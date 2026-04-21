@@ -157,6 +157,17 @@ struct NodeDesc {
     std::array<int64_t, GGML_MAX_DIMS> ggml_starts{0, 0, 0, 0};
     std::array<int64_t, GGML_MAX_DIMS> ggml_ne{1, 1, 1, 1};
   };
+  struct SplitAttrs {
+    int ggml_axis{0};
+    std::vector<int64_t> lengths;  // per-output length along ggml_axis
+  };
+  struct ReduceAttrs {
+    // Reduce a contiguous suffix of the ONNX dims. Stored as the count of
+    // trailing ONNX axes to reduce; emit collapses them into a single ggml
+    // axis (the fastest-varying, axis 0) and calls ggml_mean.
+    int trailing_count{0};
+    bool keepdims{true};
+  };
 
   using Attrs = std::variant<NoAttrs,
                              GRUAttrs,
@@ -172,7 +183,9 @@ struct NodeDesc {
                              BatchNormAttrs,
                              UpsampleAttrs,
                              TransposeAttrs,
-                             SliceAttrs>;
+                             SliceAttrs,
+                             SplitAttrs,
+                             ReduceAttrs>;
 
   std::string op_type;
   std::string domain;

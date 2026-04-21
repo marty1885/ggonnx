@@ -2018,6 +2018,235 @@ EmitResult EmitBatchNormNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
+// ONNX Split (opset 2/11/13): produces N outputs by slicing `data` along `axis`.
+// We handle the case where the split sizes are known at compile time — either
+// via the `split` attribute (opset <13), the `split` input (opset 13+), or by
+// equal division into `outputs.size()` chunks (the default).
+bool IsSupportedSplitNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.empty() || inputs.size() > 2 || outputs.empty() ||
+      node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr) return false;
+  const TensorMetadata data = getTensorMetadata(inputs[0]);
+  if (data.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
+  if (!rankSupportedByGGML(data) || data.dims.empty()) return false;
+
+  const int64_t rank = static_cast<int64_t>(data.dims.size());
+  int64_t axis = readNodeAttribute<int64_t>(node, "axis").value_or(0);
+  if (axis < 0) axis += rank;
+  if (axis < 0 || axis >= rank) return false;
+  if (data.dims[axis] < 0) return false;
+
+  // Split sizes: prefer the `split` input (opset 13+), then the attribute
+  // (opset 2/11), then equal division.
+  std::vector<int64_t> split_sizes;
+  if (inputs.size() == 2 && inputs[1] != nullptr) {
+    const auto s = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    if (!s) return false;
+    split_sizes = *s;
+  } else if (const auto attr = readNodeAttribute<std::vector<int64_t>>(node, "split")) {
+    split_sizes = *attr;
+  } else {
+    const int64_t n = static_cast<int64_t>(outputs.size());
+    if (n <= 0 || data.dims[axis] % n != 0) return false;
+    split_sizes.assign(n, data.dims[axis] / n);
+  }
+  if (split_sizes.size() != outputs.size()) return false;
+  int64_t total = 0;
+  for (int64_t s : split_sizes) {
+    if (s < 0) return false;
+    total += s;
+  }
+  if (total != data.dims[axis]) return false;
+
+  for (Ort::ConstValueInfo out : outputs) {
+    if (out == nullptr) return false;
+    const TensorMetadata meta = getTensorMetadata(out);
+    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
+    if (!rankSupportedByGGML(meta)) return false;
+  }
+  return true;
+}
+
+void CompileSplitAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  const TensorMetadata data = getTensorMetadata(inputs[0]);
+  const int64_t rank = static_cast<int64_t>(data.dims.size());
+  int64_t axis = readNodeAttribute<int64_t>(node, "axis").value_or(0);
+  if (axis < 0) axis += rank;
+
+  NodeDesc::SplitAttrs attrs;
+  attrs.ggml_axis = static_cast<int>(rank - 1 - axis);
+  if (inputs.size() == 2 && inputs[1] != nullptr) {
+    const auto s = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    GGONNX_ASSERT(s.has_value(), "Split compile: split input must be constant int64");
+    attrs.lengths = *s;
+  } else if (const auto a = readNodeAttribute<std::vector<int64_t>>(node, "split")) {
+    attrs.lengths = *a;
+  } else {
+    const int64_t n = static_cast<int64_t>(outputs.size());
+    attrs.lengths.assign(n, data.dims[axis] / n);
+  }
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitSplitNode(ggml_context* ctx,
+                         const NodeDesc& node,
+                         const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::SplitAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Split node missing attributes");
+  ggml_tensor* data = values[node.inputs[0]];
+  GGONNX_NOT_NULL(data, "compiled Split node missing GGML data input");
+
+  const int axis = attrs->ggml_axis;
+  EmitOutputs out;
+  out.reserve(attrs->lengths.size());
+  int64_t offset_elems = 0;
+  int64_t ne[GGML_MAX_DIMS];
+  for (int i = 0; i < GGML_MAX_DIMS; ++i) ne[i] = data->ne[i];
+  for (int64_t length : attrs->lengths) {
+    ne[axis] = length;
+    const size_t offset_bytes = static_cast<size_t>(offset_elems) * data->nb[axis];
+    ggml_tensor* view = ggml_view_4d(ctx, data,
+                                     ne[0], ne[1], ne[2], ne[3],
+                                     data->nb[1], data->nb[2], data->nb[3],
+                                     offset_bytes);
+    out.push_back(ggml_cont(ctx, view));
+    offset_elems += length;
+  }
+  return out;
+}
+
+// ONNX ReduceMean (opset 11/13/18). We support the common case of reducing a
+// contiguous suffix of the ONNX dims — e.g. axes=[2,3] on an [N,C,H,W] input —
+// because that's what ggml_mean (which reduces only axis 0) can express after
+// collapsing the trailing dims.
+bool IsSupportedReduceMeanNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.empty() || inputs.size() > 2 || outputs.size() != 1 ||
+      node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) return false;
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) return false;
+  if (!shapeIsFullyStatic(x)) return false;
+
+  const int64_t rank = static_cast<int64_t>(x.dims.size());
+  if (rank == 0) return false;
+
+  // Collect axes. Prefer the `axes` input (opset 18+), then the attribute.
+  std::vector<int64_t> axes;
+  if (inputs.size() == 2 && inputs[1] != nullptr) {
+    const auto v = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    if (!v) return false;
+    axes = *v;
+  } else if (const auto attr = readNodeAttribute<std::vector<int64_t>>(node, "axes")) {
+    axes = *attr;
+  } else {
+    // Default: reduce all axes.
+    axes.resize(rank);
+    for (int64_t i = 0; i < rank; ++i) axes[i] = i;
+  }
+  if (axes.empty()) return false;
+
+  std::vector<int64_t> normalized;
+  normalized.reserve(axes.size());
+  for (int64_t a : axes) {
+    if (a < 0) a += rank;
+    if (a < 0 || a >= rank) return false;
+    normalized.push_back(a);
+  }
+  std::sort(normalized.begin(), normalized.end());
+  for (size_t i = 1; i < normalized.size(); ++i) {
+    if (normalized[i] == normalized[i - 1]) return false;
+  }
+  // Must be a contiguous suffix: [rank - k, rank - 1].
+  const int64_t k = static_cast<int64_t>(normalized.size());
+  for (int64_t i = 0; i < k; ++i) {
+    if (normalized[i] != rank - k + i) return false;
+  }
+  return true;
+}
+
+void CompileReduceMeanAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto inputs = node.GetInputs();
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const int64_t rank = static_cast<int64_t>(x.dims.size());
+
+  std::vector<int64_t> axes;
+  if (inputs.size() == 2 && inputs[1] != nullptr) {
+    const auto v = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    GGONNX_ASSERT(v.has_value(), "ReduceMean compile: axes input must be constant int64");
+    axes = *v;
+  } else if (const auto attr = readNodeAttribute<std::vector<int64_t>>(node, "axes")) {
+    axes = *attr;
+  } else {
+    axes.resize(rank);
+    for (int64_t i = 0; i < rank; ++i) axes[i] = i;
+  }
+
+  NodeDesc::ReduceAttrs attrs;
+  attrs.trailing_count = static_cast<int>(axes.size());
+  attrs.keepdims = readNodeAttribute<int64_t>(node, "keepdims").value_or(1) != 0;
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitReduceMeanNode(ggml_context* ctx,
+                              const NodeDesc& node,
+                              const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::ReduceAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled ReduceMean node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled ReduceMean node missing GGML input");
+
+  // Collapse the trailing ONNX axes (= leading ggml axes) into ggml axis 0 so
+  // ggml_mean reduces them in one shot.
+  const int k = attrs->trailing_count;
+  int64_t collapsed = 1;
+  for (int i = 0; i < k; ++i) collapsed *= x->ne[i];
+  int64_t keep[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  keep[0] = collapsed;
+  for (int i = k; i < GGML_MAX_DIMS; ++i) keep[i - k + 1] = x->ne[i];
+
+  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+  ggml_tensor* flat = ggml_reshape_4d(ctx, src, keep[0], keep[1], keep[2], keep[3]);
+  ggml_tensor* reduced = ggml_mean(ctx, flat);  // ne[0] becomes 1
+
+  if (attrs->keepdims) {
+    // ggml_mean left the leading ggml axis at size 1; that corresponds to the
+    // collapsed ONNX trailing axes. Expand back to k separate size-1 axes,
+    // which for k in {1,2,3} fits in 4D.
+    int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+    for (int i = 0; i < k; ++i) out_ne[i] = 1;
+    for (int i = k; i < GGML_MAX_DIMS; ++i) out_ne[i] = reduced->ne[i - k + 1];
+    ggml_tensor* cont = ggml_cont(ctx, reduced);
+    return EmitOutputs{
+        ggml_reshape_4d(ctx, cont, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+  }
+  // keepdims == 0: drop the leading size-1 axis by re-packing kept axes into
+  // ggml positions [0..rank-k-1].
+  int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  for (int i = 0; i < GGML_MAX_DIMS - 1; ++i) out_ne[i] = reduced->ne[i + 1];
+  ggml_tensor* cont = ggml_cont(ctx, reduced);
+  return EmitOutputs{
+      ggml_reshape_4d(ctx, cont, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+}
+
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type) {
 
   struct PairHash {
@@ -2066,6 +2295,9 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Transpose"}, {IsSupportedTransposeNode, CompileTransposeAttributes, EmitTransposeNode}},
       {{"", "Concat"}, {IsSupportedConcatNode, CompileConcatAttributes, EmitConcatNode}},
       {{"", "Slice"}, {IsSupportedSliceNode, CompileSliceAttributes, EmitSliceNode}},
+      {{"", "Split"}, {IsSupportedSplitNode, CompileSplitAttributes, EmitSplitNode}},
+      {{"", "ReduceMean"},
+       {IsSupportedReduceMeanNode, CompileReduceMeanAttributes, EmitReduceMeanNode}},
       {{"", "BatchNormalization"},
        {IsSupportedBatchNormNode, CompileBatchNormAttributes, EmitBatchNormNode}},
   };
