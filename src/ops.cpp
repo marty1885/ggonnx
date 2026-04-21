@@ -584,6 +584,116 @@ EmitResult EmitLeakyReluNode(ggml_context* ctx,
   return EmitOutputs{ggml_leaky_relu(ctx, x, attrs->alpha, /*inplace=*/false)};
 }
 
+// ONNX PRelu: Y[i] = X[i] if X[i] >= 0 else slope[i] * X[i]. Slope is
+// unidirectionally broadcastable to X. ggml has no native PRelu, so we emit
+// Y = relu(X) - slope * relu(-X), which evaluates to relu(X) when X >= 0 and
+// to slope * X when X < 0 (since -relu(-X) == X on that branch).
+bool IsSupportedPReluNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata slope = getTensorMetadata(inputs[1]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      slope.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(slope) || !rankSupportedByGGML(y)) {
+    return false;
+  }
+  // ggml's broadcast is per-dim "dst[i] % src[i] == 0" in reversed layout,
+  // which subsumes ONNX unidirectional broadcasting of slope -> X.
+  if (!broadcastSupportedByGGML(slope.dims, x.dims)) {
+    return false;
+  }
+  return true;
+}
+
+EmitResult EmitPReluNode(ggml_context* ctx,
+                         const NodeDesc& node,
+                         const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(node.inputs.size() == 2 && node.outputs.size() == 1,
+                "compiled PRelu node has invalid arity");
+  ggml_tensor* x = values[node.inputs[0]];
+  ggml_tensor* slope = values[node.inputs[1]];
+  GGONNX_NOT_NULL(x, "compiled PRelu node missing GGML X input");
+  GGONNX_NOT_NULL(slope, "compiled PRelu node missing GGML slope input");
+  ggml_tensor* relu_x = ggml_relu(ctx, x);
+  ggml_tensor* relu_neg_x = ggml_relu(ctx, ggml_neg(ctx, x));
+  ggml_tensor* scaled = ggml_mul(ctx, relu_neg_x, slope);
+  return EmitOutputs{ggml_sub(ctx, relu_x, scaled)};
+}
+
+// ONNX Clip: Y = min(max(X, min_val), max_val). Pre-opset-11 reads min/max from
+// node attributes; opset 11+ reads them from inputs[1] and inputs[2] (both
+// optional, defaulting to -inf / +inf). ggml_clamp takes the two bounds as
+// plain floats, so we require the input forms to be compile-time scalars.
+bool IsSupportedClipNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.empty() || inputs.size() > 3 || outputs.size() != 1 ||
+      node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) return false;
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) return false;
+
+  // Opset 11+: min/max come in as scalar tensors. We need them as compile-time
+  // constants so ggml_clamp can take float literals.
+  for (size_t i = 1; i < inputs.size(); ++i) {
+    if (inputs[i] == nullptr) continue;  // optional, absent
+    const auto v = readConstantInputArray<float>(node, i, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+    if (!v.has_value() || v->size() != 1) return false;
+  }
+  return true;
+}
+
+void CompileClipAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  NodeDesc::ClipAttrs attrs;
+  // Opset <11: attributes. Opset >=11: inputs.
+  if (const auto min_attr = readNodeAttribute<float>(node, "min")) attrs.min = *min_attr;
+  if (const auto max_attr = readNodeAttribute<float>(node, "max")) attrs.max = *max_attr;
+  const auto inputs = node.GetInputs();
+  if (inputs.size() >= 2 && inputs[1] != nullptr) {
+    const auto v = readConstantInputArray<float>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+    if (v && v->size() == 1) attrs.min = (*v)[0];
+  }
+  if (inputs.size() >= 3 && inputs[2] != nullptr) {
+    const auto v = readConstantInputArray<float>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+    if (v && v->size() == 1) attrs.max = (*v)[0];
+  }
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitClipNode(ggml_context* ctx,
+                        const NodeDesc& node,
+                        const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::ClipAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Clip node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Clip node missing GGML input");
+  // ggml_clamp returns an in-place view that mutates its input; duplicate first
+  // so other consumers of x keep their original values.
+  ggml_tensor* src = ggml_dup(ctx, x);
+  return EmitOutputs{ggml_clamp(ctx, src, attrs->min, attrs->max)};
+}
+
 // ONNX Softmax (opset >= 13): softmax along `axis` (default -1). GGML's ggml_soft_max
 // operates along ne[0], which is the last ONNX dim.. so we only accept axis=-1 or
 // axis=rank-1. Pre-opset-13 Softmax with its "coerce to 2D" semantics is rejected.
@@ -733,8 +843,15 @@ bool IsSupportedConvNode(Ort::ConstNode node) {
     return false;
   }
 
-  if (readNodeAttribute<int64_t>(node, "group").value_or(1) != 1) {
-    return false;
+  // Accept group == 1 (regular conv) and depthwise (group == C_in == C_out with
+  // weight shape [C, 1, kH, kW]). Depthwise maps to ggml_conv_2d_dw_direct.
+  const int64_t group = readNodeAttribute<int64_t>(node, "group").value_or(1);
+  if (group != 1) {
+    if (x.dims[1] < 0 || w.dims[0] < 0 || w.dims[1] < 0 || y.dims[1] < 0) return false;
+    if (group != x.dims[1]) return false;           // must equal C_in
+    if (w.dims[0] != group) return false;           // C_out == group (multiplier 1)
+    if (w.dims[1] != 1) return false;               // weight IC/group == 1
+    if (y.dims[1] != group) return false;
   }
 
   const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
@@ -759,7 +876,7 @@ bool IsSupportedConvNode(Ort::ConstNode node) {
     if (w.dims[3] >= 0 && (*kernel_shape)[1] != w.dims[3]) return false;
   }
 
-  if (x.dims[1] >= 0 && w.dims[1] >= 0 && x.dims[1] != w.dims[1]) {
+  if (group == 1 && x.dims[1] >= 0 && w.dims[1] >= 0 && x.dims[1] != w.dims[1]) {
     return false;  // IC mismatch (group=1 path).
   }
 
@@ -796,6 +913,7 @@ void CompileConvAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
   }
   // VALID => pads remain 0.
 
+  attrs.is_depthwise = readNodeAttribute<int64_t>(node, "group").value_or(1) != 1;
   compiled_node->attrs = attrs;
 }
 
@@ -813,10 +931,15 @@ EmitResult EmitConvNode(ggml_context* ctx,
   GGONNX_NOT_NULL(x, "compiled Conv node missing GGML X input");
   GGONNX_NOT_NULL(w, "compiled Conv node missing GGML W input");
 
-  ggml_tensor* out = ggml_conv_2d_direct(ctx, w, x,
-                                         attrs->s0, attrs->s1,
-                                         attrs->p0, attrs->p1,
-                                         attrs->d0, attrs->d1);
+  ggml_tensor* out = attrs->is_depthwise
+      ? ggml_conv_2d_dw_direct(ctx, w, x,
+                               attrs->s0, attrs->s1,
+                               attrs->p0, attrs->p1,
+                               attrs->d0, attrs->d1)
+      : ggml_conv_2d_direct(ctx, w, x,
+                            attrs->s0, attrs->s1,
+                            attrs->p0, attrs->p1,
+                            attrs->d0, attrs->d1);
 
   if (node.inputs.size() == 3 && node.inputs[2] != kOptionalValueAbsent) {
     ggml_tensor* bias = values[node.inputs[2]];
@@ -1805,9 +1928,10 @@ EmitResult EmitSliceNode(ggml_context* ctx,
 
 // ONNX BatchNormalization (inference mode): 5 inputs, 1 output.
 // Y = scale * (X - mean) / sqrt(var + eps) + bias, broadcast over channel axis.
-// First pass: rank-4 NCHW only (GGML axis 2 is the channel). ORT usually folds
-// BN into the preceding Conv bias, so this mostly matters for models without
-// that fusion (e.g. language models that use BN outside Conv).
+// Supports ONNX rank 2..4. ONNX channel is always axis 1, which in ggml's
+// reversed layout is ggml axis (rank-2). ORT usually folds BN into the
+// preceding Conv bias, so this mostly matters for BN outside Conv (e.g. the
+// trailing BN on arcface's flattened feature vector, or language models).
 bool IsSupportedBatchNormNode(Ort::ConstNode node) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -1829,7 +1953,8 @@ bool IsSupportedBatchNormNode(Ort::ConstNode node) {
       y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     return false;
   }
-  if (x.dims.size() != 4 || y.dims.size() != 4) return false;
+  if (x.dims.size() < 2 || x.dims.size() > 4) return false;
+  if (x.dims.size() != y.dims.size()) return false;
   if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) return false;
 
   for (int i = 1; i < 5; ++i) {
@@ -1842,10 +1967,11 @@ bool IsSupportedBatchNormNode(Ort::ConstNode node) {
 
 void CompileBatchNormAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
-  // Reuse InstanceNormAttrs — identical shape (single epsilon). Not renamed to
-  // keep the variant small and avoid a duplicate single-field struct.
-  compiled_node->attrs = NodeDesc::InstanceNormAttrs{
+  const auto inputs = node.GetInputs();
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  compiled_node->attrs = NodeDesc::BatchNormAttrs{
       .epsilon = readNodeAttribute<float>(node, "epsilon").value_or(1e-5f),
+      .onnx_rank = static_cast<int>(x.dims.size()),
   };
 }
 
@@ -1855,7 +1981,7 @@ EmitResult EmitBatchNormNode(ggml_context* ctx,
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
   GGONNX_ASSERT(node.inputs.size() == 5 && node.outputs.size() == 1,
                 "compiled BatchNormalization node has invalid arity");
-  const auto* attrs = std::get_if<NodeDesc::InstanceNormAttrs>(&node.attrs);
+  const auto* attrs = std::get_if<NodeDesc::BatchNormAttrs>(&node.attrs);
   GGONNX_ASSERT(attrs != nullptr, "compiled BatchNormalization node missing attributes");
 
   ggml_tensor* x = values[node.inputs[0]];
@@ -1869,11 +1995,19 @@ EmitResult EmitBatchNormNode(ggml_context* ctx,
   GGONNX_NOT_NULL(mean, "compiled BatchNormalization node missing mean input");
   GGONNX_NOT_NULL(var, "compiled BatchNormalization node missing var input");
 
-  const int64_t c = x->ne[2];
-  ggml_tensor* scale_4d = ggml_reshape_4d(ctx, scale, 1, 1, c, 1);
-  ggml_tensor* bias_4d = ggml_reshape_4d(ctx, bias, 1, 1, c, 1);
-  ggml_tensor* mean_4d = ggml_reshape_4d(ctx, mean, 1, 1, c, 1);
-  ggml_tensor* var_4d = ggml_reshape_4d(ctx, var, 1, 1, c, 1);
+  // Place C at ggml axis (rank-2), 1s elsewhere. For rank 4 NCHW: ne[2]=C; for
+  // rank 3 [N,C,L]: ne[1]=C; for rank 2 [N,C]: ne[0]=C. ggml tensors always
+  // carry 4 ne slots, so a 4D reshape works for all ranks.
+  const int channel_axis = attrs->onnx_rank - 2;
+  GGONNX_ASSERT(channel_axis >= 0 && channel_axis < GGML_MAX_DIMS,
+                "BatchNormalization has unexpected onnx_rank");
+  const int64_t c = x->ne[channel_axis];
+  int64_t ne[4] = {1, 1, 1, 1};
+  ne[channel_axis] = c;
+  ggml_tensor* scale_4d = ggml_reshape_4d(ctx, scale, ne[0], ne[1], ne[2], ne[3]);
+  ggml_tensor* bias_4d = ggml_reshape_4d(ctx, bias, ne[0], ne[1], ne[2], ne[3]);
+  ggml_tensor* mean_4d = ggml_reshape_4d(ctx, mean, ne[0], ne[1], ne[2], ne[3]);
+  ggml_tensor* var_4d = ggml_reshape_4d(ctx, var, ne[0], ne[1], ne[2], ne[3]);
 
   // std = sqrt(var + eps); scale_bias(a, s, b) = s*a + b, so we can fold the
   // scalar epsilon add into the same op without a separate eps-filled tensor.
@@ -1911,6 +2045,8 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Softplus"}, {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Elu"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "LeakyRelu"}, {IsSupportedLeakyReluNode, CompileLeakyReluAttributes, EmitLeakyReluNode}},
+      {{"", "PRelu"},     {IsSupportedPReluNode, nullptr, EmitPReluNode}},
+      {{"", "Clip"},      {IsSupportedClipNode, CompileClipAttributes, EmitClipNode}},
       {{"", "Softmax"},  {IsSupportedSoftmaxNode, CompileSoftmaxAttributes, EmitSoftmaxNode}},
       {{"", "MatMul"},   {IsSupportedMatMulNode, nullptr, EmitMatMulNode, MatMulConstantLayout}},
       {{"", "Conv"},     {IsSupportedConvNode, CompileConvAttributes, EmitConvNode, nullptr}},

@@ -340,6 +340,30 @@ def test_single_leaky_relu(suite_tmpdir, ep_library: Path, alpha: float) -> None
     assert_model_matches_cpu(model_path, ep_library, "y", inputs)
 
 
+@pytest.mark.parametrize(
+    "x_shape,slope_shape",
+    [
+        ((2, 3), (1,)),          # scalar slope
+        ((2, 3), (3,)),          # per-last-dim slope
+        ((1, 4, 5, 5), (1, 4, 1, 1)),   # per-channel NCHW (arcface pattern)
+        ((2, 4, 6, 6), (1, 4, 1, 1)),
+    ],
+)
+def test_single_prelu(suite_tmpdir, ep_library: Path, x_shape, slope_shape) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    slope = helper.make_tensor_value_info("slope", TensorProto.FLOAT, list(slope_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(x_shape))
+    node = helper.make_node("PRelu", ["x", "slope"], ["y"], name="prelu_0")
+    graph = helper.make_graph([node], "single_prelu", [x, slope], [y])
+    model_path = ensure_model(suite_tmpdir, graph)
+    rng = np.random.default_rng(3)
+    inputs = {
+        "x": rng.standard_normal(x_shape).astype(np.float32),
+        "slope": rng.standard_normal(slope_shape).astype(np.float32),
+    }
+    assert_model_matches_cpu(model_path, ep_library, "y", inputs)
+
+
 @pytest.mark.parametrize("shape,axis", [((2, 4), -1), ((2, 4), 1), ((2, 3, 4), -1)])
 def test_single_softmax(suite_tmpdir, ep_library: Path, shape, axis: int) -> None:
     model_path = build_single_unary_model(suite_tmpdir, "Softmax", shape=shape, axis=axis)
@@ -1038,7 +1062,10 @@ def build_batchnorm_model(tmpdir: Path, x_shape, *, epsilon=1e-5) -> Path:
     return ensure_model(tmpdir, graph)
 
 
-@pytest.mark.parametrize("x_shape", [(1, 4, 6, 6), (2, 8, 3, 3), (1, 3, 16, 16)])
+@pytest.mark.parametrize(
+    "x_shape",
+    [(1, 4, 6, 6), (2, 8, 3, 3), (1, 3, 16, 16), (1, 512), (2, 16), (2, 4, 5)],
+)
 def test_single_batchnorm(suite_tmpdir, ep_library: Path, x_shape) -> None:
     model_path = build_batchnorm_model(suite_tmpdir, x_shape)
     rng = np.random.default_rng(22)

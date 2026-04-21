@@ -37,6 +37,20 @@ _OPENWAKEWORD_EMBEDDING_URL = (
     "https://github.com/dscripka/openWakeWord/releases/download/"
     "v0.5.1/embedding_model.onnx"
 )
+_ARCFACE_MODEL_URL = (
+    "https://huggingface.co/onnxmodelzoo/arcfaceresnet100-8/resolve/main/"
+    "arcfaceresnet100-8.onnx?download=true"
+)
+_RESNET18_MODEL_URL = (
+    "https://github.com/onnx/models/raw/"
+    "c32b9776d06d2ebc7888d705e3a558f62b20e7a8/"
+    "validated/vision/classification/resnet/model/resnet18-v2-7.onnx"
+)
+_MOBILENETV2_MODEL_URL = (
+    "https://github.com/onnx/models/raw/"
+    "c32b9776d06d2ebc7888d705e3a558f62b20e7a8/"
+    "validated/vision/classification/mobilenet/model/mobilenetv2-12.onnx"
+)
 
 
 def _concretize_input_dims(model_path: Path, overrides: dict[str, list[int]]) -> Path:
@@ -146,6 +160,67 @@ def test_openwakeword_alexa_matches_cpu(ep_library: Path) -> None:
 
     for got, expected in zip(ggml_out, cpu_out):
         np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.integration
+def test_arcface_resnet100_matches_cpu(ep_library: Path) -> None:
+    model_path = cached_model_path("arcfaceresnet100-8.onnx", _ARCFACE_MODEL_URL)
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    input_info = cpu.get_inputs()[0]
+    shape = [d if isinstance(d, int) and d > 0 else 1 for d in input_info.shape]
+    rng = np.random.default_rng(0)
+    inputs = {input_info.name: rng.standard_normal(shape).astype(np.float32)}
+
+    output_names = [out.name for out in cpu.get_outputs()]
+    cpu_out = cpu.run(output_names, inputs)
+    ggml_out = ggml.run(output_names, inputs)
+
+    for got, expected in zip(ggml_out, cpu_out):
+        np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.integration
+def test_resnet18_v2_matches_cpu(ep_library: Path) -> None:
+    raw_path = cached_model_path("resnet18-v2-7.onnx", _RESNET18_MODEL_URL)
+    model_path = _concretize_input_dims(raw_path, {"data": [1, 3, 224, 224]})
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    rng = np.random.default_rng(0)
+    inputs = {"data": rng.standard_normal((1, 3, 224, 224)).astype(np.float32)}
+
+    output_names = [out.name for out in cpu.get_outputs()]
+    cpu_out = cpu.run(output_names, inputs)
+    ggml_out = ggml.run(output_names, inputs)
+
+    for got, expected in zip(ggml_out, cpu_out):
+        np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.integration
+def test_mobilenetv2_matches_cpu(ep_library: Path) -> None:
+    raw_path = cached_model_path("mobilenetv2-12.onnx", _MOBILENETV2_MODEL_URL)
+    model_path = _concretize_input_dims(raw_path, {"input": [1, 3, 224, 224]})
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    rng = np.random.default_rng(0)
+    inputs = {"input": rng.standard_normal((1, 3, 224, 224)).astype(np.float32)}
+
+    output_names = [out.name for out in cpu.get_outputs()]
+    cpu_out = cpu.run(output_names, inputs)
+    ggml_out = ggml.run(output_names, inputs)
+
+    for got, expected in zip(ggml_out, cpu_out):
+        np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
     assert_all_nodes_run_on_ggml(ggml)
 
 

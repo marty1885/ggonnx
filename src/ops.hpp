@@ -102,6 +102,11 @@ struct NodeDesc {
     int s0{1}, s1{1};
     int p0{0}, p1{0};
     int d0{1}, d1{1};
+    bool is_depthwise{false};
+  };
+  struct ClipAttrs {
+    float min{-std::numeric_limits<float>::infinity()};
+    float max{std::numeric_limits<float>::infinity()};
   };
   struct GemmAttrs {
     float alpha{1.0f};
@@ -128,6 +133,14 @@ struct NodeDesc {
   struct InstanceNormAttrs {
     float epsilon{1e-5f};
   };
+  struct BatchNormAttrs {
+    float epsilon{1e-5f};
+    // ONNX input rank (2..4 supported). The channel axis in ONNX is always 1,
+    // which in ggml's reversed layout sits at ggml axis (rank-2). Stored at
+    // compile time because the emit-time tensor alone can't distinguish "rank
+    // 4 with N=1, H=1" from "rank 2".
+    int onnx_rank{4};
+  };
   struct UpsampleAttrs {
     int scale_w{1};
     int scale_h{1};
@@ -150,11 +163,13 @@ struct NodeDesc {
                              AlphaAttrs,
                              AxisAttrs,
                              Conv2DAttrs,
+                             ClipAttrs,
                              GemmAttrs,
                              ReshapeAttrs,
                              Pool2DAttrs,
                              PadAttrs,
                              InstanceNormAttrs,
+                             BatchNormAttrs,
                              UpsampleAttrs,
                              TransposeAttrs,
                              SliceAttrs>;
