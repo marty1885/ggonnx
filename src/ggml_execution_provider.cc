@@ -68,7 +68,9 @@ struct CompiledPartition {
   // Entries in `constants` are indexed by value_id; nullptr means "not a
   // constant". Constants never appear in graph_inputs — their data is snapshotted
   // at compile time, with per-op layout hints (e.g. MatMul B is pre-transposed).
+  ggml_backend_t backend{nullptr};
   ggml_context* constant_ctx{nullptr};
+  ggml_backend_buffer_t constant_buffer{nullptr};
   std::vector<ggml_tensor*> constants;
 
   CompiledPartition() = default;
@@ -77,19 +79,27 @@ struct CompiledPartition {
   CompiledPartition(CompiledPartition&& other) noexcept { *this = std::move(other); }
   CompiledPartition& operator=(CompiledPartition&& other) noexcept {
     if (this == &other) return *this;
+    if (constant_buffer != nullptr) ggml_backend_buffer_free(constant_buffer);
     if (constant_ctx != nullptr) ggml_free(constant_ctx);
+    if (backend != nullptr) ggml_backend_free(backend);
     values = std::move(other.values);
     graph_inputs = std::move(other.graph_inputs);
     graph_outputs = std::move(other.graph_outputs);
     kernel_input_to_value = std::move(other.kernel_input_to_value);
     nodes = std::move(other.nodes);
+    backend = other.backend;
     constant_ctx = other.constant_ctx;
+    constant_buffer = other.constant_buffer;
     constants = std::move(other.constants);
+    other.backend = nullptr;
     other.constant_ctx = nullptr;
+    other.constant_buffer = nullptr;
     return *this;
   }
   ~CompiledPartition() {
+    if (constant_buffer != nullptr) ggml_backend_buffer_free(constant_buffer);
     if (constant_ctx != nullptr) ggml_free(constant_ctx);
+    if (backend != nullptr) ggml_backend_free(backend);
   }
 };
 
@@ -109,6 +119,7 @@ struct MaterializedGraph {
   ShapeKey key;
   ggml_context* ctx{};
   ggml_cgraph* graph{};
+  ggml_gallocr_t gallocr{};
   std::vector<ggml_tensor*> values;
   std::vector<std::vector<int64_t>> value_dims;
   std::vector<ggml_tensor*> input_tensors;
@@ -214,30 +225,14 @@ size_t EstimatePartitionTensorCount(const CompiledPartition& partition) {
   return std::max<size_t>(count, 8);
 }
 
-size_t EstimateInitialGraphDataBytes(const CompiledPartition& partition,
-                                     const std::vector<TensorMetadata>& input_metadata) {
-  GGONNX_ASSERT(input_metadata.size() == partition.graph_inputs.size(),
-                "runtime input metadata does not match compiled partition");
-  size_t bytes = 0;
-
-  for (const TensorMetadata& meta : input_metadata) {
-    GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                  "GGONNX runtime input must be float32");
-    GGONNX_ASSERT(shapeIsFullyStatic(meta.dims), "runtime input shapes must be concrete");
-    bytes += elementCount(meta.dims) * sizeof(float);
-  }
-
-  // Leave plenty of headroom for intermediates and outputs. GGML will do the final
-  // graph-level planning; this context size only needs to be safely sufficient.
-  bytes *= std::max<size_t>(partition.nodes.size() + partition.graph_outputs.size(), 4);
-  // Fused image models create many extra tensor views/materializations beyond
-  // the one-output-per-node rough estimate above (e.g. reflect pad via
-  // permute+cont chains, broadcasted norm scale/bias reshapes). Keep an
-  // additional reserve so graph construction does not run out of context space.
-  bytes *= 2;
-  // Ops like Conv2D allocate substantial work buffers via ggml_new_buffer during
-  // graph_compute. Keep a generous floor so we don't segfault on small inputs.
-  return std::max<size_t>(bytes, 128 * 1024 * 1024);
+size_t EstimateGraphMetadataBytes(const CompiledPartition& partition) {
+  // Metadata-only graph context. Tensor payloads are allocated via GGML backend
+  // buffers/gallocr, not from the ggml_context arena.
+  const size_t tensor_count = partition.values.size() + partition.nodes.size() * 4 +
+                              partition.graph_inputs.size() + partition.graph_outputs.size() + 16;
+  return tensor_count * ggml_tensor_overhead() +
+         ggml_graph_overhead() +
+         64 * 1024;
 }
 
 // Byte count for a constant value given its ONNX dims (float32 only).
@@ -268,6 +263,7 @@ void MaterializeConstantData(const float* src,
   int64_t batch = 1;
   for (size_t i = 0; i + 2 < onnx_dims.size(); ++i) batch *= onnx_dims[i];
   float* out = static_cast<float*>(dst->data);
+  // TODO: Optimize this aweful slow transpose
   for (int64_t b = 0; b < batch; ++b) {
     const float* src_mat = src + b * K * N;
     float* dst_mat = out + b * K * N;
@@ -283,6 +279,8 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
   GGONNX_NOT_NULL(graph, "graph must not be null");
   const Ort::ConstGraph ort_graph{graph};
   CompiledPartition partition;
+  partition.backend = ggml_backend_cpu_init();
+  GGONNX_NOT_NULL(partition.backend, "ggml_backend_cpu_init failed");
   std::unordered_map<std::string, size_t> value_ids;
   // name -> OrtValue* for constant initializers. Populated up front, consumed
   // when we decide on per-use layouts during node walking.
@@ -431,7 +429,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
     ggml_init_params p{};
     p.mem_size = mem_size;
     p.mem_buffer = nullptr;
-    p.no_alloc = false;
+    p.no_alloc = true;
     partition.constant_ctx = ggml_init(p);
     GGONNX_NOT_NULL(partition.constant_ctx, "ggml_init failed for constants");
 
@@ -454,8 +452,30 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
                                        static_cast<int>(tensor_dims.size()),
                                        ggml_dims.data());
       GGONNX_NOT_NULL(t, "ggml_new_tensor failed for constant");
-      MaterializeConstantData(static_cast<const float*>(src_data), value.dims, layout, t);
       partition.constants[id] = t;
+    }
+
+    partition.constant_buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(partition.constant_ctx,
+                                                 ggml_backend_get_default_buffer_type(partition.backend));
+    GGONNX_NOT_NULL(partition.constant_buffer, "ggml_backend_alloc_ctx_tensors_from_buft failed for constants");
+    ggml_backend_buffer_set_usage(partition.constant_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    for (const auto& [id, layout] : constant_layout_by_id) {
+      ggml_tensor* t = partition.constants[id];
+      GGONNX_NOT_NULL(t, "constant tensor missing backend allocation");
+      const ValueDesc& value = partition.values[id];
+      auto it = constants_by_name.find(value.name);
+      GGONNX_ASSERT(it != constants_by_name.end(), "constant tensor lost during backend upload");
+
+      const void* src_data = nullptr;
+      THROW_ON_ERROR(GetOrtApi().GetTensorData(it->second, &src_data));
+      GGONNX_NOT_NULL(src_data, "ORT returned null tensor data for constant");
+
+      std::vector<float> materialized(elementCount(value.dims));
+      MaterializeConstantData(static_cast<const float*>(src_data), value.dims, layout, t);
+      std::memcpy(materialized.data(), t->data, materialized.size() * sizeof(float));
+      ggml_backend_tensor_set(t, materialized.data(), 0, materialized.size() * sizeof(float));
     }
   }
 
@@ -504,7 +524,7 @@ void CopyInputDataToTensor(const OrtValue* input_value,
   const size_t element_count = elementCount(meta.dims);
   const size_t bytes = element_count * sizeof(float);
   AssertShapeMatchesGGML(meta.dims, tensor, tensor_name);
-  std::memcpy(tensor->data, input_data, bytes);
+  ggml_backend_tensor_set(tensor, input_data, 0, bytes);
 }
 
 EmitResult EmitNode(ggml_context* ctx,
@@ -518,8 +538,13 @@ EmitResult EmitNode(ggml_context* ctx,
 }
 
 void DestroyMaterializedGraph(std::unique_ptr<MaterializedGraph>& graph) {
-  if (graph != nullptr && graph->ctx != nullptr) {
-    ggml_free(graph->ctx);
+  if (graph != nullptr) {
+    if (graph->gallocr != nullptr) {
+      ggml_gallocr_free(graph->gallocr);
+    }
+    if (graph->ctx != nullptr) {
+      ggml_free(graph->ctx);
+    }
   }
   graph.reset();
 }
@@ -530,12 +555,12 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
   const size_t mem_size =
       EstimatePartitionTensorCount(partition) * ggml_tensor_overhead() +
       ggml_graph_overhead() +
-      EstimateInitialGraphDataBytes(partition, input_metadata);
+      EstimateGraphMetadataBytes(partition);
 
   ggml_init_params params{};
   params.mem_size = mem_size;
   params.mem_buffer = nullptr;
-  params.no_alloc = false;
+  params.no_alloc = true;
 
   ggml_context* ctx = ggml_init(params);
   if (ctx == nullptr) {
@@ -575,6 +600,7 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
 
       ggml_tensor* input_tensor = CreateTensorForOnnxShape(ctx, meta.dims);
       GGONNX_NOT_NULL(input_tensor, "failed to allocate cached GGML input tensor");
+      ggml_set_input(input_tensor);
       AssertShapeMatchesGGML(meta.dims, input_tensor, partition.values[value_id].name);
       graph_state->values[value_id] = input_tensor;
       graph_state->value_dims[value_id] = meta.dims;
@@ -616,9 +642,16 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
       GGONNX_ASSERT(output_id < graph_state->values.size(), "graph output index out of range");
       ggml_tensor* output = graph_state->values[output_id];
       GGONNX_NOT_NULL(output, "compiled partition output was not materialized");
+      ggml_set_output(output);
       ggml_build_forward_expand(graph_state->graph, output);
       graph_state->output_tensors[i] = output;
     }
+
+    graph_state->gallocr =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(partition.backend));
+    GGONNX_NOT_NULL(graph_state->gallocr, "ggml_gallocr_new failed");
+    GGONNX_ASSERT(ggml_gallocr_alloc_graph(graph_state->gallocr, graph_state->graph),
+                  "ggml_gallocr_alloc_graph failed");
 
     g_debug_graph_build_count.fetch_add(1, std::memory_order_relaxed);
     return graph_state;
@@ -683,8 +716,8 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
                           state.active_graph->input_tensors[i]);
   }
 
-  if (ggml_graph_compute_with_ctx(state.active_graph->ctx, state.active_graph->graph, 1) != GGML_STATUS_SUCCESS) {
-    throw std::runtime_error("ggml_graph_compute_with_ctx failed");
+  if (ggml_backend_graph_compute(partition.backend, state.active_graph->graph) != GGML_STATUS_SUCCESS) {
+    throw std::runtime_error("ggml_backend_graph_compute failed");
   }
 
   for (size_t i = 0; i < partition.graph_outputs.size(); ++i) {
@@ -711,7 +744,7 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
     const size_t bytes = ggml_nbytes(output_tensor);
     GGONNX_ASSERT(bytes == elementCount(output_dims) * sizeof(float),
                   "GGML output byte size mismatch for '" + partition.values[output_id].name + "'");
-    std::memcpy(output_data, output_tensor->data, bytes);
+    ggml_backend_tensor_get(output_tensor, output_data, 0, bytes);
   }
 }
 
