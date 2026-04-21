@@ -421,6 +421,72 @@ def test_single_conv(suite_tmpdir, ep_library: Path, x_shape, w_shape, y_shape, 
     assert_all_nodes_run_on_ggml(ggml)
 
 
+def build_pool_model(
+    tmpdir: Path,
+    op_type: str,
+    x_shape,
+    y_shape,
+    **attrs,
+) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    node = helper.make_node(op_type, ["x"], ["y"], name=f"{op_type.lower()}_0", **attrs)
+    graph = helper.make_graph([node], f"single_{op_type.lower()}", [x], [y])
+    return ensure_model(tmpdir, graph)
+
+
+# (op_type, x_shape, y_shape, attrs)
+_POOL_CASES = [
+    # MaxPool, no pad, k=2 s=2
+    ("MaxPool", (1, 3, 8, 8), (1, 3, 4, 4), dict(kernel_shape=[2, 2], strides=[2, 2])),
+    # AveragePool, no pad, k=2 s=2
+    ("AveragePool", (1, 3, 8, 8), (1, 3, 4, 4), dict(kernel_shape=[2, 2], strides=[2, 2])),
+    # MaxPool with symmetric padding (padding matters less here since max ignores pad)
+    ("MaxPool", (2, 4, 7, 7), (2, 4, 7, 7),
+     dict(kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])),
+    # AveragePool with count_include_pad=1 to match GGML's semantics
+    ("AveragePool", (1, 2, 6, 6), (1, 2, 6, 6),
+     dict(kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1], count_include_pad=1)),
+    # asymmetric kernel, stride 1
+    ("MaxPool", (1, 2, 6, 8), (1, 2, 6, 6), dict(kernel_shape=[1, 3])),
+    # auto_pad VALID
+    ("AveragePool", (1, 3, 10, 10), (1, 3, 5, 5),
+     dict(kernel_shape=[2, 2], strides=[2, 2], auto_pad="VALID")),
+]
+
+
+@pytest.mark.parametrize("op_type,x_shape,y_shape,attrs", _POOL_CASES)
+def test_single_pool(suite_tmpdir, ep_library: Path, op_type, x_shape, y_shape, attrs) -> None:
+    model_path = build_pool_model(suite_tmpdir, op_type, x_shape, y_shape, **attrs)
+    rng = np.random.default_rng(9)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+_GLOBAL_POOL_CASES = [
+    ("GlobalMaxPool", (1, 4, 7, 7), (1, 4, 1, 1)),
+    ("GlobalAveragePool", (2, 3, 5, 8), (2, 3, 1, 1)),
+]
+
+
+@pytest.mark.parametrize("op_type,x_shape,y_shape", _GLOBAL_POOL_CASES)
+def test_single_global_pool(suite_tmpdir, ep_library: Path, op_type, x_shape, y_shape) -> None:
+    model_path = build_pool_model(suite_tmpdir, op_type, x_shape, y_shape)
+    rng = np.random.default_rng(10)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 def build_matmul_const_b_model(tmpdir: Path, a_shape, b_shape, out_shape, b_values) -> Path:
     a = helper.make_tensor_value_info("a", TensorProto.FLOAT, list(a_shape))
     c = helper.make_tensor_value_info("c", TensorProto.FLOAT, list(out_shape))

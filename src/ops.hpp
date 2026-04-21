@@ -100,8 +100,15 @@ struct NodeDesc {
   struct ReshapeAttrs {
     std::vector<int64_t> onnx_dims;  // fully static target shape
   };
+  struct Pool2DAttrs {
+    ggml_op_pool op{GGML_OP_POOL_MAX};
+    bool is_global{false};  // kernel derived from input spatial dims at emit time
+    int k0{1}, k1{1};
+    int s0{1}, s1{1};
+    int p0{0}, p1{0};
+  };
 
-  using Attrs = std::variant<NoAttrs, GRUAttrs, AlphaAttrs, AxisAttrs, Conv2DAttrs, GemmAttrs, ReshapeAttrs>;
+  using Attrs = std::variant<NoAttrs, GRUAttrs, AlphaAttrs, AxisAttrs, Conv2DAttrs, GemmAttrs, ReshapeAttrs, Pool2DAttrs>;
 
   std::string op_type;
   std::string domain;

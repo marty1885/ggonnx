@@ -850,6 +850,176 @@ EmitResult EmitReshapeNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
+// ONNX MaxPool / AveragePool (2D only). ONNX layout X[N,C,H,W] -> ggml ne=[W,H,C,N],
+// so ggml_pool_2d's k0/s0/p0 apply to W and k1/s1/p1 apply to H — ONNX kernel_shape/
+// strides/pads are [h, w] so we swap. GGML's AveragePool divides by the full kernel
+// area regardless of how many in-bounds samples were summed (i.e. count_include_pad=1),
+// so we reject AveragePool with non-zero padding unless count_include_pad=1.
+bool IsSupportedPool2DNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 1 || outputs.empty() || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (outputs.size() > 1) {
+    return false;  // MaxPool Indices output not supported.
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (x.dims.size() != 4 || y.dims.size() != 4) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) {
+    return false;
+  }
+
+  if (readNodeAttribute<int64_t>(node, "ceil_mode").value_or(0) != 0) {
+    return false;
+  }
+  if (readNodeAttribute<int64_t>(node, "storage_order").value_or(0) != 0) {
+    return false;
+  }
+  if (const auto dilations = readNodeAttribute<std::vector<int64_t>>(node, "dilations")) {
+    for (int64_t d : *dilations) {
+      if (d != 1) return false;
+    }
+  }
+
+  const auto kernel_shape = readNodeAttribute<std::vector<int64_t>>(node, "kernel_shape");
+  if (!kernel_shape.has_value() || kernel_shape->size() != 2) {
+    return false;
+  }
+  if (const auto strides = readNodeAttribute<std::vector<int64_t>>(node, "strides")) {
+    if (strides->size() != 2) return false;
+  }
+
+  const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
+  if (auto_pad != "NOTSET" && auto_pad != "VALID") {
+    return false;
+  }
+
+  std::array<int64_t, 4> pads{0, 0, 0, 0};
+  if (const auto pads_attr = readNodeAttribute<std::vector<int64_t>>(node, "pads")) {
+    if (pads_attr->size() != 4) return false;
+    if ((*pads_attr)[0] != (*pads_attr)[2] || (*pads_attr)[1] != (*pads_attr)[3]) return false;
+    if (auto_pad == "VALID" && ((*pads_attr)[0] != 0 || (*pads_attr)[1] != 0)) return false;
+    for (size_t i = 0; i < 4; ++i) pads[i] = (*pads_attr)[i];
+  }
+
+  if (node.GetOperatorType() == "AveragePool") {
+    const bool has_padding = pads[0] != 0 || pads[1] != 0;
+    const int64_t count_include_pad =
+        readNodeAttribute<int64_t>(node, "count_include_pad").value_or(0);
+    if (has_padding && count_include_pad != 1) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void CompilePool2DAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  NodeDesc::Pool2DAttrs attrs;
+  attrs.op = node.GetOperatorType() == "MaxPool" ? GGML_OP_POOL_MAX : GGML_OP_POOL_AVG;
+
+  const auto kernel_shape = readNodeAttribute<std::vector<int64_t>>(node, "kernel_shape");
+  GGONNX_ASSERT(kernel_shape.has_value() && kernel_shape->size() == 2,
+                "Pool2D kernel_shape must be present and 2D");
+  attrs.k0 = static_cast<int>((*kernel_shape)[1]);
+  attrs.k1 = static_cast<int>((*kernel_shape)[0]);
+
+  if (const auto strides = readNodeAttribute<std::vector<int64_t>>(node, "strides")) {
+    attrs.s0 = static_cast<int>((*strides)[1]);
+    attrs.s1 = static_cast<int>((*strides)[0]);
+  } else {
+    attrs.s0 = 1;
+    attrs.s1 = 1;
+  }
+
+  const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
+  if (auto_pad == "NOTSET") {
+    if (const auto pads = readNodeAttribute<std::vector<int64_t>>(node, "pads")) {
+      attrs.p0 = static_cast<int>((*pads)[1]);
+      attrs.p1 = static_cast<int>((*pads)[0]);
+    }
+  }
+  compiled_node->attrs = attrs;
+}
+
+bool IsSupportedGlobalPoolNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (x.dims.size() != 4 || y.dims.size() != 4) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) {
+    return false;
+  }
+  // Spatial dims must be concrete so the kernel is known at emit time.
+  if (x.dims[2] < 0 || x.dims[3] < 0) {
+    return false;
+  }
+  return true;
+}
+
+void CompileGlobalPoolAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  NodeDesc::Pool2DAttrs attrs;
+  attrs.op = node.GetOperatorType() == "GlobalMaxPool" ? GGML_OP_POOL_MAX : GGML_OP_POOL_AVG;
+  attrs.is_global = true;
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitPool2DNode(ggml_context* ctx,
+                          const NodeDesc& node,
+                          const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(node.inputs.size() == 1 && node.outputs.size() == 1,
+                "compiled Pool2D node has invalid arity");
+  const auto* attrs = std::get_if<NodeDesc::Pool2DAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Pool2D node missing attributes");
+
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Pool2D node missing GGML input");
+
+  int k0 = attrs->k0, k1 = attrs->k1;
+  int s0 = attrs->s0, s1 = attrs->s1;
+  int p0 = attrs->p0, p1 = attrs->p1;
+  if (attrs->is_global) {
+    k0 = static_cast<int>(x->ne[0]);
+    k1 = static_cast<int>(x->ne[1]);
+    s0 = k0;
+    s1 = k1;
+    p0 = 0;
+    p1 = 0;
+  }
+
+  ggml_tensor* out = ggml_pool_2d(ctx, x, attrs->op, k0, k1, s0, s1,
+                                  static_cast<float>(p0), static_cast<float>(p1));
+  return EmitOutputs{out};
+}
+
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type) {
 
   struct PairHash {
@@ -880,6 +1050,10 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Conv"},     {IsSupportedConvNode, CompileConvAttributes, EmitConvNode, nullptr}},
       {{"", "Gemm"},     {IsSupportedGemmNode, CompileGemmAttributes, EmitGemmNode, GemmConstantLayout}},
       {{"", "Reshape"},  {IsSupportedReshapeNode, CompileReshapeAttributes, EmitReshapeNode}},
+      {{"", "MaxPool"},       {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
+      {{"", "AveragePool"},   {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
+      {{"", "GlobalMaxPool"}, {IsSupportedGlobalPoolNode, CompileGlobalPoolAttributes, EmitPool2DNode}},
+      {{"", "GlobalAveragePool"}, {IsSupportedGlobalPoolNode, CompileGlobalPoolAttributes, EmitPool2DNode}},
   };
 
   auto it = ops_table.find({domain, op_type});
