@@ -213,6 +213,16 @@ bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_t
     return false;
   }
 
+  // GGML's binary ops require the second operand to broadcast into the first
+  // (the first operand's shape determines the output). For commutative ops we
+  // can swap operands at emit time, but for Sub/Div the order is meaningful, so
+  // only accept the node if lhs already matches the output shape.
+  const bool commutative =
+      (op_type == "Add" || op_type == "Mul" || op_type == "Max" || op_type == "Min");
+  if (!commutative && ToPaddedGGMLDims(lhs.dims) != ToPaddedGGMLDims(out.dims)) {
+    return false;
+  }
+
   return true;
 }
 
@@ -351,6 +361,14 @@ EmitResult EmitElementwiseBinaryNode(ggml_context* ctx,
   }
 
   const std::string_view op_type(node.op_type);
+  // GGML's elementwise binary ops require the second operand to broadcast into
+  // the first. For commutative ops we can swap when the caller passed the
+  // smaller tensor first (e.g. `bias [N] + matmul [B, S, N]`).
+  const bool commutative =
+      (op_type == "Add" || op_type == "Mul" || op_type == "Max" || op_type == "Min");
+  if (commutative && !ggml_can_repeat(rhs, lhs)) {
+    std::swap(lhs, rhs);
+  }
   if (op_type == "Add") {
     return EmitOutputs{ggml_add(ctx, lhs, rhs)};
   } else if (op_type == "Sub") {
@@ -505,6 +523,288 @@ EmitResult EmitGRUNode(ggml_context* ctx,
   if (node.outputs.size() > 1 && node.outputs[1] != kOptionalValueAbsent) {
     ggml_tensor* h_out = ggml_is_contiguous(h_t) ? h_t : ggml_cont(ctx, h_t);
     outputs.push_back(ggml_reshape_3d(ctx, h_out, hidden_size, batch_size, 1));
+  }
+  return outputs;
+}
+
+bool IsSupportedLSTMNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  const auto implicit_inputs = node.GetImplicitInputs();
+  const size_t num_inputs = inputs.size();
+  const size_t num_outputs = outputs.size();
+  const size_t num_implicit_inputs = implicit_inputs.size();
+  if (num_inputs < 3 || num_outputs == 0 || num_implicit_inputs != 0) {
+    return false;
+  }
+
+  std::string direction = readNodeAttribute<std::string>(node, "direction").value_or("forward");
+  if (direction != "forward") {
+    return false;
+  }
+
+  const int64_t layout = readNodeAttribute<int64_t>(node, "layout").value_or(0);
+  if (layout != 0) {
+    return false;
+  }
+
+  const int64_t input_forget = readNodeAttribute<int64_t>(node, "input_forget").value_or(0);
+  if (input_forget != 0) {
+    return false;
+  }
+
+  if (readNodeAttribute<float>(node, "clip").has_value()) {
+    return false;
+  }
+
+  if (const auto activations = readNodeAttribute<std::vector<std::string>>(node, "activations")) {
+    if (activations->size() != 3 || (*activations)[0] != "Sigmoid" ||
+        (*activations)[1] != "Tanh" || (*activations)[2] != "Tanh") {
+      return false;
+    }
+  }
+
+  if (inputs[0] == nullptr || inputs[1] == nullptr || inputs[2] == nullptr) {
+    return false;
+  }
+  // sequence_lens (input 4) must be absent
+  if (inputs.size() > 4 && inputs[4] != nullptr) {
+    return false;
+  }
+  // P (peepholes, input 7) must be absent
+  if (inputs.size() > 7 && inputs[7] != nullptr) {
+    return false;
+  }
+
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata w = getTensorMetadata(inputs[1]);
+  const TensorMetadata r = getTensorMetadata(inputs[2]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      w.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      r.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (x.dims.size() != 3 || w.dims.size() != 3 || r.dims.size() != 3) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(w) || !rankSupportedByGGML(r)) {
+    return false;
+  }
+
+  const auto hidden_size = readNodeAttribute<int64_t>(node, "hidden_size");
+  if (!hidden_size.has_value()) {
+    return false;
+  }
+  if (*hidden_size <= 0 || w.dims[0] != 1 || r.dims[0] != 1 || w.dims[1] != *hidden_size * 4 ||
+      r.dims[1] != *hidden_size * 4 || w.dims[2] <= 0 || r.dims[2] != *hidden_size) {
+    return false;
+  }
+  if (x.dims[2] >= 0 && x.dims[2] != w.dims[2]) {
+    return false;
+  }
+
+  if (inputs.size() > 3 && inputs[3] != nullptr) {
+    const TensorMetadata b = getTensorMetadata(inputs[3]);
+    if (b.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || b.dims.size() != 2 ||
+        b.dims[0] != 1 || b.dims[1] != *hidden_size * 8) {
+      return false;
+    }
+  }
+
+  auto check_initial_state = [&](size_t idx) -> bool {
+    if (inputs.size() <= idx || inputs[idx] == nullptr) {
+      return true;
+    }
+    const TensorMetadata s = getTensorMetadata(inputs[idx]);
+    if (s.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || s.dims.size() != 3 ||
+        s.dims[0] != 1 || s.dims[2] != *hidden_size) {
+      return false;
+    }
+    if (x.dims[1] >= 0 && s.dims[1] >= 0 && x.dims[1] != s.dims[1]) {
+      return false;
+    }
+    return true;
+  };
+  if (!check_initial_state(5) || !check_initial_state(6)) {
+    return false;
+  }
+
+  for (Ort::ConstValueInfo output : outputs) {
+    if (output == nullptr) {
+      continue;
+    }
+    const TensorMetadata meta = getTensorMetadata(output);
+    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || !rankSupportedByGGML(meta)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void CompileLSTMAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const std::string direction = readNodeAttribute<std::string>(node, "direction").value_or("forward");
+  GGONNX_ASSERT(direction == "forward", "only forward LSTM direction is supported");
+  const auto hidden_size = readNodeAttribute<int64_t>(node, "hidden_size");
+  GGONNX_ASSERT(hidden_size.has_value() && *hidden_size > 0,
+                "LSTM hidden_size attribute must be present and positive");
+  compiled_node->attrs = NodeDesc::LSTMAttrs{.hidden_size = *hidden_size};
+}
+
+EmitResult EmitLSTMNode(ggml_context* ctx,
+                        const NodeDesc& node,
+                        const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(node.inputs.size() >= 3, "compiled LSTM node has invalid input arity");
+  const auto* attrs = std::get_if<NodeDesc::LSTMAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled LSTM node missing LSTM attributes");
+  GGONNX_ASSERT(attrs->hidden_size > 0, "compiled LSTM node must have positive hidden_size");
+
+  auto input_or_null = [&](size_t idx) -> ggml_tensor* {
+    if (node.inputs.size() <= idx || node.inputs[idx] == kOptionalValueAbsent) {
+      return nullptr;
+    }
+    return values[node.inputs[idx]];
+  };
+
+  ggml_tensor* x = values[node.inputs[0]];
+  ggml_tensor* w = values[node.inputs[1]];
+  ggml_tensor* r = values[node.inputs[2]];
+  ggml_tensor* b = input_or_null(3);
+  ggml_tensor* initial_h = input_or_null(5);
+  ggml_tensor* initial_c = input_or_null(6);
+  if (x == nullptr || w == nullptr || r == nullptr) {
+    throw std::runtime_error("compiled LSTM node missing required GGML inputs");
+  }
+
+  const int64_t input_size = x->ne[0];
+  const int64_t batch_size = x->ne[1];
+  const int64_t seq_length = x->ne[2];
+  const int64_t hidden_size = attrs->hidden_size;
+  GGONNX_ASSERT(w->ne[0] == input_size && w->ne[1] == hidden_size * 4 && w->ne[2] == 1,
+                "compiled LSTM W tensor shape mismatch");
+  GGONNX_ASSERT(r->ne[0] == hidden_size && r->ne[1] == hidden_size * 4 && r->ne[2] == 1,
+                "compiled LSTM R tensor shape mismatch");
+
+  auto matrix_slice_rows = [&](ggml_tensor* matrix, int64_t row_offset, int64_t row_count) -> ggml_tensor* {
+    return ggml_view_2d(ctx,
+                        matrix,
+                        matrix->ne[0],
+                        row_count,
+                        matrix->nb[1],
+                        static_cast<size_t>(row_offset) * matrix->nb[1]);
+  };
+  auto vector_slice = [&](ggml_tensor* vector, int64_t offset, int64_t length) -> ggml_tensor* {
+    return ggml_view_1d(
+        ctx, vector, length, static_cast<size_t>(offset) * ggml_element_size(vector));
+  };
+  auto timestep_slice = [&](ggml_tensor* sequence, int64_t step) -> ggml_tensor* {
+    return ggml_view_2d(ctx,
+                        sequence,
+                        sequence->ne[0],
+                        sequence->ne[1],
+                        sequence->nb[1],
+                        static_cast<size_t>(step) * sequence->nb[2]);
+  };
+
+  // ONNX LSTM gate order in W/R/B: i, o, f, c.
+  ggml_tensor* wb = nullptr;
+  ggml_tensor* rb = nullptr;
+  if (b != nullptr) {
+    GGONNX_ASSERT(b->ne[0] == hidden_size * 8 && b->ne[1] == 1,
+                  "compiled LSTM bias tensor shape mismatch");
+    wb = vector_slice(b, 0, hidden_size * 4);
+    rb = vector_slice(b, hidden_size * 4, hidden_size * 4);
+  }
+
+  ggml_tensor* h_t = nullptr;
+  if (initial_h != nullptr) {
+    GGONNX_ASSERT(initial_h->ne[0] == hidden_size && initial_h->ne[1] == batch_size &&
+                      initial_h->ne[2] == 1,
+                  "compiled LSTM initial_h tensor shape mismatch");
+    h_t = ggml_view_2d(ctx, initial_h, initial_h->ne[0], initial_h->ne[1], initial_h->nb[1], 0);
+  } else {
+    h_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, batch_size);
+    std::memset(h_t->data, 0, ggml_nbytes(h_t));
+  }
+
+  ggml_tensor* c_t = nullptr;
+  if (initial_c != nullptr) {
+    GGONNX_ASSERT(initial_c->ne[0] == hidden_size && initial_c->ne[1] == batch_size &&
+                      initial_c->ne[2] == 1,
+                  "compiled LSTM initial_c tensor shape mismatch");
+    c_t = ggml_view_2d(ctx, initial_c, initial_c->ne[0], initial_c->ne[1], initial_c->nb[1], 0);
+  } else {
+    c_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, batch_size);
+    std::memset(c_t->data, 0, ggml_nbytes(c_t));
+  }
+
+  ggml_tensor* y = nullptr;
+  if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
+    y = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hidden_size, batch_size, 1, seq_length);
+  }
+
+  ggml_tensor* w_i = matrix_slice_rows(w, 0, hidden_size);
+  ggml_tensor* w_o = matrix_slice_rows(w, hidden_size, hidden_size);
+  ggml_tensor* w_f = matrix_slice_rows(w, hidden_size * 2, hidden_size);
+  ggml_tensor* w_c = matrix_slice_rows(w, hidden_size * 3, hidden_size);
+  ggml_tensor* r_i = matrix_slice_rows(r, 0, hidden_size);
+  ggml_tensor* r_o = matrix_slice_rows(r, hidden_size, hidden_size);
+  ggml_tensor* r_f = matrix_slice_rows(r, hidden_size * 2, hidden_size);
+  ggml_tensor* r_c = matrix_slice_rows(r, hidden_size * 3, hidden_size);
+  ggml_tensor* wb_i = wb != nullptr ? vector_slice(wb, 0, hidden_size) : nullptr;
+  ggml_tensor* wb_o = wb != nullptr ? vector_slice(wb, hidden_size, hidden_size) : nullptr;
+  ggml_tensor* wb_f = wb != nullptr ? vector_slice(wb, hidden_size * 2, hidden_size) : nullptr;
+  ggml_tensor* wb_c = wb != nullptr ? vector_slice(wb, hidden_size * 3, hidden_size) : nullptr;
+  ggml_tensor* rb_i = rb != nullptr ? vector_slice(rb, 0, hidden_size) : nullptr;
+  ggml_tensor* rb_o = rb != nullptr ? vector_slice(rb, hidden_size, hidden_size) : nullptr;
+  ggml_tensor* rb_f = rb != nullptr ? vector_slice(rb, hidden_size * 2, hidden_size) : nullptr;
+  ggml_tensor* rb_c = rb != nullptr ? vector_slice(rb, hidden_size * 3, hidden_size) : nullptr;
+
+  auto gate_preact = [&](ggml_tensor* wg,
+                         ggml_tensor* rg,
+                         ggml_tensor* x_t,
+                         ggml_tensor* wbg,
+                         ggml_tensor* rbg) -> ggml_tensor* {
+    ggml_tensor* acc = ggml_add(ctx, ggml_mul_mat(ctx, wg, x_t), ggml_mul_mat(ctx, rg, h_t));
+    if (wbg != nullptr) {
+      acc = ggml_add(ctx, acc, wbg);
+    }
+    if (rbg != nullptr) {
+      acc = ggml_add(ctx, acc, rbg);
+    }
+    return acc;
+  };
+
+  for (int64_t step = 0; step < seq_length; ++step) {
+    ggml_tensor* x_t = timestep_slice(x, step);
+
+    ggml_tensor* i_gate = ggml_sigmoid(ctx, gate_preact(w_i, r_i, x_t, wb_i, rb_i));
+    ggml_tensor* f_gate = ggml_sigmoid(ctx, gate_preact(w_f, r_f, x_t, wb_f, rb_f));
+    ggml_tensor* c_tilde = ggml_tanh(ctx, gate_preact(w_c, r_c, x_t, wb_c, rb_c));
+
+    c_t = ggml_add(ctx, ggml_mul(ctx, f_gate, c_t), ggml_mul(ctx, i_gate, c_tilde));
+
+    ggml_tensor* o_gate = ggml_sigmoid(ctx, gate_preact(w_o, r_o, x_t, wb_o, rb_o));
+    h_t = ggml_mul(ctx, o_gate, ggml_tanh(ctx, c_t));
+
+    if (y != nullptr) {
+      y = ggml_set(ctx, y, h_t, y->nb[1], y->nb[2], y->nb[3], static_cast<size_t>(step) * y->nb[3]);
+    }
+  }
+
+  EmitOutputs outputs;
+  if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
+    outputs.push_back(ggml_is_contiguous(y) ? y : ggml_cont(ctx, y));
+  }
+  if (node.outputs.size() > 1 && node.outputs[1] != kOptionalValueAbsent) {
+    ggml_tensor* h_out = ggml_is_contiguous(h_t) ? h_t : ggml_cont(ctx, h_t);
+    outputs.push_back(ggml_reshape_3d(ctx, h_out, hidden_size, batch_size, 1));
+  }
+  if (node.outputs.size() > 2 && node.outputs[2] != kOptionalValueAbsent) {
+    ggml_tensor* c_out = ggml_is_contiguous(c_t) ? c_t : ggml_cont(ctx, c_t);
+    outputs.push_back(ggml_reshape_3d(ctx, c_out, hidden_size, batch_size, 1));
   }
   return outputs;
 }
@@ -1053,6 +1353,22 @@ EmitResult EmitGemmNode(ggml_context* ctx,
 
   return EmitOutputs{out};
 }
+
+// TODO(channel-shuffle): fuse the Reshape→Transpose→Reshape triple that ShuffleNet
+// (and similar) use for channel shuffle. The 5D intermediate ([N,g,k,H,W] with
+// perm=[0,2,1,3,4]) cannot be held in ggml (GGML_MAX_DIMS=4), but the whole
+// triple collapses to a pure 4D view+permute+cont+reshape because H,W are
+// pass-through:
+//   flat    = reshape_4d(in, H*W, k, g, N)
+//   swapped = permute(flat, 0, 2, 1, 3)
+//   packed  = cont(swapped)
+//   out     = reshape_4d(packed, W, H, C, N)
+// Needs: pattern detector in EpGetCapability (verify single-consumer on both
+// 5D intermediates), skip ensure_value for the rank-5 values (the rank check
+// at src/ggml_execution_provider.cc:309 trips otherwise), and a synthetic
+// fused NodeDesc (e.g. "__ChannelShuffle" with attrs {g,k}) emitting the above.
+// Without this, those Reshape/Transpose nodes fall back to CPU — numerically
+// correct but breaks assert_all_nodes_run_on_ggml on shufflenet.
 
 // ONNX Reshape: data + shape input. We require the output shape to be fully static
 // (resolved by shape inference) and snapshot it at compile time — the runtime shape
@@ -2263,6 +2579,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Max"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
       {{"", "Min"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
       {{"", "GRU"}, {IsSupportedGRUNode, CompileGRUAttributes, EmitGRUNode}},
+      {{"", "LSTM"}, {IsSupportedLSTMNode, CompileLSTMAttributes, EmitLSTMNode}},
       {{"", "Relu"},     {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Sigmoid"},  {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Tanh"},     {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},

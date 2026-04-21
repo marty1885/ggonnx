@@ -1086,6 +1086,64 @@ def test_single_batchnorm(suite_tmpdir, ep_library: Path, x_shape) -> None:
     assert_all_nodes_run_on_ggml(ggml)
 
 
+def build_single_lstm_model(tmpdir: Path) -> Path:
+    seq_length = 3
+    batch_size = 2
+    input_size = 4
+    hidden_size = 3
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [seq_length, batch_size, input_size])
+    w = helper.make_tensor_value_info("w", TensorProto.FLOAT, [1, 4 * hidden_size, input_size])
+    r = helper.make_tensor_value_info("r", TensorProto.FLOAT, [1, 4 * hidden_size, hidden_size])
+    b = helper.make_tensor_value_info("b", TensorProto.FLOAT, [1, 8 * hidden_size])
+    initial_h = helper.make_tensor_value_info("initial_h", TensorProto.FLOAT, [1, batch_size, hidden_size])
+    initial_c = helper.make_tensor_value_info("initial_c", TensorProto.FLOAT, [1, batch_size, hidden_size])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [seq_length, 1, batch_size, hidden_size])
+    y_h = helper.make_tensor_value_info("y_h", TensorProto.FLOAT, [1, batch_size, hidden_size])
+    y_c = helper.make_tensor_value_info("y_c", TensorProto.FLOAT, [1, batch_size, hidden_size])
+    node = helper.make_node(
+        "LSTM",
+        ["x", "w", "r", "b", "", "initial_h", "initial_c"],
+        ["y", "y_h", "y_c"],
+        name="lstm_0",
+        hidden_size=hidden_size,
+    )
+    graph = helper.make_graph(
+        [node], "single_lstm", [x, w, r, b, initial_h, initial_c], [y, y_h, y_c]
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def lstm_inputs() -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(42)
+    hidden_size = 3
+    input_size = 4
+    batch_size = 2
+    seq_length = 3
+    return {
+        "x": rng.standard_normal((seq_length, batch_size, input_size)).astype(np.float32) * 0.5,
+        "w": rng.standard_normal((1, 4 * hidden_size, input_size)).astype(np.float32) * 0.3,
+        "r": rng.standard_normal((1, 4 * hidden_size, hidden_size)).astype(np.float32) * 0.3,
+        "b": rng.standard_normal((1, 8 * hidden_size)).astype(np.float32) * 0.1,
+        "initial_h": rng.standard_normal((1, batch_size, hidden_size)).astype(np.float32) * 0.2,
+        "initial_c": rng.standard_normal((1, batch_size, hidden_size)).astype(np.float32) * 0.2,
+    }
+
+
+def test_single_lstm_matches_cpu(suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_single_lstm_model(suite_tmpdir)
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    inputs = lstm_inputs()
+    cpu_y, cpu_y_h, cpu_y_c = cpu.run(["y", "y_h", "y_c"], inputs)
+    ggml_y, ggml_y_h, ggml_y_c = ggml.run(["y", "y_h", "y_c"], inputs)
+    np.testing.assert_allclose(ggml_y, cpu_y, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(ggml_y_h, cpu_y_h, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(ggml_y_c, cpu_y_c, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 def test_single_gru_matches_cpu(suite_tmpdir, ep_library: Path) -> None:
     model_path = build_single_gru_model(suite_tmpdir)
     cpu = cpu_session(model_path)

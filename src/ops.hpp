@@ -92,6 +92,9 @@ struct NodeDesc {
   struct GRUAttrs {
     int64_t hidden_size{};
   };
+  struct LSTMAttrs {
+    int64_t hidden_size{};
+  };
   struct AlphaAttrs {
     float alpha{};
   };
@@ -171,6 +174,7 @@ struct NodeDesc {
 
   using Attrs = std::variant<NoAttrs,
                              GRUAttrs,
+                             LSTMAttrs,
                              AlphaAttrs,
                              AxisAttrs,
                              Conv2DAttrs,

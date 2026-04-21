@@ -642,8 +642,27 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
                           "': declared " + FormatDims(declared_dims) + ", got " +
                           FormatDims(emitted_dims));
         graph_state->values[output_id] = node_output;
-        graph_state->value_dims[output_id] =
-            shapeIsFullyStatic(declared_dims) ? declared_dims : emitted_dims;
+        // Preserve the declared ONNX rank even when some dims are dynamic: GGML
+        // strips trailing unit dims (and only carries 4), so a declared shape
+        // like (1, S, V) would otherwise collapse to (S, V) when taken straight
+        // from the ggml tensor. Merge right-aligned — declared wins when
+        // concrete, emitted fills in dynamic slots.
+        if (shapeIsFullyStatic(declared_dims)) {
+          graph_state->value_dims[output_id] = declared_dims;
+        } else {
+          std::vector<int64_t> merged(declared_dims.size(), 1);
+          const size_t off = declared_dims.size() >= emitted_dims.size()
+                                 ? declared_dims.size() - emitted_dims.size()
+                                 : 0;
+          for (size_t i = 0; i < merged.size(); ++i) {
+            if (declared_dims[i] >= 0) {
+              merged[i] = declared_dims[i];
+            } else if (i >= off) {
+              merged[i] = emitted_dims[i - off];
+            }
+          }
+          graph_state->value_dims[output_id] = std::move(merged);
+        }
       }
       GGONNX_ASSERT(emitted_index == emitted_outputs->size(), "compiled node emitted too many outputs");
     }
