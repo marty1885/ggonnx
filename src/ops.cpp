@@ -20,23 +20,13 @@ TensorMetadata getTensorMetadata(Ort::ConstValue value) {
   return result;
 }
 
-bool HasNodeAttribute(Ort::ConstNode node, std::string_view attribute_name) {
-  for (const Ort::ConstOpAttr& attr : node.GetAttributes()) {
-    if (attr.GetName() == attribute_name) {
-      return true;
-    }
-  }
-  return false;
-}
-
 template <typename T>
 std::optional<T> readNodeAttribute(Ort::ConstNode node, const char* attribute_name) {
-  if (!HasNodeAttribute(node, attribute_name)) {
+  Ort::ConstOpAttr attr{nullptr};
+  const Ort::Status status = node.GetAttributeByName(attribute_name, attr);
+  if (!status.IsOK() || attr == nullptr) {
     return std::nullopt;
   }
-
-  Ort::ConstOpAttr attr{nullptr};
-  Ort::ThrowOnError(node.GetAttributeByName(attribute_name, attr));
 
   T value{};
   if constexpr (std::is_same_v<T, std::vector<std::string>> ||
