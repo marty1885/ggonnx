@@ -12,6 +12,7 @@
 #include <vector>
 #include "inner/helpers.hpp"
 #include "inner/ort_api_helpers.hpp"
+#include "meta_eval.hpp"
 #include "ops.hpp"
 
 #include <ggml-backend.h>
@@ -50,6 +51,7 @@ struct GGMLEp {
 
 struct ValueDesc {
   std::string name;
+  ONNXTensorElementDataType element_type{};
   std::vector<int64_t> dims;
   bool is_graph_input{};
   bool is_graph_output{};
@@ -72,6 +74,7 @@ struct CompiledPartition {
   ggml_context* constant_ctx{nullptr};
   ggml_backend_buffer_t constant_buffer{nullptr};
   std::vector<ggml_tensor*> constants;
+  std::vector<std::optional<ConstantTensor>> folded_constants;
 
   CompiledPartition() = default;
   CompiledPartition(const CompiledPartition&) = delete;
@@ -278,21 +281,17 @@ void MaterializeConstantData(const float* src,
 CompiledPartition CompilePartition(const OrtGraph* graph) {
   GGONNX_NOT_NULL(graph, "graph must not be null");
   const Ort::ConstGraph ort_graph{graph};
+  MetaAnalysis meta_analysis = AnalyzeCompileTimeConstants(graph);
+  SetActiveCompileTimeConstants(&meta_analysis.constants);
   CompiledPartition partition;
+  struct ActiveConstantsGuard {
+    ~ActiveConstantsGuard() { SetActiveCompileTimeConstants(nullptr); }
+  } active_constants_guard;
+
   partition.backend = ggml_backend_cpu_init();
   GGONNX_NOT_NULL(partition.backend, "ggml_backend_cpu_init failed");
   std::unordered_map<std::string, size_t> value_ids;
-  // name -> OrtValue* for constant initializers. Populated up front, consumed
-  // when we decide on per-use layouts during node walking.
-  std::unordered_map<std::string, Ort::ConstValue> constants_by_name;
-  for (Ort::ConstValueInfo init : ort_graph.GetInitializers()) {
-    if (init == nullptr) continue;
-    if (!init.IsConstantInitializer()) continue;
-    Ort::ConstValue value{nullptr};
-    Ort::ThrowOnError(init.GetInitializer(value));
-    if (value == nullptr) continue;
-    constants_by_name.emplace(init.GetName(), value);
-  }
+  ConstantValueMap constants_by_name = meta_analysis.constants;
   // value_id -> chosen layout. Populated during node walking; first writer wins,
   // later uses that disagree force AS_IS and the op falls back to runtime transpose.
   std::unordered_map<size_t, ConstantLayout> constant_layout_by_id;
@@ -306,13 +305,14 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
   auto ensure_value = [&](Ort::ConstValueInfo value_info) -> size_t {
     const std::string name = value_info.GetName();
     const TensorMetadata metadata = getTensorMetadata(value_info);
-    GGONNX_ASSERT(metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-            "compiled partition currently supports only float32 tensors");
-    GGONNX_ASSERT(rankSupportedByGGML(metadata),
-                  "compiled partition requires tensor rank <= " + std::to_string(GGML_MAX_DIMS) +
-                      ", got " + std::to_string(metadata.dims.size()) + " for value '" + name + "'");
+    if (metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      GGONNX_ASSERT(rankSupportedByGGML(metadata),
+                    "compiled partition requires tensor rank <= " + std::to_string(GGML_MAX_DIMS) +
+                        ", got " + std::to_string(metadata.dims.size()) + " for value '" + name + "'");
+    }
     const auto it = value_ids.find(name);
     if (it != value_ids.end()) {
+      partition.values[it->second].element_type = metadata.element_type;
       partition.values[it->second].dims = metadata.dims;
       return it->second;
     }
@@ -321,6 +321,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
     value_ids.emplace(name, id);
     ValueDesc value;
     value.name = name;
+    value.element_type = metadata.element_type;
     value.dims = metadata.dims;
     partition.values.push_back(std::move(value));
     return id;
@@ -361,6 +362,14 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
 
   for (Ort::ConstNode node : ort_graph.GetNodes()) {
     GGONNX_ASSERT(node != nullptr, "graph node must not be null");
+    if (meta_analysis.folded_nodes.count(NodeKey(node)) > 0) {
+      for (Ort::ConstValueInfo output : node.GetOutputs()) {
+        if (output != nullptr) {
+          ensure_value(output);
+        }
+      }
+      continue;
+    }
     if (!isNodeSupported(node)) {
       throw std::runtime_error("GGONNX Compile received an unsupported partition");
     }
@@ -411,8 +420,14 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
     partition.nodes.push_back(std::move(compiled_node));
   }
 
-  GGONNX_ASSERT(!partition.nodes.empty(), "compiled partition must contain at least one node");
   GGONNX_ASSERT(!partition.graph_outputs.empty(), "compiled partition must contain at least one graph output");
+  partition.folded_constants.resize(partition.values.size());
+  for (size_t id = 0; id < partition.values.size(); ++id) {
+    auto it = constants_by_name.find(partition.values[id].name);
+    if (it != constants_by_name.end()) {
+      partition.folded_constants[id] = it->second;
+    }
+  }
 
   // Materialize detected constants into a persistent ggml context. Sized
   // tightly: sum of constant data bytes + per-tensor overhead + slack.
@@ -438,10 +453,8 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
       const ValueDesc& value = partition.values[id];
       auto it = constants_by_name.find(value.name);
       GGONNX_ASSERT(it != constants_by_name.end(), "constant tensor lost during compile");
-
-      const void* src_data = nullptr;
-      THROW_ON_ERROR(GetOrtApi().GetTensorData(it->second, &src_data));
-      GGONNX_NOT_NULL(src_data, "ORT returned null tensor data for constant");
+      GGONNX_ASSERT(it->second.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                    "GGML constants must be float32");
 
       std::vector<int64_t> tensor_dims = value.dims;
       if (layout == ConstantLayout::MATMUL_WEIGHT_TRANSPOSED && tensor_dims.size() >= 2) {
@@ -469,13 +482,11 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
       const ValueDesc& value = partition.values[id];
       auto it = constants_by_name.find(value.name);
       GGONNX_ASSERT(it != constants_by_name.end(), "constant tensor lost during backend upload");
-
-      const void* src_data = nullptr;
-      THROW_ON_ERROR(GetOrtApi().GetTensorData(it->second, &src_data));
-      GGONNX_NOT_NULL(src_data, "ORT returned null tensor data for constant");
+      GGONNX_ASSERT(it->second.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                    "GGML constants must be float32");
 
       std::vector<float> materialized(elementCount(value.dims));
-      MaterializeConstantData(static_cast<const float*>(src_data), value.dims, layout, t);
+      MaterializeConstantData(reinterpret_cast<const float*>(it->second.data.data()), value.dims, layout, t);
       std::memcpy(materialized.data(), t->data, materialized.size() * sizeof(float));
       ggml_backend_tensor_set(t, materialized.data(), 0, materialized.size() * sizeof(float));
     }
@@ -637,23 +648,36 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
       GGONNX_ASSERT(emitted_index == emitted_outputs->size(), "compiled node emitted too many outputs");
     }
 
-    graph_state->graph = ggml_new_graph(ctx);
-    GGONNX_NOT_NULL(graph_state->graph, "ggml_new_graph failed");
+    bool has_runtime_output = false;
     for (size_t i = 0; i < partition.graph_outputs.size(); ++i) {
       const size_t output_id = partition.graph_outputs[i];
       GGONNX_ASSERT(output_id < graph_state->values.size(), "graph output index out of range");
       ggml_tensor* output = graph_state->values[output_id];
-      GGONNX_NOT_NULL(output, "compiled partition output was not materialized");
+      if (output == nullptr) {
+        GGONNX_ASSERT(partition.folded_constants.size() > output_id &&
+                          partition.folded_constants[output_id].has_value(),
+                      "compiled partition output was not materialized: " +
+                          partition.values[output_id].name);
+        graph_state->value_dims[output_id] = partition.values[output_id].dims;
+        continue;
+      }
+      if (!has_runtime_output) {
+        graph_state->graph = ggml_new_graph(ctx);
+        GGONNX_NOT_NULL(graph_state->graph, "ggml_new_graph failed");
+        has_runtime_output = true;
+      }
       ggml_set_output(output);
       ggml_build_forward_expand(graph_state->graph, output);
       graph_state->output_tensors[i] = output;
     }
 
-    graph_state->gallocr =
-        ggml_gallocr_new(ggml_backend_get_default_buffer_type(partition.backend));
-    GGONNX_NOT_NULL(graph_state->gallocr, "ggml_gallocr_new failed");
-    GGONNX_ASSERT(ggml_gallocr_alloc_graph(graph_state->gallocr, graph_state->graph),
-                  "ggml_gallocr_alloc_graph failed");
+    if (has_runtime_output) {
+      graph_state->gallocr =
+          ggml_gallocr_new(ggml_backend_get_default_buffer_type(partition.backend));
+      GGONNX_NOT_NULL(graph_state->gallocr, "ggml_gallocr_new failed");
+      GGONNX_ASSERT(ggml_gallocr_alloc_graph(graph_state->gallocr, graph_state->graph),
+                    "ggml_gallocr_alloc_graph failed");
+    }
 
     g_debug_graph_build_count.fetch_add(1, std::memory_order_relaxed);
     return graph_state;
@@ -667,9 +691,7 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
   GGONNX_NOT_NULL(state.partition, "compute state missing compiled partition");
   const CompiledPartition& partition = *state.partition;
   GGONNX_NOT_NULL(kernel_context, "kernel context must not be null");
-  GGONNX_ASSERT(!partition.graph_inputs.empty(), "compiled partition must contain graph inputs");
   GGONNX_ASSERT(!partition.graph_outputs.empty(), "compiled partition must contain graph outputs");
-  GGONNX_ASSERT(!partition.nodes.empty(), "compiled partition must contain nodes");
   size_t num_inputs = 0;
   size_t num_outputs = 0;
   THROW_ON_ERROR(GetOrtApi().KernelContext_GetInputCount(kernel_context, &num_inputs));
@@ -718,7 +740,8 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
                           state.active_graph->input_tensors[i]);
   }
 
-  if (ggml_backend_graph_compute(partition.backend, state.active_graph->graph) != GGML_STATUS_SUCCESS) {
+  if (state.active_graph->graph != nullptr &&
+      ggml_backend_graph_compute(partition.backend, state.active_graph->graph) != GGML_STATUS_SUCCESS) {
     throw std::runtime_error("ggml_backend_graph_compute failed");
   }
 
@@ -735,6 +758,15 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
     void* output_data = nullptr;
     THROW_ON_ERROR(GetOrtApi().GetTensorMutableData(output_value, &output_data));
     GGONNX_NOT_NULL(output_data, "ORT returned null output buffer");
+
+    if (partition.folded_constants.size() > output_id && partition.folded_constants[output_id].has_value()) {
+      const ConstantTensor& constant = *partition.folded_constants[output_id];
+      const size_t bytes = constant.data.size();
+      if (bytes > 0) {
+        std::memcpy(output_data, constant.data.data(), bytes);
+      }
+      continue;
+    }
 
     ggml_tensor* output_tensor = state.active_graph->output_tensors[i];
     GGONNX_NOT_NULL(output_tensor, "missing cached GGML output tensor");
@@ -844,6 +876,11 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
   return WrapStatus([&] {
     GGONNX_NOT_NULL(graph_support_info, "graph support info must not be null");
     const Ort::ConstGraph ort_graph{graph};
+    const MetaAnalysis meta_analysis = AnalyzeCompileTimeConstants(graph);
+    SetActiveCompileTimeConstants(&meta_analysis.constants);
+    struct ActiveConstantsGuard {
+      ~ActiveConstantsGuard() { SetActiveCompileTimeConstants(nullptr); }
+    } active_constants_guard;
 
     // Partition by walking nodes in topological order (how ORT yields them) and
     // sealing the current fuse group whenever we hit an unsupported node. Any
@@ -851,17 +888,55 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
     // that lies strictly between them in topological order, so an unsupported
     // node on such a path is guaranteed to split them into different groups
     // Because ONNX wants that and will complain if not in that way
+
+    // Build the set of value names that are "live at this graph level" — either
+    // consumed as a direct or implicit input by some node in this graph, or
+    // named as a graph output. A node whose outputs are only consumed inside a
+    // deeper nested subgraph (via implicit capture of the inner If/Loop/Scan
+    // body) is NOT visible here: ORT's fused-node output computation only looks
+    // at direct consumption at the current level, so including such a node in
+    // a fuse group produces a partition with zero graph outputs and Compile
+    // rejects it. Filter those nodes out of our capability.
+    std::unordered_set<std::string> live_names;
+    for (Ort::ConstNode node : ort_graph.GetNodes()) {
+      for (Ort::ConstValueInfo v : node.GetInputs()) {
+        if (v != nullptr) live_names.insert(std::string(v.GetName()));
+      }
+      for (Ort::ConstValueInfo v : node.GetImplicitInputs()) {
+        if (v != nullptr) live_names.insert(std::string(v.GetName()));
+      }
+    }
+    for (Ort::ConstValueInfo v : ort_graph.GetOutputs()) {
+      if (v != nullptr) live_names.insert(std::string(v.GetName()));
+    }
+    auto has_visible_output = [&](Ort::ConstNode node) {
+      for (Ort::ConstValueInfo v : node.GetOutputs()) {
+        if (v == nullptr) continue;
+        if (live_names.count(std::string(v.GetName())) > 0) return true;
+      }
+      return false;
+    };
+
     std::vector<const OrtNode*> current_group;
+    bool current_group_has_runtime_node = false;
     auto flush_group = [&] {
       if (current_group.empty()) return;
+      if (!current_group_has_runtime_node) {
+        current_group.clear();
+        current_group_has_runtime_node = false;
+        return;
+      }
       THROW_ON_ERROR(GetOrtEpApi().EpGraphSupportInfo_AddNodesToFuse(
           graph_support_info, current_group.data(), current_group.size(), nullptr));
       current_group.clear();
+      current_group_has_runtime_node = false;
     };
 
     for (Ort::ConstNode node : ort_graph.GetNodes()) {
-      if (isNodeSupported(node)) {
+      const bool supported = isNodeSupported(node) && has_visible_output(node);
+      if (supported || meta_analysis.folded_nodes.count(NodeKey(node)) > 0) {
         current_group.push_back(node);
+        current_group_has_runtime_node = current_group_has_runtime_node || supported;
       } else {
         flush_group();
       }

@@ -236,10 +236,31 @@ def test_broadcast_add_runs_on_ggml(suite_tmpdir, ep_library: Path, debug_api) -
     assert_all_nodes_run_on_ggml(ggml)
 
 
-@pytest.mark.parametrize("op_type", ["Add", "Sub", "Mul", "Div"])
+@pytest.mark.parametrize("op_type", ["Add", "Sub", "Mul", "Div", "Max", "Min"])
 def test_single_binary_ops(suite_tmpdir, ep_library: Path, op_type: str) -> None:
     model_path = build_single_binary_model(suite_tmpdir, op_type)
     assert_model_matches_cpu(model_path, ep_library, "z", standard_inputs())
+
+
+def build_scalar_broadcast_binary_model(tmpdir: Path, op_type: str, x_shape) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1] * len(x_shape))
+    z = helper.make_tensor_value_info("z", TensorProto.FLOAT, list(x_shape))
+    node = helper.make_node(op_type, ["x", "y"], ["z"], name=f"{op_type.lower()}_bcast")
+    graph = helper.make_graph([node], f"bcast_{op_type.lower()}", [x, y], [z])
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize("op_type", ["Max", "Min"])
+@pytest.mark.parametrize("x_shape", [(2, 3), (1, 4, 5, 6)])
+def test_min_max_scalar_broadcast(suite_tmpdir, ep_library: Path, op_type, x_shape) -> None:
+    model_path = build_scalar_broadcast_binary_model(suite_tmpdir, op_type, x_shape)
+    rng = np.random.default_rng(31)
+    inputs = {
+        "x": rng.standard_normal(x_shape).astype(np.float32),
+        "y": np.array(-0.4, dtype=np.float32).reshape([1] * len(x_shape)),
+    }
+    assert_model_matches_cpu(model_path, ep_library, "z", inputs)
 
 
 def test_dynamic_mixed_binary_cache_reuse(suite_tmpdir, ep_library: Path, debug_api) -> None:
@@ -821,6 +842,175 @@ def test_single_slice(suite_tmpdir, ep_library: Path, x_shape, y_shape, starts, 
     model_path = build_slice_model(suite_tmpdir, x_shape, y_shape, starts, ends, axes=axes)
     rng = np.random.default_rng(21)
     inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_shape_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+
+    starts_i32 = helper.make_tensor("starts_i32", TensorProto.INT32, [1], [0])
+    ends_i32 = helper.make_tensor("ends_i32", TensorProto.INT32, [1], [2])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Cast", ["shape"], ["shape_i32"], name="shape_cast", to=TensorProto.INT32),
+        helper.make_node("Cast", ["starts_i32"], ["starts"], name="starts_cast", to=TensorProto.INT64),
+        helper.make_node("Cast", ["ends_i32"], ["ends"], name="ends_cast", to=TensorProto.INT64),
+        helper.make_node(
+            "Slice",
+            ["shape_i32", "starts", "ends", "axes", "steps"],
+            ["shape_prefix_i32"],
+            name="shape_slice",
+        ),
+        helper.make_node("Cast", ["shape_prefix_i32"], ["shape_prefix"], name="shape_prefix_cast", to=TensorProto.INT64),
+        helper.make_node("Reshape", ["x", "shape_prefix"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(nodes, "shape_folded_reshape", [x], [y], initializer=[starts_i32, ends_i32, axes, steps])
+    return ensure_model(tmpdir, graph)
+
+
+def build_shape_concat_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+
+    starts0 = helper.make_tensor("starts0", TensorProto.INT64, [1], [0])
+    ends0 = helper.make_tensor("ends0", TensorProto.INT64, [1], [1])
+    starts1_i32 = helper.make_tensor("starts1_i32", TensorProto.INT32, [1], [1])
+    ends1_i32 = helper.make_tensor("ends1_i32", TensorProto.INT32, [1], [2])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts0", "ends0", "axes", "steps"], ["dim0"], name="slice_dim0"),
+        helper.make_node("Cast", ["shape"], ["shape_i32"], name="shape_cast", to=TensorProto.INT32),
+        helper.make_node("Cast", ["starts1_i32"], ["starts1"], name="starts1_cast", to=TensorProto.INT64),
+        helper.make_node("Cast", ["ends1_i32"], ["ends1"], name="ends1_cast", to=TensorProto.INT64),
+        helper.make_node("Slice", ["shape_i32", "starts1", "ends1", "axes", "steps"], ["dim1_i32"], name="slice_dim1"),
+        helper.make_node("Cast", ["dim1_i32"], ["dim1"], name="dim1_cast", to=TensorProto.INT64),
+        helper.make_node("Concat", ["dim0", "dim1"], ["new_shape"], name="shape_concat", axis=0),
+        helper.make_node("Reshape", ["x", "new_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "shape_concat_folded_reshape",
+        [x],
+        [y],
+        initializer=[starts0, ends0, starts1_i32, ends1_i32, axes, steps],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_shape_tile_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+
+    starts = helper.make_tensor("starts", TensorProto.INT64, [1], [0])
+    ends = helper.make_tensor("ends", TensorProto.INT64, [1], [2])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+    repeats = helper.make_tensor("repeats", TensorProto.INT64, [1], [2])
+    trim_starts = helper.make_tensor("trim_starts", TensorProto.INT64, [1], [0])
+    trim_ends = helper.make_tensor("trim_ends", TensorProto.INT64, [1], [2])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts", "ends", "axes", "steps"], ["shape_copy"], name="slice_shape"),
+        helper.make_node("Tile", ["shape_copy", "repeats"], ["tiled_shape"], name="tile_shape"),
+        helper.make_node(
+            "Slice",
+            ["tiled_shape", "trim_starts", "trim_ends", "axes", "steps"],
+            ["trimmed_shape"],
+            name="trim_shape",
+        ),
+        helper.make_node("Reshape", ["x", "trimmed_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "shape_tile_folded_reshape",
+        [x],
+        [y],
+        initializer=[starts, ends, axes, steps, repeats, trim_starts, trim_ends],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_loop_arange_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+
+    starts = helper.make_tensor("starts", TensorProto.INT64, [1], [0])
+    ends = helper.make_tensor("ends", TensorProto.INT64, [1], [1])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+    squeeze_axes = helper.make_tensor("squeeze_axes", TensorProto.INT64, [1], [0])
+    cond = helper.make_tensor("loop_cond", TensorProto.BOOL, [], [True])
+    start = helper.make_tensor("loop_start", TensorProto.INT32, [], [2])
+    delta = helper.make_tensor("loop_delta", TensorProto.INT32, [], [1])
+
+    body_in_iter = helper.make_tensor_value_info("i", TensorProto.INT64, [])
+    body_in_cond = helper.make_tensor_value_info("cond_in", TensorProto.BOOL, [])
+    body_in_prev = helper.make_tensor_value_info("prev", TensorProto.INT32, [])
+    body_out_cond = helper.make_tensor_value_info("cond_out", TensorProto.BOOL, [])
+    body_out_current = helper.make_tensor_value_info("current", TensorProto.INT32, [])
+    body_out_range = helper.make_tensor_value_info("range", TensorProto.INT32, [])
+    body_nodes = [
+        helper.make_node("Add", ["prev", "loop_delta"], ["current"], name="loop_add"),
+        helper.make_node("Identity", ["prev"], ["range"], name="loop_range"),
+        helper.make_node("Identity", ["cond_in"], ["cond_out"], name="loop_cond_out"),
+    ]
+    body = helper.make_graph(
+        body_nodes,
+        "loop_body",
+        [body_in_iter, body_in_cond, body_in_prev],
+        [body_out_cond, body_out_current, body_out_range],
+    )
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts", "ends", "axes", "steps"], ["trip_count_vec"], name="slice_trip_count"),
+        helper.make_node("Squeeze", ["trip_count_vec", "squeeze_axes"], ["trip_count_i64"], name="squeeze_trip_count"),
+        helper.make_node(
+            "Loop",
+            ["trip_count_i64", "loop_cond", "loop_start"],
+            ["loop_final", "loop_range"],
+            name="shape_loop",
+            body=body,
+        ),
+        helper.make_node("Cast", ["loop_range"], ["reshape_shape"], name="cast_shape", to=TensorProto.INT64),
+        helper.make_node("Reshape", ["x", "reshape_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "loop_arange_folded_reshape",
+        [x],
+        [y],
+        initializer=[starts, ends, axes, steps, squeeze_axes, cond, start, delta],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        build_shape_folded_reshape_model,
+        build_shape_concat_folded_reshape_model,
+        build_shape_tile_folded_reshape_model,
+        build_loop_arange_folded_reshape_model,
+    ],
+)
+def test_compile_time_shape_subgraph_folding(suite_tmpdir, ep_library: Path, builder) -> None:
+    model_path = builder(suite_tmpdir)
+    rng = np.random.default_rng(23)
+    inputs = {"x": rng.standard_normal((2, 3)).astype(np.float32)}
     cpu = cpu_session(model_path)
     expected = cpu.run(["y"], inputs)[0]
     ggml = ggml_session(model_path, ep_library)

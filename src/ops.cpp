@@ -1,7 +1,50 @@
 #include "ops.hpp"
 #include "inner/helpers.hpp"
 #include "inner/ort_api_helpers.hpp"
+#include <cstring>
 #include <unordered_map>
+
+namespace {
+
+thread_local const ConstantValueMap* g_active_compile_time_constants = nullptr;
+
+std::optional<ConstantTensor> LookupCompileTimeConstant(Ort::ConstValueInfo value_info) {
+  if (value_info == nullptr) return std::nullopt;
+  if (value_info.IsConstantInitializer()) {
+    Ort::ConstValue value{nullptr};
+    Ort::ThrowOnError(value_info.GetInitializer(value));
+    if (value != nullptr) {
+      const TensorMetadata meta = getTensorMetadata(value);
+      const auto tensor_info = value.GetTensorTypeAndShapeInfo();
+      const size_t bytes = tensor_info.GetElementCount() *
+                           (meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ? sizeof(float)
+                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 ? sizeof(int32_t)
+                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 ? sizeof(int64_t)
+                            : 0);
+      if (bytes == 0 && tensor_info.GetElementCount() != 0) {
+        return std::nullopt;
+      }
+      const void* raw_data = nullptr;
+      ggonnx::ort_internal::THROW_ON_ERROR(
+          ggonnx::ort_internal::GetOrtApi().GetTensorData(value, &raw_data));
+      GGONNX_NOT_NULL(raw_data, "ORT returned null tensor data for constant");
+      ConstantTensor tensor;
+      tensor.element_type = meta.element_type;
+      tensor.dims = meta.dims;
+      tensor.data.resize(bytes);
+      if (bytes > 0) {
+        std::memcpy(tensor.data.data(), raw_data, bytes);
+      }
+      return tensor;
+    }
+  }
+  if (g_active_compile_time_constants == nullptr) return std::nullopt;
+  auto it = g_active_compile_time_constants->find(value_info.GetName());
+  if (it == g_active_compile_time_constants->end()) return std::nullopt;
+  return it->second;
+}
+
+}  // namespace
 
 TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info) {
   const auto tensor_info = value_info.TypeInfo().GetTensorTypeAndShapeInfo();
@@ -10,6 +53,14 @@ TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info) {
   result.element_type = tensor_info.GetElementType();
   result.dims = tensor_info.GetShape();
   return result;
+}
+
+void SetActiveCompileTimeConstants(const ConstantValueMap* constants) {
+  g_active_compile_time_constants = constants;
+}
+
+const ConstantValueMap* GetActiveCompileTimeConstants() {
+  return g_active_compile_time_constants;
 }
 
 TensorMetadata getTensorMetadata(Ort::ConstValue value) {
@@ -61,17 +112,9 @@ std::optional<std::vector<T>> readConstantInputArray(Ort::ConstNode node,
   }
 
   const Ort::ConstValueInfo input = inputs[input_idx];
-  if (!input.IsConstantInitializer()) {
-    return std::nullopt;
-  }
-
-  Ort::ConstValue value{nullptr};
-  Ort::ThrowOnError(input.GetInitializer(value));
-  if (value == nullptr) {
-    return std::nullopt;
-  }
-
-  const TensorMetadata meta = getTensorMetadata(value);
+  const auto constant = LookupCompileTimeConstant(input);
+  if (!constant.has_value()) return std::nullopt;
+  const TensorMetadata meta{.element_type = constant->element_type, .dims = constant->dims};
   if (meta.element_type != element_type) {
     return std::nullopt;
   }
@@ -81,9 +124,7 @@ std::optional<std::vector<T>> readConstantInputArray(Ort::ConstNode node,
     return std::vector<T>{};
   }
 
-  const void* raw_data = nullptr;
-  ggonnx::ort_internal::THROW_ON_ERROR(ggonnx::ort_internal::GetOrtApi().GetTensorData(value, &raw_data));
-  const T* typed_data = static_cast<const T*>(raw_data);
+  const T* typed_data = reinterpret_cast<const T*>(constant->data.data());
   GGONNX_NOT_NULL(typed_data, "ORT returned null tensor data for constant");
   return std::vector<T>(typed_data, typed_data + count);
 }
@@ -132,7 +173,8 @@ bool inferIntegerSpatialScale(const TensorMetadata& x,
 }
 
 bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_type) {
-  if (!(op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div")) {
+  if (!(op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div" ||
+        op_type == "Max" || op_type == "Min")) {
     return false;
   }
 
@@ -161,10 +203,13 @@ bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_t
   if (!rankSupportedByGGML(lhs) || !rankSupportedByGGML(rhs) || !rankSupportedByGGML(out)) {
     return false;
   }
-  if (!broadcastSupportedByGGML(lhs.dims, rhs.dims)) {
+  // Either operand may broadcast to the output shape — check both sides against
+  // the output rather than against each other. The older lhs→rhs check only
+  // accepted broadcasts where rhs was the larger side.
+  if (!broadcastSupportedByGGML(lhs.dims, out.dims)) {
     return false;
   }
-  if (!broadcastSupportedByGGML(lhs.dims, out.dims)) {
+  if (!broadcastSupportedByGGML(rhs.dims, out.dims)) {
     return false;
   }
 
@@ -314,6 +359,17 @@ EmitResult EmitElementwiseBinaryNode(ggml_context* ctx,
     return EmitOutputs{ggml_mul(ctx, lhs, rhs)};
   } else if (op_type == "Div") {
     return EmitOutputs{ggml_div(ctx, lhs, rhs)};
+  } else if (op_type == "Max" || op_type == "Min") {
+    // ggml has no elementwise max/min, so synthesize:
+    //   max(a, b) = (a + b + |a - b|) / 2
+    //   min(a, b) = (a + b - |a - b|) / 2
+    // Broadcast is handled by the underlying add/sub — matches the support check.
+    ggml_tensor* sum = ggml_add(ctx, lhs, rhs);
+    ggml_tensor* diff = ggml_sub(ctx, lhs, rhs);
+    ggml_tensor* abs_diff = ggml_abs(ctx, diff);
+    ggml_tensor* combined = (op_type == "Max") ? ggml_add(ctx, sum, abs_diff)
+                                               : ggml_sub(ctx, sum, abs_diff);
+    return EmitOutputs{ggml_scale(ctx, combined, 0.5f)};
   }
 
   return std::nullopt;
@@ -925,6 +981,42 @@ EmitResult EmitReshapeNode(ggml_context* ctx,
   ggml_tensor* src = ggml_is_contiguous(data) ? data : ggml_cont(ctx, data);
   ggml_tensor* out = ggml_reshape_4d(ctx, src, target[0], target[1], target[2], target[3]);
   return EmitOutputs{out};
+}
+
+// ONNX Flatten: collapses input dims around `axis` into a 2D tensor. We reuse
+// the Reshape machinery — the output shape is fully determined by shape
+// inference, so we snapshot it and emit a ggml reshape.
+bool IsSupportedFlattenNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  const TensorMetadata in = getTensorMetadata(inputs[0]);
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(in) || !rankSupportedByGGML(out)) {
+    return false;
+  }
+  if (!shapeIsFullyStatic(out.dims)) {
+    return false;
+  }
+  return true;
+}
+
+void CompileFlattenAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto outputs = node.GetOutputs();
+  GGONNX_ASSERT(outputs.size() == 1 && outputs[0] != nullptr,
+                "Flatten must have a single output");
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  compiled_node->attrs = NodeDesc::ReshapeAttrs{.onnx_dims = out.dims};
 }
 
 // ONNX MaxPool / AveragePool (2D only). ONNX layout X[N,C,H,W] -> ggml ne=[W,H,C,N],
@@ -1805,6 +1897,8 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Sub"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
       {{"", "Mul"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
       {{"", "Div"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
+      {{"", "Max"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
+      {{"", "Min"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
       {{"", "GRU"}, {IsSupportedGRUNode, CompileGRUAttributes, EmitGRUNode}},
       {{"", "Relu"},     {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Sigmoid"},  {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
@@ -1822,6 +1916,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Conv"},     {IsSupportedConvNode, CompileConvAttributes, EmitConvNode, nullptr}},
       {{"", "Gemm"},     {IsSupportedGemmNode, CompileGemmAttributes, EmitGemmNode, GemmConstantLayout}},
       {{"", "Reshape"},  {IsSupportedReshapeNode, CompileReshapeAttributes, EmitReshapeNode}},
+      {{"", "Flatten"},  {IsSupportedFlattenNode, CompileFlattenAttributes, EmitReshapeNode}},
       {{"", "MaxPool"},       {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
       {{"", "AveragePool"},   {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
       {{"", "GlobalMaxPool"}, {IsSupportedGlobalPoolNode, CompileGlobalPoolAttributes, EmitPool2DNode}},

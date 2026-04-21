@@ -7,6 +7,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -21,8 +22,18 @@ struct TensorMetadata {
   std::vector<int64_t> dims;
 };
 
+struct ConstantTensor {
+  ONNXTensorElementDataType element_type{};
+  std::vector<int64_t> dims;
+  std::vector<uint8_t> data;
+};
+
+using ConstantValueMap = std::unordered_map<std::string, ConstantTensor>;
+
 TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info);
 TensorMetadata getTensorMetadata(Ort::ConstValue value);
+void SetActiveCompileTimeConstants(const ConstantValueMap* constants);
+const ConstantValueMap* GetActiveCompileTimeConstants();
 
 inline bool shapeIsFullyStatic(const TensorMetadata& tensor) {
   return std::all_of(tensor.dims.begin(), tensor.dims.end(), [](int64_t dim) { return dim >= 0; });

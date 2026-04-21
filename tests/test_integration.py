@@ -29,6 +29,14 @@ _TINY_YOLOV3_MODEL_URL = (
     "validated/vision/object_detection_segmentation/tiny-yolov3/model/"
     "tiny-yolov3-11.onnx"
 )
+_OPENWAKEWORD_ALEXA_URL = (
+    "https://github.com/dscripka/openWakeWord/releases/download/"
+    "v0.5.1/alexa_v0.1.onnx"
+)
+_OPENWAKEWORD_EMBEDDING_URL = (
+    "https://github.com/dscripka/openWakeWord/releases/download/"
+    "v0.5.1/embedding_model.onnx"
+)
 
 
 def _concretize_input_dims(model_path: Path, overrides: dict[str, list[int]]) -> Path:
@@ -117,3 +125,45 @@ def test_tiny_yolov3_model_matches_cpu(ep_library: Path) -> None:
     np.testing.assert_allclose(ggml_out[0], cpu_out[0], rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(ggml_out[1], cpu_out[1], rtol=1e-3, atol=1e-3)
     np.testing.assert_array_equal(ggml_out[2], cpu_out[2])
+
+
+@pytest.mark.integration
+def test_openwakeword_alexa_matches_cpu(ep_library: Path) -> None:
+    model_path = cached_model_path("alexa_v0.1.onnx", _OPENWAKEWORD_ALEXA_URL)
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    rng = np.random.default_rng(0)
+    inputs = {}
+    for graph_input in cpu.get_inputs():
+        shape = [d if isinstance(d, int) and d > 0 else 1 for d in graph_input.shape]
+        inputs[graph_input.name] = rng.standard_normal(shape).astype(np.float32)
+
+    output_names = [out.name for out in cpu.get_outputs()]
+    cpu_out = cpu.run(output_names, inputs)
+    ggml_out = ggml.run(output_names, inputs)
+
+    for got, expected in zip(ggml_out, cpu_out):
+        np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.integration
+def test_openwakeword_embedding_matches_cpu(ep_library: Path) -> None:
+    raw_path = cached_model_path("embedding_model.onnx", _OPENWAKEWORD_EMBEDDING_URL)
+    model_path = _concretize_input_dims(raw_path, {"input_1": [1, 76, 32, 1]})
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    rng = np.random.default_rng(0)
+    inputs = {"input_1": rng.standard_normal((1, 76, 32, 1)).astype(np.float32)}
+
+    output_names = [out.name for out in cpu.get_outputs()]
+    cpu_out = cpu.run(output_names, inputs)
+    ggml_out = ggml.run(output_names, inputs)
+
+    for got, expected in zip(ggml_out, cpu_out):
+        np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
+    assert_all_nodes_run_on_ggml(ggml)
