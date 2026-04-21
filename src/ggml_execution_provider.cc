@@ -21,6 +21,7 @@
 #include <ggml-cpu.h>
 
 #include <onnxruntime/onnxruntime_c_api.h>
+#include <onnxruntime/onnxruntime_cxx_api.h>
 
 namespace {
 
@@ -36,7 +37,7 @@ using ggonnx::ort_internal::GetOrtEpApi;
 using ggonnx::ort_internal::InitializeOrtApi;
 using ggonnx::ort_internal::IsOrtApiInitialized;
 using ggonnx::ort_internal::MakeStatus;
-using ggonnx::ort_internal::ThrowOnError;
+using ggonnx::ort_internal::THROW_ON_ERROR;
 using ggonnx::ort_internal::WrapStatus;
 
 struct GGMLFactory {
@@ -82,6 +83,14 @@ struct ResolvedPartition {
 
 struct ShapeKey {
   std::vector<std::vector<int64_t>> input_dims;
+
+  bool operator==(const ShapeKey& other) const {
+    return input_dims == other.input_dims;
+  }
+
+  bool operator!=(const ShapeKey& other) const {
+    return !(*this == other);
+  }
 };
 
 struct MaterializedGraph {
@@ -155,88 +164,33 @@ struct TensorMetadata {
   std::vector<int64_t> dims;
 };
 
-TensorMetadata GetTensorMetadata(const OrtValueInfo* value_info) {
-  GGONNX_NOT_NULL(value_info, "value info must not be null");
-  const OrtTypeInfo* type_info = nullptr;
-  ThrowOnError(GetOrtApi().GetValueInfoTypeInfo(value_info, &type_info));
-  GGONNX_NOT_NULL(type_info, "ORT returned null type info for value");
-
-  const OrtTensorTypeAndShapeInfo* tensor_info = nullptr;
-  ThrowOnError(GetOrtApi().CastTypeInfoToTensorInfo(type_info, &tensor_info));
-  GGONNX_NOT_NULL(tensor_info, "value is not a tensor");
+TensorMetadata GetTensorMetadata(Ort::ConstValueInfo value_info) {
+  const auto tensor_info = value_info.TypeInfo().GetTensorTypeAndShapeInfo();
 
   TensorMetadata result;
-  ThrowOnError(GetOrtApi().GetTensorElementType(tensor_info, &result.element_type));
-
-  size_t rank = 0;
-  ThrowOnError(GetOrtApi().GetDimensionsCount(tensor_info, &rank));
-  result.dims.resize(rank);
-  if (rank != 0) {
-    ThrowOnError(GetOrtApi().GetDimensions(tensor_info, result.dims.data(), rank));
-  }
-
+  result.element_type = tensor_info.GetElementType();
+  result.dims = tensor_info.GetShape();
   return result;
 }
 
-TensorMetadata GetTensorMetadata(const OrtValue* value) {
-  GGONNX_NOT_NULL(value, "OrtValue must not be null");
-  OrtTensorTypeAndShapeInfo* tensor_info = nullptr;
-  ThrowOnError(GetOrtApi().GetTensorTypeAndShape(value, &tensor_info));
-  GGONNX_NOT_NULL(tensor_info, "ORT returned null tensor type info");
+TensorMetadata GetTensorMetadata(Ort::ConstValue value) {
+  const auto tensor_info = value.GetTensorTypeAndShapeInfo();
 
   TensorMetadata result;
-  ThrowOnError(GetOrtApi().GetTensorElementType(tensor_info, &result.element_type));
-
-  size_t rank = 0;
-  ThrowOnError(GetOrtApi().GetDimensionsCount(tensor_info, &rank));
-  result.dims.resize(rank);
-  if (rank != 0) {
-    ThrowOnError(GetOrtApi().GetDimensions(tensor_info, result.dims.data(), rank));
-  }
-
-  GetOrtApi().ReleaseTensorTypeAndShapeInfo(tensor_info);
+  result.element_type = tensor_info.GetElementType();
+  result.dims = tensor_info.GetShape();
   return result;
-}
-
-std::string GetValueName(const OrtValueInfo* value_info) {
-  GGONNX_NOT_NULL(value_info, "value info must not be null");
-  const char* name = nullptr;
-  ThrowOnError(GetOrtApi().GetValueInfoName(value_info, &name));
-  return name != nullptr ? name : "";
-}
-
-std::string GetNodeName(const OrtNode* node) {
-  GGONNX_NOT_NULL(node, "node must not be null");
-  const char* name = nullptr;
-  ThrowOnError(GetOrtApi().Node_GetName(node, &name));
-  return name != nullptr ? name : "";
-}
-
-std::string GetNodeOperatorType(const OrtNode* node) {
-  GGONNX_NOT_NULL(node, "node must not be null");
-  const char* op_type = nullptr;
-  ThrowOnError(GetOrtApi().Node_GetOperatorType(node, &op_type));
-  GGONNX_NOT_NULL(op_type, "ORT returned null operator type");
-  return op_type;
-}
-
-std::string GetNodeDomain(const OrtNode* node) {
-  GGONNX_NOT_NULL(node, "node must not be null");
-  const char* domain = nullptr;
-  ThrowOnError(GetOrtApi().Node_GetDomain(node, &domain));
-  GGONNX_NOT_NULL(domain, "ORT returned null domain");
-  return domain;
 }
 
 bool HasFullyStaticShape(const TensorMetadata& tensor) {
   return std::all_of(tensor.dims.begin(), tensor.dims.end(), [](int64_t dim) { return dim >= 0; });
 }
 
-bool HasSupportedGGMLRank(const TensorMetadata& tensor) {
+inline bool HasSupportedGGMLRank(const TensorMetadata& tensor) {
   return tensor.dims.size() <= GGML_MAX_DIMS;
 }
 
-bool HasFullyDefinedDims(const std::vector<int64_t>& dims) {
+bool HasFullyStaticShape(const std::vector<int64_t>& dims) {
   return std::all_of(dims.begin(), dims.end(), [](int64_t dim) { return dim >= 0; });
 }
 
@@ -254,56 +208,6 @@ bool AreShapesCompatible(const std::vector<int64_t>& lhs, const std::vector<int6
   return true;
 }
 
-std::string FormatDims(const std::vector<int64_t>& dims) {
-  std::string result = "[";
-  for (size_t i = 0; i < dims.size(); ++i) {
-    if (i != 0) {
-      result += ", ";
-    }
-    result += std::to_string(dims[i]);
-  }
-  result += "]";
-  return result;
-}
-
-std::array<int64_t, GGML_MAX_DIMS> ToGGMLDims(const std::vector<int64_t>& onnx_dims) {
-  GGONNX_ASSERT(onnx_dims.size() <= GGML_MAX_DIMS,
-                "ONNX tensor rank exceeds GGML maximum rank of " + std::to_string(GGML_MAX_DIMS));
-  std::array<int64_t, GGML_MAX_DIMS> ggml_dims{};
-  for (size_t i = 0; i < onnx_dims.size(); ++i) {
-    ggml_dims[i] = onnx_dims[onnx_dims.size() - 1 - i];
-  }
-  return ggml_dims;
-}
-
-std::array<int64_t, GGML_MAX_DIMS> ToPaddedGGMLDims(const std::vector<int64_t>& onnx_dims) {
-  GGONNX_ASSERT(onnx_dims.size() <= GGML_MAX_DIMS,
-                "ONNX tensor rank exceeds GGML maximum rank of " + std::to_string(GGML_MAX_DIMS));
-  std::array<int64_t, GGML_MAX_DIMS> ggml_dims;
-  ggml_dims.fill(1);
-  for (size_t i = 0; i < onnx_dims.size(); ++i) {
-    ggml_dims[i] = onnx_dims[onnx_dims.size() - 1 - i];
-  }
-  return ggml_dims;
-}
-
-std::vector<int64_t> ToOnnxDims(const ggml_tensor* tensor) {
-  GGONNX_NOT_NULL(tensor, "ggml tensor must not be null");
-  if (ggml_is_scalar(tensor)) {
-    return {};
-  }
-
-  const int rank = ggml_n_dims(tensor);
-  GGONNX_ASSERT(rank >= 1 && rank <= GGML_MAX_DIMS, "ggml tensor has invalid rank");
-
-  std::vector<int64_t> onnx_dims;
-  onnx_dims.reserve(static_cast<size_t>(rank));
-  for (int i = rank - 1; i >= 0; --i) {
-    onnx_dims.push_back(tensor->ne[i]);
-  }
-  return onnx_dims;
-}
-
 void AssertShapeMatchesGGML(const std::vector<int64_t>& expected_onnx_dims,
                             const ggml_tensor* tensor,
                             const std::string& tensor_name) {
@@ -313,32 +217,6 @@ void AssertShapeMatchesGGML(const std::vector<int64_t>& expected_onnx_dims,
     throw std::runtime_error("shape mismatch for tensor '" + tensor_name + "': ONNX " +
                              FormatDims(expected_onnx_dims) + " vs GGML " +
                              FormatDims(actual_onnx_dims));
-  }
-}
-
-bool ShapeKeysMatch(const ShapeKey& lhs, const ShapeKey& rhs) {
-  return lhs.input_dims == rhs.input_dims;
-}
-
-void GetNodeIoMetadata(const OrtNode* node,
-                       std::vector<const OrtValueInfo*>* inputs,
-                       std::vector<const OrtValueInfo*>* outputs) {
-  GGONNX_NOT_NULL(node, "node must not be null");
-  GGONNX_NOT_NULL(inputs, "node input metadata output must not be null");
-  GGONNX_NOT_NULL(outputs, "node output metadata output must not be null");
-
-  size_t num_inputs = 0;
-  size_t num_outputs = 0;
-  ThrowOnError(GetOrtApi().Node_GetNumInputs(node, &num_inputs));
-  ThrowOnError(GetOrtApi().Node_GetNumOutputs(node, &num_outputs));
-
-  inputs->resize(num_inputs);
-  outputs->resize(num_outputs);
-  if (num_inputs != 0) {
-    ThrowOnError(GetOrtApi().Node_GetInputs(node, inputs->data(), inputs->size()));
-  }
-  if (num_outputs != 0) {
-    ThrowOnError(GetOrtApi().Node_GetOutputs(node, outputs->data(), outputs->size()));
   }
 }
 
@@ -398,94 +276,45 @@ bool IsSupportedElementwiseBinaryOpType(std::string_view op_type) {
   return op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div";
 }
 
-const OrtOpAttr* FindNodeAttribute(const OrtNode* node, const char* attribute_name) {
-  GGONNX_NOT_NULL(node, "node must not be null");
-  GGONNX_NOT_NULL(attribute_name, "attribute name must not be null");
-  const OrtOpAttr* attr = nullptr;
-  OrtStatus* status = GetOrtApi().Node_GetAttributeByName(node, attribute_name, &attr);
-  if (status == nullptr) {
-    return attr;
+template <typename T>
+std::optional<T> ReadNodeAttribute(Ort::ConstNode node, const char* attribute_name) {
+  Ort::ConstOpAttr attr{nullptr};
+  auto status = node.GetAttributeByName(attribute_name, attr);
+  if (status.IsOK()) {
+    T value{};
+    if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+      std::vector<std::string> values;
+      Ort::ThrowOnError(attr.GetValueArray(values));
+      return values;
+    } else {
+      Ort::ThrowOnError(attr.GetValue(value));
+      return value;
+    }
   }
 
-  const OrtErrorCode code = GetOrtApi().GetErrorCode(status);
-  GetOrtApi().ReleaseStatus(status);
-  if (code == ORT_INVALID_ARGUMENT) {
-    return nullptr;
-  }
-
-  throw std::runtime_error("failed to query node attribute '" + std::string(attribute_name) + "'");
-}
-
-template <typename T>
-inline constexpr bool FalseValue = false;
-
-template <typename T>
-std::optional<T> ReadNodeAttribute(const OrtNode* node, const char* attribute_name) {
-  const OrtOpAttr* attr = FindNodeAttribute(node, attribute_name);
-  if (attr == nullptr) {
+  if (status.GetErrorCode() == ORT_INVALID_ARGUMENT) {
     return std::nullopt;
   }
 
-  if constexpr (std::is_same_v<T, std::string>) {
-    size_t total_size = 0;
-    ThrowOnError(GetOrtApi().ReadOpAttr(attr, ORT_OP_ATTR_STRING, nullptr, 0, &total_size));
-    std::vector<char> buffer(total_size);
-    ThrowOnError(
-        GetOrtApi().ReadOpAttr(attr, ORT_OP_ATTR_STRING, buffer.data(), buffer.size(), &total_size));
-    return std::string(buffer.data(), total_size);
-  }
-  else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
-    size_t total_size = 0;
-    ThrowOnError(
-        GetOrtApi().ReadOpAttr(attr, ORT_OP_ATTR_STRINGS, nullptr, 0, &total_size));
-    std::vector<char> buffer(total_size);
-    ThrowOnError(
-        GetOrtApi().ReadOpAttr(attr, ORT_OP_ATTR_STRINGS, buffer.data(), buffer.size(), &total_size));
-
-    std::vector<std::string> values;
-    const char* current = buffer.data();
-    const char* end = current + total_size;
-    while (current < end) {
-      values.emplace_back(current);
-      current += values.back().size() + 1;
-    }
-    throw std::runtime_error("This implementation is weird.... I don't trust it");
-    return values;
-  }
-  else if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, float>) {
-    constexpr OrtOpAttrType kType =
-        std::is_same_v<T, int64_t> ? ORT_OP_ATTR_INT : ORT_OP_ATTR_FLOAT;
-    T value{};
-    size_t bytes_read = 0;
-    ThrowOnError(GetOrtApi().ReadOpAttr(attr, kType, &value, sizeof(T), &bytes_read));
-    GGONNX_ASSERT(bytes_read == sizeof(T),
-                  "attribute '" + std::string(attribute_name) + "' returned unexpected size");
-    return value;
-  }
-  else {
-    static_assert(FalseValue<T>, "unsupported node attribute type");
-  }
+  Ort::ThrowOnError(status);
+  return std::nullopt;
 }
 
-bool IsSupportedElementwiseBinaryNode(const OrtNode* node, std::string_view op_type) {
-  GGONNX_NOT_NULL(node, "node must not be null");
+bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_type) {
   if (!IsSupportedElementwiseBinaryOpType(op_type)) {
     return false;
   }
 
-  size_t num_inputs = 0;
-  size_t num_outputs = 0;
-  size_t num_implicit_inputs = 0;
-  ThrowOnError(GetOrtApi().Node_GetNumInputs(node, &num_inputs));
-  ThrowOnError(GetOrtApi().Node_GetNumOutputs(node, &num_outputs));
-  ThrowOnError(GetOrtApi().Node_GetNumImplicitInputs(node, &num_implicit_inputs));
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  const auto implicit_inputs = node.GetImplicitInputs();
+  const size_t num_inputs = inputs.size();
+  const size_t num_outputs = outputs.size();
+  const size_t num_implicit_inputs = implicit_inputs.size();
   if (num_inputs != 2 || num_outputs != 1 || num_implicit_inputs != 0) {
     return false;
   }
 
-  std::vector<const OrtValueInfo*> inputs;
-  std::vector<const OrtValueInfo*> outputs;
-  GetNodeIoMetadata(node, &inputs, &outputs);
   GGONNX_ASSERT(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
                 "ORT returned null binary op input/output metadata");
 
@@ -511,15 +340,13 @@ bool IsSupportedElementwiseBinaryNode(const OrtNode* node, std::string_view op_t
   return true;
 }
 
-bool IsSupportedGRUNode(const OrtNode* node) {
-  GGONNX_NOT_NULL(node, "node must not be null");
-
-  size_t num_inputs = 0;
-  size_t num_outputs = 0;
-  size_t num_implicit_inputs = 0;
-  ThrowOnError(GetOrtApi().Node_GetNumInputs(node, &num_inputs));
-  ThrowOnError(GetOrtApi().Node_GetNumOutputs(node, &num_outputs));
-  ThrowOnError(GetOrtApi().Node_GetNumImplicitInputs(node, &num_implicit_inputs));
+bool IsSupportedGRUNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  const auto implicit_inputs = node.GetImplicitInputs();
+  const size_t num_inputs = inputs.size();
+  const size_t num_outputs = outputs.size();
+  const size_t num_implicit_inputs = implicit_inputs.size();
   if (num_inputs < 3 || num_outputs == 0 || num_implicit_inputs != 0) {
     return false;
   }
@@ -550,9 +377,6 @@ bool IsSupportedGRUNode(const OrtNode* node) {
     }
   }
 
-  std::vector<const OrtValueInfo*> inputs;
-  std::vector<const OrtValueInfo*> outputs;
-  GetNodeIoMetadata(node, &inputs, &outputs);
   if (inputs.size() < 3 || inputs[0] == nullptr || inputs[1] == nullptr || inputs[2] == nullptr) {
     return false;
   }
@@ -606,7 +430,7 @@ bool IsSupportedGRUNode(const OrtNode* node) {
     }
   }
 
-  for (const OrtValueInfo* output : outputs) {
+  for (Ort::ConstValueInfo output : outputs) {
     if (output == nullptr) {
       continue;
     }
@@ -716,10 +540,9 @@ void ResolveGRUNode(const CompiledPartition& partition,
   }
 }
 
-bool IsNodeSupported(const OrtNode* node) {
-  GGONNX_NOT_NULL(node, "node must not be null");
-  const std::string op_type = GetNodeOperatorType(node);
-  const std::string domain = GetNodeDomain(node);
+bool IsNodeSupported(Ort::ConstNode node) {
+  const std::string op_type = node.GetOperatorType();
+  const std::string domain = node.GetDomain();
   const std::string_view op_type_view(op_type);
   const std::string_view domain_view(domain);
 
@@ -764,11 +587,12 @@ size_t EstimatePartitionDataBytes(const std::vector<std::vector<int64_t>>& value
 
 CompiledPartition CompilePartition(const OrtGraph* graph) {
   GGONNX_NOT_NULL(graph, "graph must not be null");
+  const Ort::ConstGraph ort_graph{graph};
   CompiledPartition partition;
   std::unordered_map<std::string, size_t> value_ids;
 
-  auto ensure_value = [&](const OrtValueInfo* value_info) -> size_t {
-    const std::string name = GetValueName(value_info);
+  auto ensure_value = [&](Ort::ConstValueInfo value_info) -> size_t {
+    const std::string name = value_info.GetName();
     const TensorMetadata metadata = GetTensorMetadata(value_info);
     GGONNX_ASSERT(metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             "compiled partition currently supports only float32 tensors");
@@ -790,55 +614,35 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
     return id;
   };
 
-  size_t num_inputs = 0;
-  ThrowOnError(GetOrtApi().Graph_GetNumInputs(graph, &num_inputs));
-  std::vector<const OrtValueInfo*> graph_inputs(num_inputs);
-  if (num_inputs != 0) {
-    ThrowOnError(GetOrtApi().Graph_GetInputs(graph, graph_inputs.data(), graph_inputs.size()));
-  }
-
-  for (const OrtValueInfo* input : graph_inputs) {
-    GGONNX_NOT_NULL(input, "graph input metadata must not be null");
+  const auto graph_inputs = ort_graph.GetInputs();
+  for (Ort::ConstValueInfo input : graph_inputs) {
+    GGONNX_ASSERT(input != nullptr, "graph input metadata must not be null");
     const size_t id = ensure_value(input);
     partition.values[id].is_graph_input = true;
     partition.graph_inputs.push_back(id);
   }
 
-  size_t num_outputs = 0;
-  ThrowOnError(GetOrtApi().Graph_GetNumOutputs(graph, &num_outputs));
-  std::vector<const OrtValueInfo*> graph_outputs(num_outputs);
-  if (num_outputs != 0) {
-    ThrowOnError(GetOrtApi().Graph_GetOutputs(graph, graph_outputs.data(), graph_outputs.size()));
-  }
-
-  for (const OrtValueInfo* output : graph_outputs) {
-    GGONNX_NOT_NULL(output, "graph output metadata must not be null");
+  const auto graph_outputs = ort_graph.GetOutputs();
+  for (Ort::ConstValueInfo output : graph_outputs) {
+    GGONNX_ASSERT(output != nullptr, "graph output metadata must not be null");
     const size_t id = ensure_value(output);
     partition.values[id].is_graph_output = true;
     partition.graph_outputs.push_back(id);
   }
 
-  size_t num_nodes = 0;
-  ThrowOnError(GetOrtApi().Graph_GetNumNodes(graph, &num_nodes));
-  std::vector<const OrtNode*> nodes(num_nodes);
-  if (num_nodes != 0) {
-    ThrowOnError(GetOrtApi().Graph_GetNodes(graph, nodes.data(), nodes.size()));
-  }
-
-  for (const OrtNode* node : nodes) {
-    GGONNX_NOT_NULL(node, "graph node must not be null");
+  for (Ort::ConstNode node : ort_graph.GetNodes()) {
+    GGONNX_ASSERT(node != nullptr, "graph node must not be null");
     if (!IsNodeSupported(node)) {
       throw std::runtime_error("GGONNX Compile received an unsupported partition");
     }
 
-    std::vector<const OrtValueInfo*> node_inputs;
-    std::vector<const OrtValueInfo*> node_outputs;
-    GetNodeIoMetadata(node, &node_inputs, &node_outputs);
+    const auto node_inputs = node.GetInputs();
+    const auto node_outputs = node.GetOutputs();
 
     NodeDesc compiled_node;
-    compiled_node.op_type = GetNodeOperatorType(node);
-    compiled_node.domain = GetNodeDomain(node);
-    compiled_node.name = GetNodeName(node);
+    compiled_node.op_type = node.GetOperatorType();
+    compiled_node.domain = node.GetDomain();
+    compiled_node.name = node.GetName();
 
     if (compiled_node.op_type == "GRU") {
       compiled_node.direction = ReadNodeAttribute<std::string>(node, "direction").value_or("forward");
@@ -852,14 +656,14 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
           ReadNodeAttribute<int64_t>(node, "linear_before_reset").value_or(0);
     }
 
-    for (const OrtValueInfo* input : node_inputs) {
+    for (Ort::ConstValueInfo input : node_inputs) {
       if (input == nullptr) {
         compiled_node.inputs.push_back(kOptionalValueAbsent);
         continue;
       }
       compiled_node.inputs.push_back(ensure_value(input));
     }
-    for (const OrtValueInfo* output : node_outputs) {
+    for (Ort::ConstValueInfo output : node_outputs) {
       if (output == nullptr) {
         compiled_node.outputs.push_back(kOptionalValueAbsent);
         continue;
@@ -879,7 +683,7 @@ ShapeKey MakeShapeKey(const std::vector<TensorMetadata>& input_metadata) {
   ShapeKey key;
   key.input_dims.reserve(input_metadata.size());
   for (const TensorMetadata& meta : input_metadata) {
-    GGONNX_ASSERT(HasFullyDefinedDims(meta.dims),
+    GGONNX_ASSERT(HasFullyStaticShape(meta.dims),
                   "runtime input shapes must be concrete before GGML execution");
     key.input_dims.push_back(meta.dims);
   }
@@ -905,7 +709,7 @@ ResolvedPartition ResolvePartitionShapes(const CompiledPartition& partition,
     GGONNX_ASSERT(AreShapesCompatible(value.dims, meta.dims),
                   "runtime input shape mismatch for tensor '" + value.name + "': declared " +
                       FormatDims(value.dims) + ", got " + FormatDims(meta.dims));
-    GGONNX_ASSERT(HasFullyDefinedDims(meta.dims),
+    GGONNX_ASSERT(HasFullyStaticShape(meta.dims),
                   "runtime input shapes must be concrete for tensor '" + value.name + "'");
 
     resolved.value_dims[value_id] = meta.dims;
@@ -961,13 +765,13 @@ void CopyInputDataToTensor(const OrtValue* input_value,
                            ggml_tensor* tensor) {
   GGONNX_NOT_NULL(input_value, "graph input value must not be null");
   GGONNX_NOT_NULL(tensor, "cached GGML input tensor must not be null");
-  const TensorMetadata meta = GetTensorMetadata(input_value);
+  const TensorMetadata meta = GetTensorMetadata(Ort::ConstValue{input_value});
   if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     throw std::runtime_error("GGONNX graph input must be float32");
   }
 
   const void* input_data = nullptr;
-  ThrowOnError(GetOrtApi().GetTensorData(input_value, &input_data));
+  THROW_ON_ERROR(GetOrtApi().GetTensorData(input_value, &input_data));
   GGONNX_NOT_NULL(input_data, "ORT returned null tensor data for graph input");
 
   GGONNX_ASSERT(meta.dims == expected_dims,
@@ -1253,8 +1057,8 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
   GGONNX_ASSERT(!partition.nodes.empty(), "compiled partition must contain nodes");
   size_t num_inputs = 0;
   size_t num_outputs = 0;
-  ThrowOnError(GetOrtApi().KernelContext_GetInputCount(kernel_context, &num_inputs));
-  ThrowOnError(GetOrtApi().KernelContext_GetOutputCount(kernel_context, &num_outputs));
+  THROW_ON_ERROR(GetOrtApi().KernelContext_GetInputCount(kernel_context, &num_inputs));
+  THROW_ON_ERROR(GetOrtApi().KernelContext_GetOutputCount(kernel_context, &num_outputs));
   if (num_inputs != partition.graph_inputs.size() || num_outputs != partition.graph_outputs.size()) {
     throw std::runtime_error("kernel IO count does not match compiled partition");
   }
@@ -1263,22 +1067,22 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
   std::vector<TensorMetadata> input_metadata;
   input_metadata.reserve(num_inputs);
   for (size_t i = 0; i < num_inputs; ++i) {
-    ThrowOnError(GetOrtApi().KernelContext_GetInput(kernel_context, i, &input_values[i]));
+    THROW_ON_ERROR(GetOrtApi().KernelContext_GetInput(kernel_context, i, &input_values[i]));
     if (input_values[i] == nullptr) {
       throw std::runtime_error("compiled partition received null input");
     }
 
     int is_tensor = 0;
-    ThrowOnError(GetOrtApi().IsTensor(input_values[i], &is_tensor));
+    THROW_ON_ERROR(GetOrtApi().IsTensor(input_values[i], &is_tensor));
     if (!is_tensor) {
       throw std::runtime_error("compiled partition input is not a tensor");
     }
 
-    input_metadata.push_back(GetTensorMetadata(input_values[i]));
+    input_metadata.push_back(GetTensorMetadata(Ort::ConstValue{input_values[i]}));
   }
 
   const ShapeKey shape_key = MakeShapeKey(input_metadata);
-  if (state.active_graph == nullptr || !ShapeKeysMatch(state.active_graph->key, shape_key)) {
+  if (state.active_graph == nullptr || state.active_graph->key != shape_key) {
     DestroyMaterializedGraph(state.active_graph);
     state.active_graph = BuildMaterializedGraph(
         partition, shape_key, ResolvePartitionShapes(partition, input_metadata));
@@ -1301,14 +1105,14 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
     const size_t output_id = partition.graph_outputs[i];
     const std::vector<int64_t>& output_dims = state.active_graph->resolved.value_dims[output_id];
     OrtValue* output_value = nullptr;
-    ThrowOnError(GetOrtApi().KernelContext_GetOutput(
+    THROW_ON_ERROR(GetOrtApi().KernelContext_GetOutput(
         kernel_context, i, output_dims.data(), output_dims.size(), &output_value));
     if (output_value == nullptr) {
       throw std::runtime_error("failed to allocate ORT output");
     }
 
     void* output_data = nullptr;
-    ThrowOnError(GetOrtApi().GetTensorMutableData(output_value, &output_data));
+    THROW_ON_ERROR(GetOrtApi().GetTensorMutableData(output_value, &output_data));
     GGONNX_NOT_NULL(output_data, "ORT returned null output buffer");
 
     ggml_tensor* output_tensor = state.active_graph->output_tensors[i];
@@ -1405,7 +1209,7 @@ OrtStatus* FactoryGetSupportedDevices(OrtEpFactory* this_ptr,
         throw std::runtime_error("ORT provided too few EP device slots");
       }
 
-      ThrowOnError(GetOrtEpApi().CreateEpDevice(&factory->iface, device, nullptr, nullptr, &ep_devices[count]));
+      THROW_ON_ERROR(GetOrtEpApi().CreateEpDevice(&factory->iface, device, nullptr, nullptr, &ep_devices[count]));
       ++count;
     }
 
@@ -1418,15 +1222,10 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
                            OrtEpGraphSupportInfo* graph_support_info) noexcept {
   return WrapStatus([&] {
     GGONNX_NOT_NULL(graph_support_info, "graph support info must not be null");
-    size_t num_nodes = 0;
-    ThrowOnError(GetOrtApi().Graph_GetNumNodes(graph, &num_nodes));
-    std::vector<const OrtNode*> nodes(num_nodes);
-    if (num_nodes != 0) {
-      ThrowOnError(GetOrtApi().Graph_GetNodes(graph, nodes.data(), nodes.size()));
-    }
+    const Ort::ConstGraph ort_graph{graph};
 
     std::vector<const OrtNode*> supported_nodes;
-    for (const OrtNode* node : nodes) {
+    for (Ort::ConstNode node : ort_graph.GetNodes()) {
       if (!IsNodeSupported(node)) {
         continue;
       }
@@ -1434,7 +1233,7 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
     }
 
     if (!supported_nodes.empty()) {
-      ThrowOnError(GetOrtEpApi().EpGraphSupportInfo_AddNodesToFuse(
+      THROW_ON_ERROR(GetOrtEpApi().EpGraphSupportInfo_AddNodesToFuse(
           graph_support_info, supported_nodes.data(), supported_nodes.size(), nullptr));
     }
   });

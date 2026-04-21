@@ -27,6 +27,6 @@ OrtStatus* WrapStatus(Fn&& fn) noexcept {
   }
 }
 
-void ThrowOnError(OrtStatus* status);
+void THROW_ON_ERROR(OrtStatus* status);
 
 }  // namespace ggonnx::ort_internal

@@ -2,6 +2,8 @@
 
 #include "inner/helpers.hpp"
 
+#include <onnxruntime/onnxruntime_cxx_api.h>
+
 #include <stdexcept>
 
 namespace ggonnx::ort_internal {
@@ -15,6 +17,7 @@ void InitializeOrtApi(const OrtApiBase* ort_api_base) {
   GGONNX_NOT_NULL(ort_api_base, "OrtApiBase must not be null");
   g_ort_api = ort_api_base->GetApi(ORT_API_VERSION);
   GGONNX_NOT_NULL(g_ort_api, "failed to get ORT API");
+  Ort::InitApi(g_ort_api);
   GGONNX_NOT_NULL(g_ort_api->GetEpApi(), "failed to initialize ORT EP API");
 }
 
@@ -41,7 +44,7 @@ OrtStatus* MakeStatus(OrtErrorCode code, const std::string& message) noexcept {
   }
 }
 
-void ThrowOnError(OrtStatus* status) {
+void THROW_ON_ERROR(OrtStatus* status) {
   if (status == nullptr) {
     return;
   }
