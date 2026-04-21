@@ -77,10 +77,6 @@ struct CompiledPartition {
   std::vector<NodeDesc> nodes;
 };
 
-struct ResolvedPartition {
-  std::vector<std::vector<int64_t>> value_dims;
-};
-
 struct ShapeKey {
   std::vector<std::vector<int64_t>> input_dims;
 
@@ -95,10 +91,10 @@ struct ShapeKey {
 
 struct MaterializedGraph {
   ShapeKey key;
-  ResolvedPartition resolved;
   ggml_context* ctx{};
   ggml_cgraph* graph{};
   std::vector<ggml_tensor*> values;
+  std::vector<std::vector<int64_t>> value_dims;
   std::vector<ggml_tensor*> input_tensors;
   std::vector<ggml_tensor*> output_tensors;
 };
@@ -111,6 +107,21 @@ struct GGMLComputeState {
 struct GGMLNodeComputeInfo {
   OrtNodeComputeInfo iface{};
   CompiledPartition partition;
+};
+
+using EmitOutputs = std::vector<ggml_tensor*>;
+using EmitResult = std::optional<EmitOutputs>;
+using EmitNodeFn = EmitResult (*)(ggml_context* ctx,
+                                  const NodeDesc& node,
+                                  const std::vector<ggml_tensor*>& values);
+using CompileAttrsFn = void (*)(Ort::ConstNode node, NodeDesc* compiled_node);
+
+struct OpDefinition {
+  std::string_view domain;
+  std::string_view op_type;
+  bool (*support)(Ort::ConstNode node);
+  CompileAttrsFn compile_attrs;
+  EmitNodeFn emit;
 };
 
 GGMLFactory* AsFactory(OrtEpFactory* factory) {
@@ -340,6 +351,10 @@ bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_t
   return true;
 }
 
+bool IsSupportedElementwiseBinaryOpNode(Ort::ConstNode node) {
+  return IsSupportedElementwiseBinaryNode(node, node.GetOperatorType());
+}
+
 bool IsSupportedGRUNode(Ort::ConstNode node) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -443,122 +458,208 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
   return true;
 }
 
-void ResolveElementwiseBinaryNode(const CompiledPartition& partition,
-                                  const NodeDesc& node,
-                                  const std::vector<std::vector<int64_t>>& value_dims,
-                                  const std::vector<bool>& is_resolved,
-                                  std::vector<std::vector<int64_t>>* resolved_dims,
-                                  std::vector<bool>* resolved_flags) {
-  GGONNX_NOT_NULL(resolved_dims, "resolved dims output must not be null");
-  GGONNX_NOT_NULL(resolved_flags, "resolved flags output must not be null");
-  GGONNX_ASSERT(node.inputs.size() == 2 && node.outputs.size() == 1,
-                "compiled binary op node has invalid arity");
-  const size_t lhs_id = node.inputs[0];
-  const size_t rhs_id = node.inputs[1];
-  const size_t out_id = node.outputs[0];
-  GGONNX_ASSERT(is_resolved[lhs_id] && is_resolved[rhs_id],
-                "compiled binary op node inputs must be resolved before execution");
-
-  const std::vector<int64_t>& lhs_dims = value_dims[lhs_id];
-  const std::vector<int64_t>& rhs_dims = value_dims[rhs_id];
-  const std::vector<int64_t> output_dims = InferBroadcastOutputDims(lhs_dims, rhs_dims);
-  GGONNX_ASSERT(IsBroadcastSupportedByGGML(lhs_dims, output_dims),
-                "GGML cannot realize broadcast from lhs " + FormatDims(lhs_dims) + " to output " +
-                    FormatDims(output_dims));
-  GGONNX_ASSERT(IsBroadcastSupportedByGGML(rhs_dims, output_dims),
-                "GGML cannot realize broadcast from rhs " + FormatDims(rhs_dims) + " to output " +
-                    FormatDims(output_dims));
-  GGONNX_ASSERT(AreShapesCompatible(partition.values[out_id].dims, output_dims),
-                "resolved output shape mismatch for tensor '" + partition.values[out_id].name + "'");
-  (*resolved_dims)[out_id] = output_dims;
-  (*resolved_flags)[out_id] = true;
+void CompileGRUAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  compiled_node->direction = ReadNodeAttribute<std::string>(node, "direction").value_or("forward");
+  GGONNX_ASSERT(compiled_node->direction == "forward", "only forward GRU direction is supported");
+  const auto hidden_size = ReadNodeAttribute<int64_t>(node, "hidden_size");
+  GGONNX_ASSERT(hidden_size.has_value() && *hidden_size > 0,
+                "GRU hidden_size attribute must be present and positive");
+  compiled_node->hidden_size = *hidden_size;
+  compiled_node->layout = ReadNodeAttribute<int64_t>(node, "layout").value_or(0);
+  compiled_node->linear_before_reset =
+      ReadNodeAttribute<int64_t>(node, "linear_before_reset").value_or(0);
 }
 
-void ResolveGRUNode(const CompiledPartition& partition,
-                    const NodeDesc& node,
-                    const std::vector<std::vector<int64_t>>& value_dims,
-                    const std::vector<bool>& is_resolved,
-                    std::vector<std::vector<int64_t>>* resolved_dims,
-                    std::vector<bool>* resolved_flags) {
-  GGONNX_NOT_NULL(resolved_dims, "resolved dims output must not be null");
-  GGONNX_NOT_NULL(resolved_flags, "resolved flags output must not be null");
+EmitResult EmitElementwiseBinaryNode(ggml_context* ctx,
+                                     const NodeDesc& node,
+                                     const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  if (node.inputs.size() != 2 || node.outputs.size() != 1) {
+    throw std::runtime_error("compiled binary op node has invalid arity");
+  }
+  GGONNX_ASSERT(node.inputs[0] < values.size() && node.inputs[1] < values.size(),
+                "compiled binary op node input index out of range");
+  GGONNX_ASSERT(node.outputs[0] < values.size(), "compiled binary op node output index out of range");
+
+  ggml_tensor* lhs = values[node.inputs[0]];
+  ggml_tensor* rhs = values[node.inputs[1]];
+  if (lhs == nullptr || rhs == nullptr) {
+    throw std::runtime_error("compiled binary op node missing GGML inputs");
+  }
+
+  const std::string_view op_type(node.op_type);
+  if (op_type == "Add") {
+    return EmitOutputs{ggml_add(ctx, lhs, rhs)};
+  } else if (op_type == "Sub") {
+    return EmitOutputs{ggml_sub(ctx, lhs, rhs)};
+  } else if (op_type == "Mul") {
+    return EmitOutputs{ggml_mul(ctx, lhs, rhs)};
+  } else if (op_type == "Div") {
+    return EmitOutputs{ggml_div(ctx, lhs, rhs)};
+  }
+
+  return std::nullopt;
+}
+
+EmitResult EmitGRUNode(ggml_context* ctx,
+                       const NodeDesc& node,
+                       const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
   GGONNX_ASSERT(node.inputs.size() >= 3, "compiled GRU node has invalid input arity");
+  GGONNX_ASSERT(node.hidden_size > 0, "compiled GRU node must have positive hidden_size");
 
-  const size_t x_id = node.inputs[0];
-  const size_t w_id = node.inputs[1];
-  const size_t r_id = node.inputs[2];
-  GGONNX_ASSERT(is_resolved[x_id] && is_resolved[w_id] && is_resolved[r_id],
-                "compiled GRU node required inputs must be resolved before execution");
-
-  const std::vector<int64_t>& x_dims = value_dims[x_id];
-  const std::vector<int64_t>& w_dims = value_dims[w_id];
-  const std::vector<int64_t>& r_dims = value_dims[r_id];
-  GGONNX_ASSERT(x_dims.size() == 3 && w_dims.size() == 3 && r_dims.size() == 3,
-                "resolved GRU node inputs must be rank-3 tensors");
-  GGONNX_ASSERT(w_dims[0] == 1 && r_dims[0] == 1,
-                "resolved GRU node currently supports only forward direction");
-  GGONNX_ASSERT(w_dims[1] == node.hidden_size * 3 && r_dims[1] == node.hidden_size * 3,
-                "resolved GRU node weight shapes do not match hidden size");
-  GGONNX_ASSERT(x_dims[2] == w_dims[2],
-                "resolved GRU node input size mismatch between X and W");
-  GGONNX_ASSERT(r_dims[2] == node.hidden_size,
-                "resolved GRU recurrent weights must match hidden size");
-
-  if (node.inputs.size() > 3 && node.inputs[3] != kOptionalValueAbsent) {
-    const size_t b_id = node.inputs[3];
-    GGONNX_ASSERT(is_resolved[b_id], "compiled GRU bias input must be resolved before execution");
-    GGONNX_ASSERT(value_dims[b_id] == std::vector<int64_t>({1, node.hidden_size * 6}),
-                  "resolved GRU bias shape mismatch");
+  ggml_tensor* x = values[node.inputs[0]];
+  ggml_tensor* w = values[node.inputs[1]];
+  ggml_tensor* r = values[node.inputs[2]];
+  ggml_tensor* b = (node.inputs.size() > 3 && node.inputs[3] != kOptionalValueAbsent) ? values[node.inputs[3]] : nullptr;
+  ggml_tensor* initial_h =
+      (node.inputs.size() > 5 && node.inputs[5] != kOptionalValueAbsent) ? values[node.inputs[5]] : nullptr;
+  if (x == nullptr || w == nullptr || r == nullptr) {
+    throw std::runtime_error("compiled GRU node missing required GGML inputs");
   }
 
-  if (node.inputs.size() > 5 && node.inputs[5] != kOptionalValueAbsent) {
-    const size_t initial_h_id = node.inputs[5];
-    GGONNX_ASSERT(is_resolved[initial_h_id], "compiled GRU initial_h input must be resolved before execution");
-    GGONNX_ASSERT(value_dims[initial_h_id].size() == 3 && value_dims[initial_h_id][0] == 1 &&
-                      value_dims[initial_h_id][1] == x_dims[1] &&
-                      value_dims[initial_h_id][2] == node.hidden_size,
-                  "resolved GRU initial_h shape mismatch");
+  const int64_t input_size = x->ne[0];
+  const int64_t batch_size = x->ne[1];
+  const int64_t seq_length = x->ne[2];
+  const int64_t hidden_size = node.hidden_size;
+  GGONNX_ASSERT(w->ne[0] == input_size && w->ne[1] == hidden_size * 3 && w->ne[2] == 1,
+                "compiled GRU W tensor shape mismatch");
+  GGONNX_ASSERT(r->ne[0] == hidden_size && r->ne[1] == hidden_size * 3 && r->ne[2] == 1,
+                "compiled GRU R tensor shape mismatch");
+
+  auto matrix_slice_rows = [&](ggml_tensor* matrix, int64_t row_offset, int64_t row_count) -> ggml_tensor* {
+    return ggml_view_2d(ctx,
+                        matrix,
+                        matrix->ne[0],
+                        row_count,
+                        matrix->nb[1],
+                        static_cast<size_t>(row_offset) * matrix->nb[1]);
+  };
+  auto vector_slice = [&](ggml_tensor* vector, int64_t offset, int64_t length) -> ggml_tensor* {
+    return ggml_view_1d(
+        ctx, vector, length, static_cast<size_t>(offset) * ggml_element_size(vector));
+  };
+  auto timestep_slice = [&](ggml_tensor* sequence, int64_t step) -> ggml_tensor* {
+    return ggml_view_2d(ctx,
+                        sequence,
+                        sequence->ne[0],
+                        sequence->ne[1],
+                        sequence->nb[1],
+                        static_cast<size_t>(step) * sequence->nb[2]);
+  };
+  auto broadcast_add = [&](ggml_tensor* matrix, ggml_tensor* bias) -> ggml_tensor* {
+    return ggml_add(ctx, matrix, ggml_repeat(ctx, bias, matrix));
+  };
+
+  ggml_tensor* wb = nullptr;
+  ggml_tensor* rb = nullptr;
+  if (b != nullptr) {
+    GGONNX_ASSERT(b->ne[0] == hidden_size * 6 && b->ne[1] == 1, "compiled GRU bias tensor shape mismatch");
+    wb = vector_slice(b, 0, hidden_size * 3);
+    rb = vector_slice(b, hidden_size * 3, hidden_size * 3);
   }
 
-  const std::vector<int64_t> y_dims = {x_dims[0], 1, x_dims[1], node.hidden_size};
-  const std::vector<int64_t> y_h_dims = {1, x_dims[1], node.hidden_size};
+  ggml_tensor* h_t = nullptr;
+  if (initial_h != nullptr) {
+    GGONNX_ASSERT(initial_h->ne[0] == hidden_size && initial_h->ne[1] == batch_size && initial_h->ne[2] == 1,
+                  "compiled GRU initial_h tensor shape mismatch");
+    h_t = ggml_view_2d(ctx, initial_h, initial_h->ne[0], initial_h->ne[1], initial_h->nb[1], 0);
+  } else {
+    h_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, batch_size);
+    std::memset(h_t->data, 0, ggml_nbytes(h_t));
+  }
 
+  ggml_tensor* y = nullptr;
   if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
-    const size_t y_id = node.outputs[0];
-    GGONNX_ASSERT(AreShapesCompatible(partition.values[y_id].dims, y_dims),
-                  "resolved GRU Y shape mismatch for tensor '" + partition.values[y_id].name + "'");
-    (*resolved_dims)[y_id] = y_dims;
-    (*resolved_flags)[y_id] = true;
+    y = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hidden_size, batch_size, 1, seq_length);
   }
 
-  if (node.outputs.size() > 1 && node.outputs[1] != kOptionalValueAbsent) {
-    const size_t y_h_id = node.outputs[1];
-    GGONNX_ASSERT(AreShapesCompatible(partition.values[y_h_id].dims, y_h_dims),
-                  "resolved GRU Y_h shape mismatch for tensor '" + partition.values[y_h_id].name + "'");
-    (*resolved_dims)[y_h_id] = y_h_dims;
-    (*resolved_flags)[y_h_id] = true;
+  ggml_tensor* w_z = matrix_slice_rows(w, 0, hidden_size);
+  ggml_tensor* w_r = matrix_slice_rows(w, hidden_size, hidden_size);
+  ggml_tensor* w_h = matrix_slice_rows(w, hidden_size * 2, hidden_size);
+  ggml_tensor* r_z = matrix_slice_rows(r, 0, hidden_size);
+  ggml_tensor* r_r = matrix_slice_rows(r, hidden_size, hidden_size);
+  ggml_tensor* r_h = matrix_slice_rows(r, hidden_size * 2, hidden_size);
+  ggml_tensor* wb_z = wb != nullptr ? vector_slice(wb, 0, hidden_size) : nullptr;
+  ggml_tensor* wb_r = wb != nullptr ? vector_slice(wb, hidden_size, hidden_size) : nullptr;
+  ggml_tensor* wb_h = wb != nullptr ? vector_slice(wb, hidden_size * 2, hidden_size) : nullptr;
+  ggml_tensor* rb_z = rb != nullptr ? vector_slice(rb, 0, hidden_size) : nullptr;
+  ggml_tensor* rb_r = rb != nullptr ? vector_slice(rb, hidden_size, hidden_size) : nullptr;
+  ggml_tensor* rb_h = rb != nullptr ? vector_slice(rb, hidden_size * 2, hidden_size) : nullptr;
+
+  for (int64_t step = 0; step < seq_length; ++step) {
+    ggml_tensor* x_t = timestep_slice(x, step);
+
+    ggml_tensor* z = ggml_add(ctx, ggml_mul_mat(ctx, w_z, x_t), ggml_mul_mat(ctx, r_z, h_t));
+    if (wb_z != nullptr) {
+      z = broadcast_add(z, wb_z);
+    }
+    if (rb_z != nullptr) {
+      z = broadcast_add(z, rb_z);
+    }
+    z = ggml_sigmoid(ctx, z);
+
+    ggml_tensor* r_gate = ggml_add(ctx, ggml_mul_mat(ctx, w_r, x_t), ggml_mul_mat(ctx, r_r, h_t));
+    if (wb_r != nullptr) {
+      r_gate = broadcast_add(r_gate, wb_r);
+    }
+    if (rb_r != nullptr) {
+      r_gate = broadcast_add(r_gate, rb_r);
+    }
+    r_gate = ggml_sigmoid(ctx, r_gate);
+
+    ggml_tensor* h_candidate = ggml_mul_mat(ctx, w_h, x_t);
+    ggml_tensor* recurrent_term = ggml_mul_mat(ctx, r_h, ggml_mul(ctx, r_gate, h_t));
+    h_candidate = ggml_add(ctx, h_candidate, recurrent_term);
+    if (wb_h != nullptr) {
+      h_candidate = broadcast_add(h_candidate, wb_h);
+    }
+    if (rb_h != nullptr) {
+      h_candidate = broadcast_add(h_candidate, rb_h);
+    }
+    h_candidate = ggml_tanh(ctx, h_candidate);
+
+    h_t = ggml_add(ctx, h_candidate, ggml_mul(ctx, z, ggml_sub(ctx, h_t, h_candidate)));
+
+    if (y != nullptr) {
+      y = ggml_set(ctx, y, h_t, y->nb[1], y->nb[2], y->nb[3], static_cast<size_t>(step) * y->nb[3]);
+    }
   }
+
+  EmitOutputs outputs;
+  if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
+    outputs.push_back(ggml_cont(ctx, y));
+  }
+  if (node.outputs.size() > 1 && node.outputs[1] != kOptionalValueAbsent) {
+    outputs.push_back(ggml_cont_3d(ctx, h_t, hidden_size, batch_size, 1));
+  }
+  return outputs;
+}
+
+const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type) {
+  static const std::array<OpDefinition, 5> kOps = {{
+      {std::string_view(), "Add", IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode},
+      {std::string_view(), "Sub", IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode},
+      {std::string_view(), "Mul", IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode},
+      {std::string_view(), "Div", IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode},
+      {std::string_view(), "GRU", IsSupportedGRUNode, CompileGRUAttributes, EmitGRUNode},
+  }};
+
+  for (const OpDefinition& op : kOps) {
+    if (op.domain == domain && op.op_type == op_type) {
+      return &op;
+    }
+  }
+
+  return nullptr;
 }
 
 bool IsNodeSupported(Ort::ConstNode node) {
   const std::string op_type = node.GetOperatorType();
   const std::string domain = node.GetDomain();
-  const std::string_view op_type_view(op_type);
-  const std::string_view domain_view(domain);
-
-  if (!(domain_view == std::string_view())) {
-    return false;
-  }
-
-  if(IsSupportedElementwiseBinaryNode(node, op_type_view)) {
-      return true;
-  }
-
-  if(op_type_view == "GRU" && IsSupportedGRUNode(node)) {
-      return true;
-  }
-
-  return false;
+  const OpDefinition* op = FindOpDefinition(domain, op_type);
+  return op != nullptr && op->support(node);
 }
 
 size_t ElementCount(const std::vector<int64_t>& dims) {
@@ -575,14 +676,23 @@ size_t EstimatePartitionTensorCount(const CompiledPartition& partition) {
   return std::max<size_t>(count, 8);
 }
 
-size_t EstimatePartitionDataBytes(const std::vector<std::vector<int64_t>>& value_dims) {
-  GGONNX_ASSERT(!value_dims.empty(), "resolved partition must contain at least one value");
+size_t EstimateInitialGraphDataBytes(const CompiledPartition& partition,
+                                     const std::vector<TensorMetadata>& input_metadata) {
+  GGONNX_ASSERT(input_metadata.size() == partition.graph_inputs.size(),
+                "runtime input metadata does not match compiled partition");
   size_t bytes = 0;
-  for (const std::vector<int64_t>& dims : value_dims) {
-    bytes += ElementCount(dims) * sizeof(float);
+
+  for (const TensorMetadata& meta : input_metadata) {
+    GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                  "GGONNX runtime input must be float32");
+    GGONNX_ASSERT(HasFullyStaticShape(meta.dims), "runtime input shapes must be concrete");
+    bytes += ElementCount(meta.dims) * sizeof(float);
   }
 
-  return std::max<size_t>(bytes * 8, 256 * 1024);
+  // Leave plenty of headroom for intermediates and outputs. GGML will do the final
+  // graph-level planning; this context size only needs to be safely sufficient.
+  bytes *= std::max<size_t>(partition.nodes.size() + partition.graph_outputs.size(), 4);
+  return std::max<size_t>(bytes, 256 * 1024);
 }
 
 CompiledPartition CompilePartition(const OrtGraph* graph) {
@@ -643,17 +753,10 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
     compiled_node.op_type = node.GetOperatorType();
     compiled_node.domain = node.GetDomain();
     compiled_node.name = node.GetName();
-
-    if (compiled_node.op_type == "GRU") {
-      compiled_node.direction = ReadNodeAttribute<std::string>(node, "direction").value_or("forward");
-      GGONNX_ASSERT(compiled_node.direction == "forward", "only forward GRU direction is supported");
-      const auto hidden_size = ReadNodeAttribute<int64_t>(node, "hidden_size");
-      GGONNX_ASSERT(hidden_size.has_value() && *hidden_size > 0,
-                    "GRU hidden_size attribute must be present and positive");
-      compiled_node.hidden_size = *hidden_size;
-      compiled_node.layout = ReadNodeAttribute<int64_t>(node, "layout").value_or(0);
-      compiled_node.linear_before_reset =
-          ReadNodeAttribute<int64_t>(node, "linear_before_reset").value_or(0);
+    const OpDefinition* op = FindOpDefinition(compiled_node.domain, compiled_node.op_type);
+    GGONNX_ASSERT(op != nullptr, "compiled partition could not locate supported op definition");
+    if (op->compile_attrs != nullptr) {
+      op->compile_attrs(node, &compiled_node);
     }
 
     for (Ort::ConstValueInfo input : node_inputs) {
@@ -690,65 +793,6 @@ ShapeKey MakeShapeKey(const std::vector<TensorMetadata>& input_metadata) {
   return key;
 }
 
-ResolvedPartition ResolvePartitionShapes(const CompiledPartition& partition,
-                                         const std::vector<TensorMetadata>& input_metadata) {
-  GGONNX_ASSERT(input_metadata.size() == partition.graph_inputs.size(),
-                "runtime input metadata does not match compiled partition");
-
-  ResolvedPartition resolved;
-  resolved.value_dims.resize(partition.values.size());
-  std::vector<bool> is_resolved(partition.values.size(), false);
-
-  for (size_t i = 0; i < input_metadata.size(); ++i) {
-    const size_t value_id = partition.graph_inputs[i];
-    const TensorMetadata& meta = input_metadata[i];
-    const ValueDesc& value = partition.values[value_id];
-
-    GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                  "GGONNX runtime input must be float32");
-    GGONNX_ASSERT(AreShapesCompatible(value.dims, meta.dims),
-                  "runtime input shape mismatch for tensor '" + value.name + "': declared " +
-                      FormatDims(value.dims) + ", got " + FormatDims(meta.dims));
-    GGONNX_ASSERT(HasFullyStaticShape(meta.dims),
-                  "runtime input shapes must be concrete for tensor '" + value.name + "'");
-
-    resolved.value_dims[value_id] = meta.dims;
-    is_resolved[value_id] = true;
-  }
-
-  for (const NodeDesc& node : partition.nodes) {
-    const std::string_view op_type(node.op_type);
-    const std::string_view domain(node.domain);
-    if (domain.empty() && IsSupportedElementwiseBinaryOpType(op_type)) {
-      ResolveElementwiseBinaryNode(partition,
-                                   node,
-                                   resolved.value_dims,
-                                   is_resolved,
-                                   &resolved.value_dims,
-                                   &is_resolved);
-      continue;
-    }
-    if (domain.empty() && op_type == "GRU") {
-      ResolveGRUNode(partition,
-                     node,
-                     resolved.value_dims,
-                     is_resolved,
-                     &resolved.value_dims,
-                     &is_resolved);
-      continue;
-    }
-
-    GGONNX_ABORT("GGONNX fatal: Unsupported ONNX op in ResolvePartitionShapes");
-  }
-
-  for (size_t output_id : partition.graph_outputs) {
-    GGONNX_ASSERT(output_id < is_resolved.size() && is_resolved[output_id],
-                  "compiled partition output shape was not resolved");
-  }
-
-  return resolved;
-}
-
 ggml_tensor* CreateTensorForOnnxShape(ggml_context* ctx, const std::vector<int64_t>& dims) {
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
   if (dims.empty()) {
@@ -783,179 +827,14 @@ void CopyInputDataToTensor(const OrtValue* input_value,
   std::memcpy(tensor->data, input_data, bytes);
 }
 
-ggml_tensor* EmitNode(ggml_context* ctx,
-                      const NodeDesc& node,
-                      const std::vector<ggml_tensor*>& values,
-                      const std::vector<std::vector<int64_t>>& resolved_value_dims,
-                      std::vector<ggml_tensor*>* node_outputs) {
+EmitResult EmitNode(ggml_context* ctx,
+                    const NodeDesc& node,
+                    const std::vector<ggml_tensor*>& values) {
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
-  GGONNX_NOT_NULL(node_outputs, "node outputs must not be null");
-  const std::string_view op_type(node.op_type);
-  const std::string_view domain(node.domain);
-  if (domain.empty() && IsSupportedElementwiseBinaryOpType(op_type)) {
-    if (node.inputs.size() != 2 || node.outputs.size() != 1) {
-      throw std::runtime_error("compiled binary op node has invalid arity");
-    }
-    GGONNX_ASSERT(node.inputs[0] < values.size() && node.inputs[1] < values.size(),
-                  "compiled binary op node input index out of range");
-    GGONNX_ASSERT(node.outputs[0] < values.size(), "compiled binary op node output index out of range");
-
-    ggml_tensor* lhs = values[node.inputs[0]];
-    ggml_tensor* rhs = values[node.inputs[1]];
-    if (lhs == nullptr || rhs == nullptr) {
-      throw std::runtime_error("compiled binary op node missing GGML inputs");
-    }
-
-    if (op_type == "Add") {
-      node_outputs->push_back(ggml_add(ctx, lhs, rhs));
-      return node_outputs->back();
-    }
-    if (op_type == "Sub") {
-      node_outputs->push_back(ggml_sub(ctx, lhs, rhs));
-      return node_outputs->back();
-    }
-    if (op_type == "Mul") {
-      node_outputs->push_back(ggml_mul(ctx, lhs, rhs));
-      return node_outputs->back();
-    }
-    if (op_type == "Div") {
-      node_outputs->push_back(ggml_div(ctx, lhs, rhs));
-      return node_outputs->back();
-    }
-  }
-
-  if (domain.empty() && op_type == "GRU") {
-    GGONNX_ASSERT(node.inputs.size() >= 3, "compiled GRU node has invalid input arity");
-    GGONNX_ASSERT(node.hidden_size > 0, "compiled GRU node must have positive hidden_size");
-
-    ggml_tensor* x = values[node.inputs[0]];
-    ggml_tensor* w = values[node.inputs[1]];
-    ggml_tensor* r = values[node.inputs[2]];
-    ggml_tensor* b = (node.inputs.size() > 3 && node.inputs[3] != kOptionalValueAbsent) ? values[node.inputs[3]] : nullptr;
-    ggml_tensor* initial_h =
-        (node.inputs.size() > 5 && node.inputs[5] != kOptionalValueAbsent) ? values[node.inputs[5]] : nullptr;
-    if (x == nullptr || w == nullptr || r == nullptr) {
-      throw std::runtime_error("compiled GRU node missing required GGML inputs");
-    }
-
-    const int64_t input_size = x->ne[0];
-    const int64_t batch_size = x->ne[1];
-    const int64_t seq_length = x->ne[2];
-    const int64_t hidden_size = node.hidden_size;
-    GGONNX_ASSERT(w->ne[0] == input_size && w->ne[1] == hidden_size * 3 && w->ne[2] == 1,
-                  "compiled GRU W tensor shape mismatch");
-    GGONNX_ASSERT(r->ne[0] == hidden_size && r->ne[1] == hidden_size * 3 && r->ne[2] == 1,
-                  "compiled GRU R tensor shape mismatch");
-
-    auto matrix_slice_rows = [&](ggml_tensor* matrix, int64_t row_offset, int64_t row_count) -> ggml_tensor* {
-      return ggml_view_2d(ctx,
-                          matrix,
-                          matrix->ne[0],
-                          row_count,
-                          matrix->nb[1],
-                          static_cast<size_t>(row_offset) * matrix->nb[1]);
-    };
-    auto vector_slice = [&](ggml_tensor* vector, int64_t offset, int64_t length) -> ggml_tensor* {
-      return ggml_view_1d(
-          ctx, vector, length, static_cast<size_t>(offset) * ggml_element_size(vector));
-    };
-    auto timestep_slice = [&](ggml_tensor* sequence, int64_t step) -> ggml_tensor* {
-      return ggml_view_2d(ctx,
-                          sequence,
-                          sequence->ne[0],
-                          sequence->ne[1],
-                          sequence->nb[1],
-                          static_cast<size_t>(step) * sequence->nb[2]);
-    };
-    auto broadcast_add = [&](ggml_tensor* matrix, ggml_tensor* bias) -> ggml_tensor* {
-      return ggml_add(ctx, matrix, ggml_repeat(ctx, bias, matrix));
-    };
-
-    ggml_tensor* wb = nullptr;
-    ggml_tensor* rb = nullptr;
-    if (b != nullptr) {
-      GGONNX_ASSERT(b->ne[0] == hidden_size * 6 && b->ne[1] == 1, "compiled GRU bias tensor shape mismatch");
-      wb = vector_slice(b, 0, hidden_size * 3);
-      rb = vector_slice(b, hidden_size * 3, hidden_size * 3);
-    }
-
-    ggml_tensor* h_t = nullptr;
-    if (initial_h != nullptr) {
-      GGONNX_ASSERT(initial_h->ne[0] == hidden_size && initial_h->ne[1] == batch_size && initial_h->ne[2] == 1,
-                    "compiled GRU initial_h tensor shape mismatch");
-      h_t = ggml_view_2d(ctx, initial_h, initial_h->ne[0], initial_h->ne[1], initial_h->nb[1], 0);
-    } else {
-      h_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, batch_size);
-      std::memset(h_t->data, 0, ggml_nbytes(h_t));
-    }
-
-    ggml_tensor* y = nullptr;
-    if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
-      y = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hidden_size, batch_size, 1, seq_length);
-    }
-
-    ggml_tensor* w_z = matrix_slice_rows(w, 0, hidden_size);
-    ggml_tensor* w_r = matrix_slice_rows(w, hidden_size, hidden_size);
-    ggml_tensor* w_h = matrix_slice_rows(w, hidden_size * 2, hidden_size);
-    ggml_tensor* r_z = matrix_slice_rows(r, 0, hidden_size);
-    ggml_tensor* r_r = matrix_slice_rows(r, hidden_size, hidden_size);
-    ggml_tensor* r_h = matrix_slice_rows(r, hidden_size * 2, hidden_size);
-    ggml_tensor* wb_z = wb != nullptr ? vector_slice(wb, 0, hidden_size) : nullptr;
-    ggml_tensor* wb_r = wb != nullptr ? vector_slice(wb, hidden_size, hidden_size) : nullptr;
-    ggml_tensor* wb_h = wb != nullptr ? vector_slice(wb, hidden_size * 2, hidden_size) : nullptr;
-    ggml_tensor* rb_z = rb != nullptr ? vector_slice(rb, 0, hidden_size) : nullptr;
-    ggml_tensor* rb_r = rb != nullptr ? vector_slice(rb, hidden_size, hidden_size) : nullptr;
-    ggml_tensor* rb_h = rb != nullptr ? vector_slice(rb, hidden_size * 2, hidden_size) : nullptr;
-
-    for (int64_t step = 0; step < seq_length; ++step) {
-      ggml_tensor* x_t = timestep_slice(x, step);
-
-      ggml_tensor* z = ggml_add(ctx, ggml_mul_mat(ctx, w_z, x_t), ggml_mul_mat(ctx, r_z, h_t));
-      if (wb_z != nullptr) {
-        z = broadcast_add(z, wb_z);
-      }
-      if (rb_z != nullptr) {
-        z = broadcast_add(z, rb_z);
-      }
-      z = ggml_sigmoid(ctx, z);
-
-      ggml_tensor* r_gate = ggml_add(ctx, ggml_mul_mat(ctx, w_r, x_t), ggml_mul_mat(ctx, r_r, h_t));
-      if (wb_r != nullptr) {
-        r_gate = broadcast_add(r_gate, wb_r);
-      }
-      if (rb_r != nullptr) {
-        r_gate = broadcast_add(r_gate, rb_r);
-      }
-      r_gate = ggml_sigmoid(ctx, r_gate);
-
-      ggml_tensor* h_candidate = ggml_mul_mat(ctx, w_h, x_t);
-      ggml_tensor* recurrent_term = ggml_mul_mat(ctx, r_h, ggml_mul(ctx, r_gate, h_t));
-      h_candidate = ggml_add(ctx, h_candidate, recurrent_term);
-      if (wb_h != nullptr) {
-        h_candidate = broadcast_add(h_candidate, wb_h);
-      }
-      if (rb_h != nullptr) {
-        h_candidate = broadcast_add(h_candidate, rb_h);
-      }
-      h_candidate = ggml_tanh(ctx, h_candidate);
-
-      h_t = ggml_add(ctx, h_candidate, ggml_mul(ctx, z, ggml_sub(ctx, h_t, h_candidate)));
-
-      if (y != nullptr) {
-        y = ggml_set(ctx, y, h_t, y->nb[1], y->nb[2], y->nb[3], static_cast<size_t>(step) * y->nb[3]);
-      }
-    }
-
-    if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
-      node_outputs->push_back(ggml_cont(ctx, y));
-    }
-    if (node.outputs.size() > 1 && node.outputs[1] != kOptionalValueAbsent) {
-      node_outputs->push_back(ggml_cont_3d(ctx, h_t, hidden_size, batch_size, 1));
-    }
-    return node_outputs->empty() ? nullptr : node_outputs->front();
-  }
-
-  GGONNX_ABORT("GGONNX fatal: Unsupported ONNX op in EmitNode");
+  const OpDefinition* op = FindOpDefinition(node.domain, node.op_type);
+  GGONNX_ASSERT(op != nullptr && op->emit != nullptr,
+                "compiled partition contains op without GGML emitter");
+  return op->emit(ctx, node, values);
 }
 
 void DestroyMaterializedGraph(std::unique_ptr<MaterializedGraph>& graph) {
@@ -967,11 +846,11 @@ void DestroyMaterializedGraph(std::unique_ptr<MaterializedGraph>& graph) {
 
 std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartition& partition,
                                                           ShapeKey key,
-                                                          ResolvedPartition resolved) {
+                                                          const std::vector<TensorMetadata>& input_metadata) {
   const size_t mem_size =
       EstimatePartitionTensorCount(partition) * ggml_tensor_overhead() +
       ggml_graph_overhead() +
-      EstimatePartitionDataBytes(resolved.value_dims);
+      EstimateInitialGraphDataBytes(partition, input_metadata);
 
   ggml_init_params params{};
   params.mem_size = mem_size;
@@ -986,48 +865,56 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
   try {
     auto graph_state = std::make_unique<MaterializedGraph>();
     graph_state->key = std::move(key);
-    graph_state->resolved = std::move(resolved);
     graph_state->ctx = ctx;
     graph_state->values.resize(partition.values.size(), nullptr);
+    graph_state->value_dims.resize(partition.values.size());
     graph_state->input_tensors.resize(partition.graph_inputs.size(), nullptr);
     graph_state->output_tensors.resize(partition.graph_outputs.size(), nullptr);
 
     for (size_t i = 0; i < partition.graph_inputs.size(); ++i) {
       const size_t value_id = partition.graph_inputs[i];
-      ggml_tensor* input_tensor = CreateTensorForOnnxShape(ctx, graph_state->resolved.value_dims[value_id]);
+      const TensorMetadata& meta = input_metadata[i];
+      const ValueDesc& value = partition.values[value_id];
+      GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                    "GGONNX runtime input must be float32");
+      GGONNX_ASSERT(AreShapesCompatible(value.dims, meta.dims),
+                    "runtime input shape mismatch for tensor '" + value.name + "': declared " +
+                        FormatDims(value.dims) + ", got " + FormatDims(meta.dims));
+      GGONNX_ASSERT(HasFullyStaticShape(meta.dims),
+                    "runtime input shapes must be concrete for tensor '" + value.name + "'");
+
+      ggml_tensor* input_tensor = CreateTensorForOnnxShape(ctx, meta.dims);
       GGONNX_NOT_NULL(input_tensor, "failed to allocate cached GGML input tensor");
-      AssertShapeMatchesGGML(graph_state->resolved.value_dims[value_id],
-                             input_tensor,
-                             partition.values[value_id].name);
+      AssertShapeMatchesGGML(meta.dims, input_tensor, partition.values[value_id].name);
       graph_state->values[value_id] = input_tensor;
+      graph_state->value_dims[value_id] = meta.dims;
       graph_state->input_tensors[i] = input_tensor;
     }
 
     for (const NodeDesc& node : partition.nodes) {
-      std::vector<ggml_tensor*> emitted_outputs;
-      GGONNX_NOT_NULL(EmitNode(ctx,
-                               node,
-                               graph_state->values,
-                               graph_state->resolved.value_dims,
-                               &emitted_outputs),
-                      "EmitNode() returned nullptr, unsupported output?");
+      EmitResult emitted_outputs = EmitNode(ctx, node, graph_state->values);
+      GGONNX_ASSERT(emitted_outputs.has_value(),
+                    "EmitNode() returned unsupported for a compiled node");
 
       size_t emitted_index = 0;
       for (size_t output_id : node.outputs) {
         if (output_id == kOptionalValueAbsent) {
           continue;
         }
-        GGONNX_ASSERT(emitted_index < emitted_outputs.size(), "compiled node emitted too few outputs");
+        GGONNX_ASSERT(emitted_index < emitted_outputs->size(), "compiled node emitted too few outputs");
         GGONNX_ASSERT(output_id < graph_state->values.size(), "compiled node output index out of range");
         GGONNX_ASSERT(graph_state->values[output_id] == nullptr,
                       "compiled node output slot already populated");
-        ggml_tensor* node_output = emitted_outputs[emitted_index++];
-        AssertShapeMatchesGGML(graph_state->resolved.value_dims[output_id],
-                               node_output,
-                               partition.values[output_id].name);
+        ggml_tensor* node_output = (*emitted_outputs)[emitted_index++];
+        const std::vector<int64_t> output_dims = ToOnnxDims(node_output);
+        GGONNX_ASSERT(AreShapesCompatible(partition.values[output_id].dims, output_dims),
+                      "emitted output shape mismatch for tensor '" + partition.values[output_id].name +
+                          "': declared " + FormatDims(partition.values[output_id].dims) + ", got " +
+                          FormatDims(output_dims));
         graph_state->values[output_id] = node_output;
+        graph_state->value_dims[output_id] = std::move(output_dims);
       }
-      GGONNX_ASSERT(emitted_index == emitted_outputs.size(), "compiled node emitted too many outputs");
+      GGONNX_ASSERT(emitted_index == emitted_outputs->size(), "compiled node emitted too many outputs");
     }
 
     graph_state->graph = ggml_new_graph(ctx);
@@ -1084,15 +971,14 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
   const ShapeKey shape_key = MakeShapeKey(input_metadata);
   if (state.active_graph == nullptr || state.active_graph->key != shape_key) {
     DestroyMaterializedGraph(state.active_graph);
-    state.active_graph = BuildMaterializedGraph(
-        partition, shape_key, ResolvePartitionShapes(partition, input_metadata));
+    state.active_graph = BuildMaterializedGraph(partition, shape_key, input_metadata);
   }
 
   GGONNX_NOT_NULL(state.active_graph.get(), "active GGML graph must not be null");
   for (size_t i = 0; i < partition.graph_inputs.size(); ++i) {
     const size_t input_id = partition.graph_inputs[i];
     CopyInputDataToTensor(input_values[i],
-                          state.active_graph->resolved.value_dims[input_id],
+                          state.active_graph->value_dims[input_id],
                           partition.values[input_id].name,
                           state.active_graph->input_tensors[i]);
   }
@@ -1103,7 +989,7 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
 
   for (size_t i = 0; i < partition.graph_outputs.size(); ++i) {
     const size_t output_id = partition.graph_outputs[i];
-    const std::vector<int64_t>& output_dims = state.active_graph->resolved.value_dims[output_id];
+    const std::vector<int64_t>& output_dims = state.active_graph->value_dims[output_id];
     OrtValue* output_value = nullptr;
     THROW_ON_ERROR(GetOrtApi().KernelContext_GetOutput(
         kernel_context, i, output_dims.data(), output_dims.size(), &output_value));
