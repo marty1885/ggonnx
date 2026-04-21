@@ -1,12 +1,29 @@
 #include "ops.hpp"
 #include "inner/helpers.hpp"
 #include "inner/ort_api_helpers.hpp"
+#include <cmath>
 #include <cstring>
 #include <unordered_map>
 
 namespace {
 
 thread_local const ConstantValueMap* g_active_compile_time_constants = nullptr;
+
+void ComputeErf(ggml_tensor* dst, const ggml_tensor* src, int ith, int nth, void* /*userdata*/) {
+  GGONNX_NOT_NULL(dst, "Erf custom op destination must not be null");
+  GGONNX_NOT_NULL(src, "Erf custom op source must not be null");
+
+  const int64_t n = ggml_nelements(src);
+  const int64_t start = (n * ith) / nth;
+  const int64_t end = (n * (ith + 1)) / nth;
+  float* dst_data = ggml_get_data_f32(dst);
+  float* src_data = ggml_get_data_f32(src);
+  GGONNX_NOT_NULL(dst_data, "Erf custom op destination data must not be null");
+  GGONNX_NOT_NULL(src_data, "Erf custom op source data must not be null");
+  for (int64_t i = start; i < end; ++i) {
+    dst_data[i] = std::erf(src_data[i]);
+  }
+}
 
 std::optional<ConstantTensor> LookupCompileTimeConstant(Ort::ConstValueInfo value_info) {
   if (value_info == nullptr) return std::nullopt;
@@ -810,7 +827,7 @@ EmitResult EmitLSTMNode(ggml_context* ctx,
 }
 
 // Shape-preserving unary float op with no attributes. Covers Relu, Sigmoid, Tanh, Neg,
-// Abs, Sqrt, Exp, Log, Softplus, Elu (ONNX default alpha=1.0 only).
+// Abs, Sqrt, Exp, Log, Erf, Softplus, Elu (ONNX default alpha=1.0 only).
 bool IsSupportedUnaryFloatNode(Ort::ConstNode node) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -858,6 +875,8 @@ EmitResult EmitUnaryFloatNode(ggml_context* ctx,
   if (op == "Sqrt")     return EmitOutputs{ggml_sqrt(ctx, x)};
   if (op == "Exp")      return EmitOutputs{ggml_exp(ctx, x)};
   if (op == "Log")      return EmitOutputs{ggml_log(ctx, x)};
+  if (op == "Erf")      return EmitOutputs{ggml_map_custom1(ctx, ggml_cont(ctx, x), ComputeErf,
+                                                            GGML_N_TASKS_MAX, nullptr)};
   if (op == "Softplus") return EmitOutputs{ggml_softplus(ctx, x)};
   if (op == "Elu")      return EmitOutputs{ggml_elu(ctx, x)};
   return std::nullopt;
@@ -1622,6 +1641,43 @@ bool IsSupportedFlattenNode(Ort::ConstNode node) {
     return false;
   }
   return true;
+}
+
+// ONNX Squeeze: removes axes of length 1. Like Reshape/Flatten, once shape
+// inference has run the runtime axes input is redundant, so we only require the
+// output shape to be fully static and lower to a ggml reshape.
+bool IsSupportedSqueezeNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if ((inputs.size() != 1 && inputs.size() != 2) || outputs.size() != 1 ||
+      node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  const TensorMetadata in = getTensorMetadata(inputs[0]);
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(in) || !rankSupportedByGGML(out)) {
+    return false;
+  }
+  if (!shapeIsFullyStatic(out.dims)) {
+    return false;
+  }
+  return true;
+}
+
+void CompileSqueezeAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto outputs = node.GetOutputs();
+  GGONNX_ASSERT(outputs.size() == 1 && outputs[0] != nullptr,
+                "Squeeze must have a single output");
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  compiled_node->attrs = NodeDesc::ReshapeAttrs{.onnx_dims = out.dims};
 }
 
 void CompileFlattenAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
@@ -2819,6 +2875,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Sqrt"},     {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Exp"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Log"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
+      {{"", "Erf"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Softplus"}, {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Elu"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "LeakyRelu"}, {IsSupportedLeakyReluNode, CompileLeakyReluAttributes, EmitLeakyReluNode}},
@@ -2832,6 +2889,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Gemm"},     {IsSupportedGemmNode, CompileGemmAttributes, EmitGemmNode, GemmConstantLayout}},
       {{"", "Reshape"},  {IsSupportedReshapeNode, CompileReshapeAttributes, EmitReshapeNode}},
       {{"", "Flatten"},  {IsSupportedFlattenNode, CompileFlattenAttributes, EmitReshapeNode}},
+      {{"", "Squeeze"},  {IsSupportedSqueezeNode, CompileSqueezeAttributes, EmitReshapeNode}},
       {{"", "MaxPool"},       {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
       {{"", "AveragePool"},   {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
       {{"", "GlobalMaxPool"}, {IsSupportedGlobalPoolNode, CompileGlobalPoolAttributes, EmitPool2DNode}},

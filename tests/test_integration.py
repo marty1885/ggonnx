@@ -65,6 +65,10 @@ _WAIFU2X_CUNET_MODEL_URL = (
     "https://huggingface.co/deepghs/waifu2x_onnx/resolve/main/"
     "20250502/onnx_models/cunet/art/noise0_scale2x.onnx?download=true"
 )
+_WAIFU2X_SWIN_UNET_MODEL_URL = (
+    "https://huggingface.co/deepghs/waifu2x_onnx/resolve/main/"
+    "20250502/onnx_models/swin_unet/art/noise0_scale2x.onnx?download=true"
+)
 
 
 def _esperanto_flag(height: int, width: int) -> np.ndarray:
@@ -368,6 +372,35 @@ def test_waifu2x_cunet_matches_cpu(ep_library: Path) -> None:
     for got, expected in zip(ggml_out, cpu_out):
         np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
     assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.integration
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "waifu2x swin_unet still falls back to CPU for Reshape/Transpose/"
+        "Squeeze/Pad/Split/Erf/Add/DepthToSpace and the GGML-partitioned "
+        "result does not yet match CPU"
+    ),
+)
+def test_waifu2x_swin_unet_matches_cpu(ep_library: Path) -> None:
+    raw_path = cached_model_path(
+        "waifu2x_swin_unet_art_noise0_scale2x.onnx",
+        _WAIFU2X_SWIN_UNET_MODEL_URL,
+    )
+    model_path = _concretize_input_dims(raw_path, {"x": [1, 3, 128, 128]})
+
+    inputs = {"x": _esperanto_flag(128, 128)}
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    output_names = [out.name for out in cpu.get_outputs()]
+    cpu_out = cpu.run(output_names, inputs)
+    ggml_out = ggml.run(output_names, inputs)
+
+    for got, expected in zip(ggml_out, cpu_out):
+        np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.integration

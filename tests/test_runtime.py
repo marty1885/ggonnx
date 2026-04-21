@@ -324,7 +324,7 @@ _UNARY_INPUT_OVERRIDES = {
 
 @pytest.mark.parametrize(
     "op_type",
-    ["Relu", "Sigmoid", "Tanh", "Neg", "Abs", "Sqrt", "Exp", "Log", "Softplus", "Elu"],
+    ["Relu", "Sigmoid", "Tanh", "Neg", "Abs", "Sqrt", "Exp", "Log", "Erf", "Softplus", "Elu"],
 )
 def test_single_unary_ops(suite_tmpdir, ep_library: Path, op_type: str) -> None:
     model_path = build_single_unary_model(suite_tmpdir, op_type)
@@ -927,6 +927,21 @@ def build_reshape_model(tmpdir: Path, in_shape, out_shape) -> Path:
     return ensure_model(tmpdir, graph)
 
 
+def build_squeeze_model(tmpdir: Path, x_shape, y_shape, axes, *, variant="input_axes") -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    if variant == "attribute_axes":
+        node = helper.make_node("Squeeze", ["x"], ["y"], name="squeeze_0", axes=list(axes))
+        graph = helper.make_graph([node], "single_squeeze_attr", [x], [y])
+        return ensure_model_with_opset(tmpdir, graph, 11)
+    if variant == "input_axes":
+        axes_init = helper.make_tensor("axes", TensorProto.INT64, [len(axes)], list(axes))
+        node = helper.make_node("Squeeze", ["x", "axes"], ["y"], name="squeeze_0")
+        graph = helper.make_graph([node], "single_squeeze_input", [x], [y], initializer=[axes_init])
+        return ensure_model_with_opset(tmpdir, graph, 13)
+    raise ValueError(f"unsupported Squeeze variant: {variant}")
+
+
 @pytest.mark.parametrize(
     "in_shape,out_shape",
     [
@@ -940,6 +955,30 @@ def test_single_reshape(suite_tmpdir, ep_library: Path, in_shape, out_shape) -> 
     model_path = build_reshape_model(suite_tmpdir, in_shape, out_shape)
     rng = np.random.default_rng(4)
     inputs = {"x": rng.standard_normal(in_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.parametrize("variant", ["attribute_axes", "input_axes"])
+@pytest.mark.parametrize(
+    "x_shape,y_shape,axes",
+    [
+        ((1, 3, 1, 5), (3, 5), [0, 2]),
+        ((2, 1, 4, 1), (2, 4), [1, 3]),
+    ],
+)
+def test_single_squeeze(
+    suite_tmpdir, ep_library: Path, variant, x_shape, y_shape, axes
+) -> None:
+    model_path = build_squeeze_model(
+        suite_tmpdir, x_shape, y_shape, axes, variant=variant
+    )
+    rng = np.random.default_rng(24)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
     cpu = cpu_session(model_path)
     expected = cpu.run(["y"], inputs)[0]
     ggml = ggml_session(model_path, ep_library)
