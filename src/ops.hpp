@@ -2,6 +2,7 @@
 
 #include <ggml.h>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -120,6 +121,18 @@ struct NodeDesc {
     int scale_w{1};
     int scale_h{1};
   };
+  struct TransposeAttrs {
+    // Permutation expressed in GGML axis order (padded to GGML_MAX_DIMS). Axis j
+    // of the output is taken from axis ggml_perm[j] of the input — the same
+    // convention ggml_permute() uses.
+    std::array<int, GGML_MAX_DIMS> ggml_perm{0, 1, 2, 3};
+  };
+  struct SliceAttrs {
+    // Slice is implemented as a ggml_view with step == 1. Both arrays are in
+    // padded GGML axis order: untouched dims get start=0 and full size.
+    std::array<int64_t, GGML_MAX_DIMS> ggml_starts{0, 0, 0, 0};
+    std::array<int64_t, GGML_MAX_DIMS> ggml_ne{1, 1, 1, 1};
+  };
 
   using Attrs = std::variant<NoAttrs,
                              GRUAttrs,
@@ -131,7 +144,9 @@ struct NodeDesc {
                              Pool2DAttrs,
                              PadAttrs,
                              InstanceNormAttrs,
-                             UpsampleAttrs>;
+                             UpsampleAttrs,
+                             TransposeAttrs,
+                             SliceAttrs>;
 
   std::string op_type;
   std::string domain;

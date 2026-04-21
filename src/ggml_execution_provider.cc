@@ -447,9 +447,11 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
       if (layout == ConstantLayout::MATMUL_WEIGHT_TRANSPOSED && tensor_dims.size() >= 2) {
         std::swap(tensor_dims[tensor_dims.size() - 2], tensor_dims[tensor_dims.size() - 1]);
       }
-      const std::array<int64_t, GGML_MAX_DIMS> ggml_dims = ToGGMLDims(tensor_dims);
+      // Scalar ONNX constants (rank 0) are represented in ggml as a rank-1 size-1 tensor.
+      std::vector<int64_t> ggml_src_dims = tensor_dims.empty() ? std::vector<int64_t>{1} : tensor_dims;
+      const std::array<int64_t, GGML_MAX_DIMS> ggml_dims = ToGGMLDims(ggml_src_dims);
       ggml_tensor* t = ggml_new_tensor(partition.constant_ctx, GGML_TYPE_F32,
-                                       static_cast<int>(tensor_dims.size()),
+                                       static_cast<int>(ggml_src_dims.size()),
                                        ggml_dims.data());
       GGONNX_NOT_NULL(t, "ggml_new_tensor failed for constant");
       partition.constants[id] = t;

@@ -367,10 +367,6 @@ EmitResult EmitGRUNode(ggml_context* ctx,
                         sequence->nb[1],
                         static_cast<size_t>(step) * sequence->nb[2]);
   };
-  auto broadcast_add = [&](ggml_tensor* matrix, ggml_tensor* bias) -> ggml_tensor* {
-    return ggml_add(ctx, matrix, ggml_repeat(ctx, bias, matrix));
-  };
-
   ggml_tensor* wb = nullptr;
   ggml_tensor* rb = nullptr;
   if (b != nullptr) {
@@ -412,19 +408,19 @@ EmitResult EmitGRUNode(ggml_context* ctx,
 
     ggml_tensor* z = ggml_add(ctx, ggml_mul_mat(ctx, w_z, x_t), ggml_mul_mat(ctx, r_z, h_t));
     if (wb_z != nullptr) {
-      z = broadcast_add(z, wb_z);
+      z = ggml_add(ctx, z, wb_z);
     }
     if (rb_z != nullptr) {
-      z = broadcast_add(z, rb_z);
+      z = ggml_add(ctx, z, rb_z);
     }
     z = ggml_sigmoid(ctx, z);
 
     ggml_tensor* r_gate = ggml_add(ctx, ggml_mul_mat(ctx, w_r, x_t), ggml_mul_mat(ctx, r_r, h_t));
     if (wb_r != nullptr) {
-      r_gate = broadcast_add(r_gate, wb_r);
+      r_gate = ggml_add(ctx, r_gate, wb_r);
     }
     if (rb_r != nullptr) {
-      r_gate = broadcast_add(r_gate, rb_r);
+      r_gate = ggml_add(ctx, r_gate, rb_r);
     }
     r_gate = ggml_sigmoid(ctx, r_gate);
 
@@ -432,10 +428,10 @@ EmitResult EmitGRUNode(ggml_context* ctx,
     ggml_tensor* recurrent_term = ggml_mul_mat(ctx, r_h, ggml_mul(ctx, r_gate, h_t));
     h_candidate = ggml_add(ctx, h_candidate, recurrent_term);
     if (wb_h != nullptr) {
-      h_candidate = broadcast_add(h_candidate, wb_h);
+      h_candidate = ggml_add(ctx, h_candidate, wb_h);
     }
     if (rb_h != nullptr) {
-      h_candidate = broadcast_add(h_candidate, rb_h);
+      h_candidate = ggml_add(ctx, h_candidate, rb_h);
     }
     h_candidate = ggml_tanh(ctx, h_candidate);
 
@@ -448,10 +444,11 @@ EmitResult EmitGRUNode(ggml_context* ctx,
 
   EmitOutputs outputs;
   if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
-    outputs.push_back(ggml_cont(ctx, y));
+    outputs.push_back(ggml_is_contiguous(y) ? y : ggml_cont(ctx, y));
   }
   if (node.outputs.size() > 1 && node.outputs[1] != kOptionalValueAbsent) {
-    outputs.push_back(ggml_reshape_3d(ctx, ggml_cont(ctx, h_t), hidden_size, batch_size, 1));
+    ggml_tensor* h_out = ggml_is_contiguous(h_t) ? h_t : ggml_cont(ctx, h_t);
+    outputs.push_back(ggml_reshape_3d(ctx, h_out, hidden_size, batch_size, 1));
   }
   return outputs;
 }
@@ -1391,6 +1388,410 @@ EmitResult EmitUpsampleNode(ggml_context* ctx,
   return EmitOutputs{ggml_upscale(ctx, x, attrs->scale_w, GGML_SCALE_MODE_NEAREST)};
 }
 
+// Identity: logical copy. We emit a view of the input so the result has a
+// distinct ggml_tensor* (graph build asserts on reused output slots) while
+// sharing storage and staying cheap.
+bool IsSupportedIdentityNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  const TensorMetadata in = getTensorMetadata(inputs[0]);
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(in) || !rankSupportedByGGML(out)) {
+    return false;
+  }
+  return true;
+}
+
+EmitResult EmitIdentityNode(ggml_context* ctx,
+                            const NodeDesc& node,
+                            const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Identity node missing GGML input");
+  // ggml_view_tensor() has op==NONE, so if the partition output is a view-only
+  // chain the graph allocator skips the input buffer entirely. ggml_cont is a
+  // real op and keeps the graph traversal honest.
+  return EmitOutputs{ggml_cont(ctx, x)};
+}
+
+// ONNX Transpose: permutes dims by `perm` (default = reverse). GGML dim order is
+// reversed vs ONNX, so the ggml axis that feeds output GGML axis j is
+// R-1 - perm[R-1 - j]. Axes beyond the ONNX rank are padded identity.
+bool IsSupportedTransposeNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  const TensorMetadata in = getTensorMetadata(inputs[0]);
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(in) || !rankSupportedByGGML(out)) {
+    return false;
+  }
+  const size_t rank = in.dims.size();
+  if (rank == 0 || rank != out.dims.size()) {
+    return false;
+  }
+  if (const auto perm = readNodeAttribute<std::vector<int64_t>>(node, "perm")) {
+    if (perm->size() != rank) return false;
+    std::vector<int> seen(rank, 0);
+    for (int64_t p : *perm) {
+      if (p < 0 || static_cast<size_t>(p) >= rank) return false;
+      if (seen[p]) return false;
+      seen[p] = 1;
+    }
+  }
+  return true;
+}
+
+void CompileTransposeAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto inputs = node.GetInputs();
+  const size_t rank = getTensorMetadata(inputs[0]).dims.size();
+
+  std::vector<int64_t> perm;
+  if (const auto attr = readNodeAttribute<std::vector<int64_t>>(node, "perm")) {
+    perm = *attr;
+  } else {
+    // ONNX default: reverse dims.
+    perm.resize(rank);
+    for (size_t i = 0; i < rank; ++i) perm[i] = static_cast<int64_t>(rank - 1 - i);
+  }
+
+  // Invert the ONNX permutation: inv[perm[i]] = i. Semantically inv maps an
+  // input ONNX dim to the output ONNX dim it ends up at — which matches
+  // ggml_permute's axis_j = "new position of input axis j".
+  std::vector<int64_t> inv(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    inv[static_cast<size_t>(perm[i])] = static_cast<int64_t>(i);
+  }
+
+  NodeDesc::TransposeAttrs attrs;
+  // Identity for padded GGML axes beyond input rank.
+  for (int i = 0; i < GGML_MAX_DIMS; ++i) attrs.ggml_perm[i] = i;
+  for (size_t j = 0; j < rank; ++j) {
+    const size_t onnx_in_dim = rank - 1 - j;
+    const size_t onnx_out_dim = static_cast<size_t>(inv[onnx_in_dim]);
+    attrs.ggml_perm[j] = static_cast<int>(rank - 1 - onnx_out_dim);
+  }
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitTransposeNode(ggml_context* ctx,
+                             const NodeDesc& node,
+                             const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::TransposeAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Transpose node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Transpose node missing GGML input");
+  ggml_tensor* permuted = ggml_permute(ctx,
+                                       x,
+                                       attrs->ggml_perm[0],
+                                       attrs->ggml_perm[1],
+                                       attrs->ggml_perm[2],
+                                       attrs->ggml_perm[3]);
+  // ggml_permute returns a non-contiguous view; materialize so downstream ops
+  // that assume contiguous input (reshape, concat, mul_mat) are happy.
+  return EmitOutputs{ggml_cont(ctx, permuted)};
+}
+
+// ONNX Concat: join N inputs along `axis`. GGML's ggml_concat takes two tensors
+// and a GGML-axis integer, so we translate ONNX axis -> (rank-1-axis) and fold
+// left-to-right.
+bool IsSupportedConcatNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.empty() || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (outputs[0] == nullptr) return false;
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  if (out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || !rankSupportedByGGML(out)) {
+    return false;
+  }
+  const size_t rank = out.dims.size();
+  if (rank == 0) return false;
+
+  const auto axis_attr = readNodeAttribute<int64_t>(node, "axis");
+  if (!axis_attr) return false;
+  int64_t axis = *axis_attr;
+  if (axis < 0) axis += static_cast<int64_t>(rank);
+  if (axis < 0 || axis >= static_cast<int64_t>(rank)) return false;
+
+  for (Ort::ConstValueInfo input : inputs) {
+    if (input == nullptr) return false;
+    const TensorMetadata meta = getTensorMetadata(input);
+    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
+    if (meta.dims.size() != rank) return false;
+    if (!rankSupportedByGGML(meta)) return false;
+  }
+  return true;
+}
+
+void CompileConcatAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto outputs = node.GetOutputs();
+  const size_t rank = getTensorMetadata(outputs[0]).dims.size();
+  const int64_t axis = readNodeAttribute<int64_t>(node, "axis").value_or(0);
+  const int64_t normalized = axis < 0 ? axis + static_cast<int64_t>(rank) : axis;
+  // Store as GGML axis index so emit is a pure translation.
+  compiled_node->attrs = NodeDesc::AxisAttrs{.axis = static_cast<int64_t>(rank) - 1 - normalized};
+}
+
+EmitResult EmitConcatNode(ggml_context* ctx,
+                          const NodeDesc& node,
+                          const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::AxisAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Concat node missing attributes");
+  GGONNX_ASSERT(!node.inputs.empty(), "compiled Concat node has no inputs");
+  const int ggml_axis = static_cast<int>(attrs->axis);
+
+  ggml_tensor* acc = values[node.inputs[0]];
+  GGONNX_NOT_NULL(acc, "compiled Concat node missing GGML input 0");
+  if (!ggml_is_contiguous(acc)) acc = ggml_cont(ctx, acc);
+
+  for (size_t i = 1; i < node.inputs.size(); ++i) {
+    ggml_tensor* rhs = values[node.inputs[i]];
+    GGONNX_NOT_NULL(rhs, "compiled Concat node missing GGML input");
+    if (!ggml_is_contiguous(rhs)) rhs = ggml_cont(ctx, rhs);
+    acc = ggml_concat(ctx, acc, rhs, ggml_axis);
+  }
+  return EmitOutputs{acc};
+}
+
+// ONNX Slice (opset >= 10): data, starts, ends, axes?, steps?. We handle the
+// common case where starts/ends/axes/steps are constant int64 initializers and
+// all steps are 1 — that lets us lower the op to a single ggml_view_4d, which
+// is a zero-copy aliased view of the source buffer.
+bool IsSupportedSliceNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() < 3 || inputs.size() > 5 || outputs.size() != 1 ||
+      node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+
+  const TensorMetadata data = getTensorMetadata(inputs[0]);
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  if (data.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(data) || !rankSupportedByGGML(out)) {
+    return false;
+  }
+  if (!shapeIsFullyStatic(data) || data.dims.size() == 0) {
+    return false;
+  }
+  // We require constant int64 starts/ends (and axes/steps if present) so the
+  // view can be materialized at compile time. Dynamic Slice falls back to CPU.
+  const auto starts = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  const auto ends = readConstantInputArray<int64_t>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  if (!starts || !ends || starts->size() != ends->size() || starts->empty()) {
+    return false;
+  }
+  if (inputs.size() >= 4 && inputs[3] != nullptr) {
+    const auto axes = readConstantInputArray<int64_t>(node, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    if (!axes || axes->size() != starts->size()) return false;
+  }
+  if (inputs.size() == 5 && inputs[4] != nullptr) {
+    const auto steps = readConstantInputArray<int64_t>(node, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    if (!steps || steps->size() != starts->size()) return false;
+    for (int64_t s : *steps) {
+      if (s != 1) return false;
+    }
+  }
+  return true;
+}
+
+void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto inputs = node.GetInputs();
+  const TensorMetadata data = getTensorMetadata(inputs[0]);
+  const int64_t rank = static_cast<int64_t>(data.dims.size());
+
+  const auto starts = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  const auto ends = readConstantInputArray<int64_t>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  GGONNX_ASSERT(starts.has_value() && ends.has_value(),
+                "Slice compile: starts/ends must be constant int64 initializers");
+
+  std::vector<int64_t> axes;
+  if (inputs.size() >= 4 && inputs[3] != nullptr) {
+    const auto axes_opt = readConstantInputArray<int64_t>(node, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    GGONNX_ASSERT(axes_opt.has_value(), "Slice compile: axes must be a constant int64 initializer");
+    axes = *axes_opt;
+  } else {
+    axes.resize(starts->size());
+    for (size_t i = 0; i < starts->size(); ++i) axes[i] = static_cast<int64_t>(i);
+  }
+
+  NodeDesc::SliceAttrs attrs;
+  attrs.ggml_starts.fill(0);
+  // Default: each dim passes through unsliced.
+  for (int64_t i = 0; i < rank; ++i) {
+    attrs.ggml_ne[rank - 1 - i] = data.dims[i];
+  }
+  for (int i = rank; i < GGML_MAX_DIMS; ++i) {
+    attrs.ggml_ne[i] = 1;
+  }
+
+  for (size_t k = 0; k < axes.size(); ++k) {
+    int64_t onnx_axis = axes[k];
+    if (onnx_axis < 0) onnx_axis += rank;
+    GGONNX_ASSERT(onnx_axis >= 0 && onnx_axis < rank,
+                  "Slice compile: axis out of range");
+    const int64_t dim = data.dims[onnx_axis];
+
+    // ONNX clamping rules: clamp start to [0, dim], clamp end to [0, dim].
+    auto clamp = [](int64_t v, int64_t lo, int64_t hi) {
+      return v < lo ? lo : (v > hi ? hi : v);
+    };
+    int64_t s = (*starts)[k];
+    int64_t e = (*ends)[k];
+    if (s < 0) s += dim;
+    if (e < 0) e += dim;
+    s = clamp(s, 0, dim);
+    e = clamp(e, 0, dim);
+    const int64_t length = e > s ? e - s : 0;
+
+    const int ggml_axis = static_cast<int>(rank - 1 - onnx_axis);
+    attrs.ggml_starts[ggml_axis] = s;
+    attrs.ggml_ne[ggml_axis] = length;
+  }
+
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitSliceNode(ggml_context* ctx,
+                         const NodeDesc& node,
+                         const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::SliceAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Slice node missing attributes");
+  ggml_tensor* data = values[node.inputs[0]];
+  GGONNX_NOT_NULL(data, "compiled Slice node missing GGML data input");
+
+  // Inherit source strides — a step==1 slice is a plain rectangular view.
+  const size_t offset_bytes =
+      static_cast<size_t>(attrs->ggml_starts[0]) * data->nb[0] +
+      static_cast<size_t>(attrs->ggml_starts[1]) * data->nb[1] +
+      static_cast<size_t>(attrs->ggml_starts[2]) * data->nb[2] +
+      static_cast<size_t>(attrs->ggml_starts[3]) * data->nb[3];
+
+  ggml_tensor* view = ggml_view_4d(ctx, data,
+                                   attrs->ggml_ne[0], attrs->ggml_ne[1],
+                                   attrs->ggml_ne[2], attrs->ggml_ne[3],
+                                   data->nb[1], data->nb[2], data->nb[3],
+                                   offset_bytes);
+  // Materialize because downstream kernels (and the graph-output copy path)
+  // require contiguous memory. The view keeps the same dims but aliases the
+  // source buffer — ggml_cont does the actual pack.
+  return EmitOutputs{ggml_cont(ctx, view)};
+}
+
+// ONNX BatchNormalization (inference mode): 5 inputs, 1 output.
+// Y = scale * (X - mean) / sqrt(var + eps) + bias, broadcast over channel axis.
+// First pass: rank-4 NCHW only (GGML axis 2 is the channel). ORT usually folds
+// BN into the preceding Conv bias, so this mostly matters for models without
+// that fusion (e.g. language models that use BN outside Conv).
+bool IsSupportedBatchNormNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 5 || outputs.size() != 1 ||
+      node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    if (inputs[i] == nullptr) return false;
+  }
+  if (outputs[0] == nullptr) return false;
+  if (readNodeAttribute<int64_t>(node, "training_mode").value_or(0) != 0) {
+    return false;
+  }
+
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (x.dims.size() != 4 || y.dims.size() != 4) return false;
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) return false;
+
+  for (int i = 1; i < 5; ++i) {
+    const TensorMetadata p = getTensorMetadata(inputs[i]);
+    if (p.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
+    if (p.dims.size() != 1) return false;
+  }
+  return true;
+}
+
+void CompileBatchNormAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  // Reuse InstanceNormAttrs — identical shape (single epsilon). Not renamed to
+  // keep the variant small and avoid a duplicate single-field struct.
+  compiled_node->attrs = NodeDesc::InstanceNormAttrs{
+      .epsilon = readNodeAttribute<float>(node, "epsilon").value_or(1e-5f),
+  };
+}
+
+EmitResult EmitBatchNormNode(ggml_context* ctx,
+                             const NodeDesc& node,
+                             const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(node.inputs.size() == 5 && node.outputs.size() == 1,
+                "compiled BatchNormalization node has invalid arity");
+  const auto* attrs = std::get_if<NodeDesc::InstanceNormAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled BatchNormalization node missing attributes");
+
+  ggml_tensor* x = values[node.inputs[0]];
+  ggml_tensor* scale = values[node.inputs[1]];
+  ggml_tensor* bias = values[node.inputs[2]];
+  ggml_tensor* mean = values[node.inputs[3]];
+  ggml_tensor* var = values[node.inputs[4]];
+  GGONNX_NOT_NULL(x, "compiled BatchNormalization node missing GGML X input");
+  GGONNX_NOT_NULL(scale, "compiled BatchNormalization node missing scale input");
+  GGONNX_NOT_NULL(bias, "compiled BatchNormalization node missing bias input");
+  GGONNX_NOT_NULL(mean, "compiled BatchNormalization node missing mean input");
+  GGONNX_NOT_NULL(var, "compiled BatchNormalization node missing var input");
+
+  const int64_t c = x->ne[2];
+  ggml_tensor* scale_4d = ggml_reshape_4d(ctx, scale, 1, 1, c, 1);
+  ggml_tensor* bias_4d = ggml_reshape_4d(ctx, bias, 1, 1, c, 1);
+  ggml_tensor* mean_4d = ggml_reshape_4d(ctx, mean, 1, 1, c, 1);
+  ggml_tensor* var_4d = ggml_reshape_4d(ctx, var, 1, 1, c, 1);
+
+  // std = sqrt(var + eps); scale_bias(a, s, b) = s*a + b, so we can fold the
+  // scalar epsilon add into the same op without a separate eps-filled tensor.
+  ggml_tensor* std_tensor = ggml_sqrt(ctx, ggml_scale_bias(ctx, var_4d, 1.0f, attrs->epsilon));
+  ggml_tensor* centered = ggml_sub(ctx, x, mean_4d);
+  ggml_tensor* normed = ggml_div(ctx, centered, std_tensor);
+  ggml_tensor* out = ggml_add(ctx, ggml_mul(ctx, normed, scale_4d), bias_4d);
+  return EmitOutputs{out};
+}
+
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type) {
 
   struct PairHash {
@@ -1430,6 +1831,12 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
        {IsSupportedInstanceNormalizationNode, CompileInstanceNormalizationAttributes, EmitInstanceNormalizationNode}},
       {{"", "Upsample"}, {IsSupportedUpsampleNode, CompileUpsampleAttributes, EmitUpsampleNode}},
       {{"", "Resize"}, {IsSupportedUpsampleNode, CompileUpsampleAttributes, EmitUpsampleNode}},
+      {{"", "Identity"}, {IsSupportedIdentityNode, nullptr, EmitIdentityNode}},
+      {{"", "Transpose"}, {IsSupportedTransposeNode, CompileTransposeAttributes, EmitTransposeNode}},
+      {{"", "Concat"}, {IsSupportedConcatNode, CompileConcatAttributes, EmitConcatNode}},
+      {{"", "Slice"}, {IsSupportedSliceNode, CompileSliceAttributes, EmitSliceNode}},
+      {{"", "BatchNormalization"},
+       {IsSupportedBatchNormNode, CompileBatchNormAttributes, EmitBatchNormNode}},
   };
 
   auto it = ops_table.find({domain, op_type});

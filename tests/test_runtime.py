@@ -775,6 +775,100 @@ def test_single_reshape(suite_tmpdir, ep_library: Path, in_shape, out_shape) -> 
     assert_all_nodes_run_on_ggml(ggml)
 
 
+def build_slice_model(tmpdir: Path, x_shape, y_shape, starts, ends, axes=None, steps=None) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    inits = [
+        helper.make_tensor("starts", TensorProto.INT64, [len(starts)], list(starts)),
+        helper.make_tensor("ends", TensorProto.INT64, [len(ends)], list(ends)),
+    ]
+    node_inputs = ["x", "starts", "ends"]
+    if axes is not None:
+        inits.append(helper.make_tensor("axes", TensorProto.INT64, [len(axes)], list(axes)))
+        node_inputs.append("axes")
+    if steps is not None:
+        if axes is None:
+            inits.append(helper.make_tensor("axes", TensorProto.INT64, [len(steps)],
+                                            list(range(len(steps)))))
+            node_inputs.append("axes")
+        inits.append(helper.make_tensor("steps", TensorProto.INT64, [len(steps)], list(steps)))
+        node_inputs.append("steps")
+    node = helper.make_node("Slice", node_inputs, ["y"], name="slice_0")
+    graph = helper.make_graph([node], "single_slice", [x], [y], initializer=inits)
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "x_shape,y_shape,starts,ends,axes",
+    [
+        # Basic rank-4 slice on spatial dim
+        ((1, 3, 8, 8), (1, 3, 4, 8), [0], [4], [2]),
+        # Multi-axis slice
+        ((1, 3, 8, 8), (1, 2, 4, 4), [1, 0, 2], [3, 4, 6], [1, 2, 3]),
+        # Negative indexing
+        ((1, 3, 8, 8), (1, 3, 8, 4), [-4], [8], [3]),
+        # Rank 2
+        ((6, 10), (3, 5), [1, 2], [4, 7], [0, 1]),
+        # Rank 1
+        ((12,), (4,), [2], [6], [0]),
+        # Clamping: end beyond dim
+        ((4, 5), (4, 3), [2], [99], [1]),
+        # Default axes (none passed) — slice first len(starts) dims
+        ((6, 8), (3, 8), [0], [3], None),
+    ],
+)
+def test_single_slice(suite_tmpdir, ep_library: Path, x_shape, y_shape, starts, ends, axes) -> None:
+    model_path = build_slice_model(suite_tmpdir, x_shape, y_shape, starts, ends, axes=axes)
+    rng = np.random.default_rng(21)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_batchnorm_model(tmpdir: Path, x_shape, *, epsilon=1e-5) -> Path:
+    c = x_shape[1]
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    scale = helper.make_tensor_value_info("scale", TensorProto.FLOAT, [c])
+    bias = helper.make_tensor_value_info("bias", TensorProto.FLOAT, [c])
+    mean = helper.make_tensor_value_info("mean", TensorProto.FLOAT, [c])
+    var = helper.make_tensor_value_info("var", TensorProto.FLOAT, [c])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(x_shape))
+    node = helper.make_node(
+        "BatchNormalization",
+        ["x", "scale", "bias", "mean", "var"],
+        ["y"],
+        name="bn_0",
+        epsilon=epsilon,
+    )
+    graph = helper.make_graph([node], "single_bn", [x, scale, bias, mean, var], [y])
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize("x_shape", [(1, 4, 6, 6), (2, 8, 3, 3), (1, 3, 16, 16)])
+def test_single_batchnorm(suite_tmpdir, ep_library: Path, x_shape) -> None:
+    model_path = build_batchnorm_model(suite_tmpdir, x_shape)
+    rng = np.random.default_rng(22)
+    c = x_shape[1]
+    inputs = {
+        "x": rng.standard_normal(x_shape).astype(np.float32),
+        "scale": rng.standard_normal((c,)).astype(np.float32),
+        "bias": rng.standard_normal((c,)).astype(np.float32),
+        "mean": rng.standard_normal((c,)).astype(np.float32),
+        # var must be positive for sqrt to be meaningful
+        "var": np.abs(rng.standard_normal((c,)).astype(np.float32)) + 0.1,
+    }
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 def test_single_gru_matches_cpu(suite_tmpdir, ep_library: Path) -> None:
     model_path = build_single_gru_model(suite_tmpdir)
     cpu = cpu_session(model_path)
