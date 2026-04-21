@@ -78,6 +78,24 @@ add_test(
     pytest
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
     -q
+    -m
+    "not integration"
+    --ep-library
+    $<TARGET_FILE:ggonnx_ep>
+)
+
+add_test(
+  NAME ggonnx_integration_tests
+  COMMAND
+    ${CMAKE_COMMAND}
+    -E
+    env
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+    ${Python3_EXECUTABLE}
+    -m
+    pytest
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_integration.py
+    -q
     --ep-library
     $<TARGET_FILE:ggonnx_ep>
 )

@@ -230,9 +230,14 @@ size_t EstimateInitialGraphDataBytes(const CompiledPartition& partition,
   // Leave plenty of headroom for intermediates and outputs. GGML will do the final
   // graph-level planning; this context size only needs to be safely sufficient.
   bytes *= std::max<size_t>(partition.nodes.size() + partition.graph_outputs.size(), 4);
+  // Fused image models create many extra tensor views/materializations beyond
+  // the one-output-per-node rough estimate above (e.g. reflect pad via
+  // permute+cont chains, broadcasted norm scale/bias reshapes). Keep an
+  // additional reserve so graph construction does not run out of context space.
+  bytes *= 2;
   // Ops like Conv2D allocate substantial work buffers via ggml_new_buffer during
   // graph_compute. Keep a generous floor so we don't segfault on small inputs.
-  return std::max<size_t>(bytes, 64 * 1024 * 1024);
+  return std::max<size_t>(bytes, 128 * 1024 * 1024);
 }
 
 // Byte count for a constant value given its ONNX dims (float32 only).

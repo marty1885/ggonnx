@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 from onnx import TensorProto, helper
 
-from test_support import assert_all_nodes_run_on_ggml, cpu_session, ggml_session, ensure_model
+from test_support import (
+    assert_all_nodes_run_on_ggml,
+    cpu_session,
+    ggml_session,
+    ensure_model,
+    ensure_model_with_opset,
+)
 
 
 def build_single_add_model(tmpdir: Path) -> Path:
@@ -435,6 +441,68 @@ def build_pool_model(
     return ensure_model(tmpdir, graph)
 
 
+def build_pad_model(tmpdir: Path, x_shape, y_shape, *, pads, mode="reflect", variant="legacy_attr") -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    if variant == "legacy_attr":
+        node = helper.make_node("Pad", ["x"], ["y"], name="pad_0", pads=pads, mode=mode)
+        graph = helper.make_graph([node], "single_pad_legacy", [x], [y])
+        return ensure_model_with_opset(tmpdir, graph, 2)
+    if variant == "input_pads":
+        pads_init = helper.make_tensor("pads", TensorProto.INT64, [len(pads)], list(pads))
+        node = helper.make_node("Pad", ["x", "pads"], ["y"], name="pad_0", mode=mode)
+        graph = helper.make_graph([node], "single_pad_input_pads", [x], [y], initializer=[pads_init])
+        return ensure_model_with_opset(tmpdir, graph, 13)
+    raise ValueError(f"unsupported Pad variant: {variant}")
+
+
+def build_instance_norm_model(tmpdir: Path, x_shape) -> Path:
+    c = x_shape[1]
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    scale = helper.make_tensor_value_info("scale", TensorProto.FLOAT, [c])
+    bias = helper.make_tensor_value_info("bias", TensorProto.FLOAT, [c])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(x_shape))
+    node = helper.make_node(
+        "InstanceNormalization",
+        ["x", "scale", "bias"],
+        ["y"],
+        name="instance_norm_0",
+        epsilon=1e-5,
+    )
+    graph = helper.make_graph([node], "single_instance_norm", [x, scale, bias], [y])
+    return ensure_model(tmpdir, graph)
+
+
+def build_upsample_model(
+    tmpdir: Path, x_shape, y_shape, scales, *, variant="input_scales"
+) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    if variant == "legacy_attr":
+        node = helper.make_node("Upsample", ["x"], ["y"], name="upsample_0", mode="nearest", scales=scales)
+        graph = helper.make_graph([node], "single_upsample_legacy", [x], [y])
+        return ensure_model_with_opset(tmpdir, graph, 7)
+    if variant == "input_scales":
+        scales_init = helper.make_tensor("scales", TensorProto.FLOAT, [4], list(scales))
+        node = helper.make_node("Upsample", ["x", "scales"], ["y"], name="upsample_0", mode="nearest")
+        graph = helper.make_graph([node], "single_upsample_input_scales", [x], [y], initializer=[scales_init])
+        return ensure_model_with_opset(tmpdir, graph, 9)
+    if variant == "resize":
+        scales_init = helper.make_tensor("scales", TensorProto.FLOAT, [4], list(scales))
+        node = helper.make_node(
+            "Resize",
+            ["x", "", "scales"],
+            ["y"],
+            name="resize_0",
+            mode="nearest",
+            coordinate_transformation_mode="asymmetric",
+            nearest_mode="floor",
+        )
+        graph = helper.make_graph([node], "single_resize", [x], [y], initializer=[scales_init])
+        return ensure_model_with_opset(tmpdir, graph, 13)
+    raise ValueError(f"unsupported upsample variant: {variant}")
+
+
 # (op_type, x_shape, y_shape, attrs)
 _POOL_CASES = [
     # MaxPool, no pad, k=2 s=2
@@ -484,6 +552,66 @@ def test_single_global_pool(suite_tmpdir, ep_library: Path, op_type, x_shape, y_
     ggml = ggml_session(model_path, ep_library)
     got = ggml.run(["y"], inputs)[0]
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.parametrize("variant", ["legacy_attr", "input_pads"])
+@pytest.mark.parametrize(
+    "x_shape,y_shape,pads",
+    [
+        ((1, 1, 4, 5), (1, 1, 6, 7), [0, 0, 1, 1, 0, 0, 1, 1]),
+        ((1, 2, 6, 6), (1, 2, 14, 14), [0, 0, 4, 4, 0, 0, 4, 4]),
+    ],
+)
+def test_single_pad_reflect(suite_tmpdir, ep_library: Path, variant, x_shape, y_shape, pads) -> None:
+    model_path = build_pad_model(suite_tmpdir, x_shape, y_shape, pads=pads, variant=variant)
+    rng = np.random.default_rng(11)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.parametrize("x_shape", [(1, 3, 8, 8), (2, 4, 5, 7)])
+def test_single_instance_normalization(suite_tmpdir, ep_library: Path, x_shape) -> None:
+    model_path = build_instance_norm_model(suite_tmpdir, x_shape)
+    c = x_shape[1]
+    rng = np.random.default_rng(12)
+    inputs = {
+        "x": rng.standard_normal(x_shape).astype(np.float32),
+        "scale": rng.standard_normal((c,)).astype(np.float32),
+        "bias": rng.standard_normal((c,)).astype(np.float32),
+    }
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.parametrize("variant", ["legacy_attr", "input_scales", "resize"])
+@pytest.mark.parametrize(
+    "x_shape,y_shape,scales",
+    [
+        ((1, 3, 8, 8), (1, 3, 16, 16), [1.0, 1.0, 2.0, 2.0]),
+        ((1, 2, 5, 7), (1, 2, 10, 14), [1.0, 1.0, 2.0, 2.0]),
+    ],
+)
+def test_single_upsample_nearest(
+    suite_tmpdir, ep_library: Path, variant, x_shape, y_shape, scales
+) -> None:
+    model_path = build_upsample_model(suite_tmpdir, x_shape, y_shape, scales, variant=variant)
+    rng = np.random.default_rng(13)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
     assert_all_nodes_run_on_ggml(ggml)
 
 

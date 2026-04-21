@@ -107,8 +107,31 @@ struct NodeDesc {
     int s0{1}, s1{1};
     int p0{0}, p1{0};
   };
+  struct PadAttrs {
+    int pad_w_left{0};
+    int pad_w_right{0};
+    int pad_h_top{0};
+    int pad_h_bottom{0};
+  };
+  struct InstanceNormAttrs {
+    float epsilon{1e-5f};
+  };
+  struct UpsampleAttrs {
+    int scale_w{1};
+    int scale_h{1};
+  };
 
-  using Attrs = std::variant<NoAttrs, GRUAttrs, AlphaAttrs, AxisAttrs, Conv2DAttrs, GemmAttrs, ReshapeAttrs, Pool2DAttrs>;
+  using Attrs = std::variant<NoAttrs,
+                             GRUAttrs,
+                             AlphaAttrs,
+                             AxisAttrs,
+                             Conv2DAttrs,
+                             GemmAttrs,
+                             ReshapeAttrs,
+                             Pool2DAttrs,
+                             PadAttrs,
+                             InstanceNormAttrs,
+                             UpsampleAttrs>;
 
   std::string op_type;
   std::string domain;

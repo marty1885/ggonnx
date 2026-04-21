@@ -1,5 +1,6 @@
 #include "ops.hpp"
 #include "inner/helpers.hpp"
+#include "inner/ort_api_helpers.hpp"
 #include <unordered_map>
 
 TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info) {
@@ -39,6 +40,95 @@ std::optional<T> readNodeAttribute(Ort::ConstNode node, const char* attribute_na
     Ort::ThrowOnError(attr.GetValue(value));
     return value;
   }
+}
+
+size_t elementCount(const std::vector<int64_t>& dims) {
+  size_t count = 1;
+  for (const int64_t dim : dims) {
+    GGONNX_ASSERT(dim >= 0, "tensor element count requested for dynamic or invalid shape");
+    count *= static_cast<size_t>(dim);
+  }
+  return count;
+}
+
+template <typename T>
+std::optional<std::vector<T>> readConstantInputArray(Ort::ConstNode node,
+                                                     size_t input_idx,
+                                                     ONNXTensorElementDataType element_type) {
+  const auto inputs = node.GetInputs();
+  if (input_idx >= inputs.size() || inputs[input_idx] == nullptr) {
+    return std::nullopt;
+  }
+
+  const Ort::ConstValueInfo input = inputs[input_idx];
+  if (!input.IsConstantInitializer()) {
+    return std::nullopt;
+  }
+
+  Ort::ConstValue value{nullptr};
+  Ort::ThrowOnError(input.GetInitializer(value));
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+
+  const TensorMetadata meta = getTensorMetadata(value);
+  if (meta.element_type != element_type) {
+    return std::nullopt;
+  }
+
+  const size_t count = elementCount(meta.dims);
+  if (count == 0) {
+    return std::vector<T>{};
+  }
+
+  const void* raw_data = nullptr;
+  ggonnx::ort_internal::THROW_ON_ERROR(ggonnx::ort_internal::GetOrtApi().GetTensorData(value, &raw_data));
+  const T* typed_data = static_cast<const T*>(raw_data);
+  GGONNX_NOT_NULL(typed_data, "ORT returned null tensor data for constant");
+  return std::vector<T>(typed_data, typed_data + count);
+}
+
+std::optional<std::vector<int64_t>> readPadVector(Ort::ConstNode node) {
+  if (const auto pads = readNodeAttribute<std::vector<int64_t>>(node, "pads")) {
+    return pads;
+  }
+  if (const auto paddings = readNodeAttribute<std::vector<int64_t>>(node, "paddings")) {
+    return paddings;
+  }
+  return readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+}
+
+bool inferIntegerSpatialScale(const TensorMetadata& x,
+                              const TensorMetadata& y,
+                              int* scale_h,
+                              int* scale_w) {
+  GGONNX_NOT_NULL(scale_h, "scale_h output must not be null");
+  GGONNX_NOT_NULL(scale_w, "scale_w output must not be null");
+  if (x.dims.size() != 4 || y.dims.size() != 4) {
+    return false;
+  }
+  if (!shapeIsFullyStatic(x) || !shapeIsFullyStatic(y)) {
+    return false;
+  }
+  if (y.dims[0] != x.dims[0] || y.dims[1] != x.dims[1]) {
+    return false;
+  }
+  if (x.dims[2] <= 0 || x.dims[3] <= 0 || y.dims[2] <= 0 || y.dims[3] <= 0) {
+    return false;
+  }
+  if (y.dims[2] % x.dims[2] != 0 || y.dims[3] % x.dims[3] != 0) {
+    return false;
+  }
+
+  const int64_t inferred_h = y.dims[2] / x.dims[2];
+  const int64_t inferred_w = y.dims[3] / x.dims[3];
+  if (inferred_h <= 0 || inferred_w <= 0) {
+    return false;
+  }
+
+  *scale_h = static_cast<int>(inferred_h);
+  *scale_w = static_cast<int>(inferred_w);
+  return true;
 }
 
 bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_type) {
@@ -1010,6 +1100,297 @@ EmitResult EmitPool2DNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
+bool IsSupportedPadNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.empty() || inputs.size() > 4 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (x.dims.size() != 4 || y.dims.size() != 4) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) {
+    return false;
+  }
+
+  const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("constant");
+  if (mode != "reflect") {
+    return false;
+  }
+
+  const auto pads = readPadVector(node);
+  if (!pads.has_value() || pads->size() != 8) {
+    return false;
+  }
+
+  if ((*pads)[0] != 0 || (*pads)[1] != 0 || (*pads)[4] != 0 || (*pads)[5] != 0) {
+    return false;
+  }
+  if ((*pads)[2] < 0 || (*pads)[3] < 0 || (*pads)[6] < 0 || (*pads)[7] < 0) {
+    return false;
+  }
+
+  if (x.dims[2] >= 0 && ((*pads)[2] >= x.dims[2] || (*pads)[6] >= x.dims[2])) {
+    return false;
+  }
+  if (x.dims[3] >= 0 && ((*pads)[3] >= x.dims[3] || (*pads)[7] >= x.dims[3])) {
+    return false;
+  }
+
+  return true;
+}
+
+void CompilePadAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto pads = readPadVector(node);
+  GGONNX_ASSERT(pads.has_value() && pads->size() == 8,
+                "Pad reflect node must provide 8-element pads");
+  compiled_node->attrs = NodeDesc::PadAttrs{
+      .pad_w_left = static_cast<int>((*pads)[3]),
+      .pad_w_right = static_cast<int>((*pads)[7]),
+      .pad_h_top = static_cast<int>((*pads)[2]),
+      .pad_h_bottom = static_cast<int>((*pads)[6]),
+  };
+}
+
+EmitResult EmitPadNode(ggml_context* ctx,
+                       const NodeDesc& node,
+                       const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(!node.inputs.empty() && node.outputs.size() == 1,
+                "compiled Pad node has invalid arity");
+  const auto* attrs = std::get_if<NodeDesc::PadAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Pad node missing attributes");
+
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Pad node missing GGML input");
+
+  ggml_tensor* out = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+  if (attrs->pad_w_left != 0 || attrs->pad_w_right != 0) {
+    out = ggml_pad_reflect_1d(ctx, out, attrs->pad_w_left, attrs->pad_w_right);
+  }
+  if (attrs->pad_h_top != 0 || attrs->pad_h_bottom != 0) {
+    ggml_tensor* swapped = ggml_cont(ctx, ggml_permute(ctx, out, 1, 0, 2, 3));
+    swapped = ggml_pad_reflect_1d(ctx, swapped, attrs->pad_h_top, attrs->pad_h_bottom);
+    out = ggml_cont(ctx, ggml_permute(ctx, swapped, 1, 0, 2, 3));
+  }
+
+  return EmitOutputs{out};
+}
+
+bool IsSupportedInstanceNormalizationNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 3 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || inputs[1] == nullptr || inputs[2] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata scale = getTensorMetadata(inputs[1]);
+  const TensorMetadata bias = getTensorMetadata(inputs[2]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      scale.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      bias.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (x.dims.size() != 4 || y.dims.size() != 4 || scale.dims.size() != 1 || bias.dims.size() != 1) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y) ||
+      !rankSupportedByGGML(scale) || !rankSupportedByGGML(bias)) {
+    return false;
+  }
+  if (x.dims[1] >= 0 && scale.dims[0] >= 0 && x.dims[1] != scale.dims[0]) {
+    return false;
+  }
+  if (scale.dims[0] >= 0 && bias.dims[0] >= 0 && scale.dims[0] != bias.dims[0]) {
+    return false;
+  }
+  return true;
+}
+
+void CompileInstanceNormalizationAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  compiled_node->attrs = NodeDesc::InstanceNormAttrs{
+      .epsilon = readNodeAttribute<float>(node, "epsilon").value_or(1e-5f),
+  };
+}
+
+EmitResult EmitInstanceNormalizationNode(ggml_context* ctx,
+                                         const NodeDesc& node,
+                                         const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(node.inputs.size() == 3 && node.outputs.size() == 1,
+                "compiled InstanceNormalization node has invalid arity");
+  const auto* attrs = std::get_if<NodeDesc::InstanceNormAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled InstanceNormalization node missing attributes");
+
+  ggml_tensor* x = values[node.inputs[0]];
+  ggml_tensor* scale = values[node.inputs[1]];
+  ggml_tensor* bias = values[node.inputs[2]];
+  GGONNX_NOT_NULL(x, "compiled InstanceNormalization node missing GGML input");
+  GGONNX_NOT_NULL(scale, "compiled InstanceNormalization node missing scale input");
+  GGONNX_NOT_NULL(bias, "compiled InstanceNormalization node missing bias input");
+
+  GGONNX_ASSERT(x->ne[2] > 0, "InstanceNormalization channel dimension must be positive");
+  ggml_tensor* norm = ggml_group_norm(ctx, x, static_cast<int>(x->ne[2]), attrs->epsilon);
+  ggml_tensor* scale_4d = ggml_reshape_4d(ctx, scale, 1, 1, scale->ne[0], 1);
+  ggml_tensor* bias_4d = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
+  return EmitOutputs{ggml_add(ctx, ggml_mul(ctx, norm, scale_4d), bias_4d)};
+}
+
+bool IsSupportedUpsampleNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  const std::string op_type = node.GetOperatorType();
+  const bool is_resize = op_type == "Resize";
+  if ((!is_resize && (inputs.empty() || inputs.size() > 2)) ||
+      (is_resize && (inputs.empty() || inputs.size() > 4)) ||
+      outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (x.dims.size() != 4 || y.dims.size() != 4) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) {
+    return false;
+  }
+
+  const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("nearest");
+  if (mode != "nearest") {
+    return false;
+  }
+
+  if (is_resize) {
+    const std::string coordinate_transformation_mode =
+        readNodeAttribute<std::string>(node, "coordinate_transformation_mode").value_or("half_pixel");
+    if (coordinate_transformation_mode != "asymmetric") {
+      return false;
+    }
+    const std::string nearest_mode =
+        readNodeAttribute<std::string>(node, "nearest_mode").value_or("round_prefer_floor");
+    if (nearest_mode != "floor" && nearest_mode != "round_prefer_floor") {
+      return false;
+    }
+  }
+
+  int scale_h = 0;
+  int scale_w = 0;
+  if (!inferIntegerSpatialScale(x, y, &scale_h, &scale_w)) {
+    return false;
+  }
+  if (scale_h != scale_w) {
+    return false;
+  }
+
+  if (op_type == "Upsample" && inputs.size() == 1) {
+    const auto scales = readNodeAttribute<std::vector<float>>(node, "scales");
+    if (!scales.has_value() || scales->size() != 4) {
+      return false;
+    }
+    if ((*scales)[0] != 1.0f || (*scales)[1] != 1.0f ||
+        (*scales)[2] != static_cast<float>(scale_h) ||
+        (*scales)[3] != static_cast<float>(scale_w)) {
+      return false;
+    }
+  }
+
+  if (op_type == "Upsample" && inputs.size() == 2) {
+    const auto scales =
+        readConstantInputArray<float>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+    if (scales.has_value() &&
+        (scales->size() != 4 || (*scales)[0] != 1.0f || (*scales)[1] != 1.0f ||
+         (*scales)[2] != static_cast<float>(scale_h) || (*scales)[3] != static_cast<float>(scale_w))) {
+      return false;
+    }
+  }
+
+  if (is_resize && inputs.size() >= 3 && inputs[2] != nullptr) {
+    const auto scales =
+        readConstantInputArray<float>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+    if (scales.has_value() &&
+        (scales->size() != 4 || (*scales)[0] != 1.0f || (*scales)[1] != 1.0f ||
+         (*scales)[2] != static_cast<float>(scale_h) || (*scales)[3] != static_cast<float>(scale_w))) {
+      return false;
+    }
+  }
+
+  if (is_resize && inputs.size() >= 4 && inputs[3] != nullptr) {
+    const auto sizes =
+        readConstantInputArray<int64_t>(node, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    if (sizes.has_value() &&
+        (sizes->size() != 4 || (*sizes)[0] != y.dims[0] || (*sizes)[1] != y.dims[1] ||
+         (*sizes)[2] != y.dims[2] || (*sizes)[3] != y.dims[3])) {
+      return false;
+    }
+  }
+
+  if (!is_resize && inputs.size() == 1 && scale_h <= 0) {
+    return false;
+  }
+
+  return true;
+}
+
+void CompileUpsampleAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  GGONNX_ASSERT(!inputs.empty() && inputs[0] != nullptr && outputs.size() == 1 && outputs[0] != nullptr,
+                "Upsample/Resize must have one data input and one output");
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  int scale_h = 0;
+  int scale_w = 0;
+  GGONNX_ASSERT(inferIntegerSpatialScale(x, y, &scale_h, &scale_w),
+                "Upsample/Resize must have static integer spatial scale");
+  compiled_node->attrs = NodeDesc::UpsampleAttrs{
+      .scale_w = scale_w,
+      .scale_h = scale_h,
+  };
+}
+
+EmitResult EmitUpsampleNode(ggml_context* ctx,
+                            const NodeDesc& node,
+                            const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(!node.inputs.empty() && node.outputs.size() == 1,
+                "compiled Upsample/Resize node has invalid arity");
+  const auto* attrs = std::get_if<NodeDesc::UpsampleAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Upsample node missing attributes");
+
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Upsample node missing GGML input");
+  GGONNX_ASSERT(attrs->scale_w == attrs->scale_h,
+                "GGML nearest upsample requires equal width/height scale");
+  return EmitOutputs{ggml_upscale(ctx, x, attrs->scale_w, GGML_SCALE_MODE_NEAREST)};
+}
+
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type) {
 
   struct PairHash {
@@ -1044,6 +1425,11 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "AveragePool"},   {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
       {{"", "GlobalMaxPool"}, {IsSupportedGlobalPoolNode, CompileGlobalPoolAttributes, EmitPool2DNode}},
       {{"", "GlobalAveragePool"}, {IsSupportedGlobalPoolNode, CompileGlobalPoolAttributes, EmitPool2DNode}},
+      {{"", "Pad"}, {IsSupportedPadNode, CompilePadAttributes, EmitPadNode}},
+      {{"", "InstanceNormalization"},
+       {IsSupportedInstanceNormalizationNode, CompileInstanceNormalizationAttributes, EmitInstanceNormalizationNode}},
+      {{"", "Upsample"}, {IsSupportedUpsampleNode, CompileUpsampleAttributes, EmitUpsampleNode}},
+      {{"", "Resize"}, {IsSupportedUpsampleNode, CompileUpsampleAttributes, EmitUpsampleNode}},
   };
 
   auto it = ops_table.find({domain, op_type});

@@ -11,6 +11,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--ep-library", action="store", required=True, help="Path to the GGONNX EP shared library")
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "integration: slower end-to-end tests that may download external models",
+    )
+
+
 @pytest.fixture(scope="session")
 def ep_library(pytestconfig: pytest.Config) -> Path:
     return Path(pytestconfig.getoption("ep_library")).resolve()
