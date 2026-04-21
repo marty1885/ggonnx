@@ -6,46 +6,46 @@ import numpy as np
 import pytest
 from onnx import TensorProto, helper
 
-from test_support import cpu_session, ggml_session, save_model
+from test_support import assert_all_nodes_run_on_ggml, cpu_session, ggml_session, ensure_model
 
 
-def build_single_add_model(path: Path) -> None:
+def build_single_add_model(tmpdir: Path) -> Path:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
     z = helper.make_tensor_value_info("z", TensorProto.FLOAT, [2, 3])
     node = helper.make_node("Add", ["x", "y"], ["z"], name="add_0")
     graph = helper.make_graph([node], "single_add", [x, y], [z])
-    save_model(path, graph)
+    return ensure_model(tmpdir, graph)
 
 
-def build_dynamic_add_model(path: Path) -> None:
+def build_dynamic_add_model(tmpdir: Path) -> Path:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", "cols"])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, ["batch", "cols"])
     z = helper.make_tensor_value_info("z", TensorProto.FLOAT, ["batch", "cols"])
     node = helper.make_node("Add", ["x", "y"], ["z"], name="add_dynamic")
     graph = helper.make_graph([node], "dynamic_add", [x, y], [z])
-    save_model(path, graph)
+    return ensure_model(tmpdir, graph)
 
 
-def build_broadcast_add_model(path: Path) -> None:
+def build_broadcast_add_model(tmpdir: Path) -> Path:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", "cols"])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, ["cols"])
     z = helper.make_tensor_value_info("z", TensorProto.FLOAT, ["batch", "cols"])
     node = helper.make_node("Add", ["x", "y"], ["z"], name="add_broadcast")
     graph = helper.make_graph([node], "broadcast_add", [x, y], [z])
-    save_model(path, graph)
+    return ensure_model(tmpdir, graph)
 
 
-def build_single_binary_model(path: Path, op_type: str) -> None:
+def build_single_binary_model(tmpdir: Path, op_type: str) -> Path:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
     z = helper.make_tensor_value_info("z", TensorProto.FLOAT, [2, 3])
     node = helper.make_node(op_type, ["x", "y"], ["z"], name=f"{op_type.lower()}_0")
     graph = helper.make_graph([node], f"single_{op_type.lower()}", [x, y], [z])
-    save_model(path, graph)
+    return ensure_model(tmpdir, graph)
 
 
-def build_dynamic_mixed_binary_model(path: Path) -> None:
+def build_dynamic_mixed_binary_model(tmpdir: Path) -> Path:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", "cols"])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, ["batch", "cols"])
     a = helper.make_tensor_value_info("a", TensorProto.FLOAT, ["batch", "cols"])
@@ -59,10 +59,10 @@ def build_dynamic_mixed_binary_model(path: Path) -> None:
         helper.make_node("Div", ["s", "y"], ["z"], name="div_0"),
     ]
     graph = helper.make_graph(nodes, "dynamic_mixed_binary", [x, y], [z], value_info=[a, m, s])
-    save_model(path, graph)
+    return ensure_model(tmpdir, graph)
 
 
-def build_single_gru_model(path: Path) -> None:
+def build_single_gru_model(tmpdir: Path) -> Path:
     seq_length = 3
     batch_size = 2
     input_size = 4
@@ -83,7 +83,7 @@ def build_single_gru_model(path: Path) -> None:
         hidden_size=hidden_size,
     )
     graph = helper.make_graph([node], "single_gru", [x, w, r, b, initial_h], [y, y_h])
-    save_model(path, graph)
+    return ensure_model(tmpdir, graph)
 
 
 def standard_inputs() -> dict[str, np.ndarray]:
@@ -99,6 +99,7 @@ def assert_model_matches_cpu(model_path: Path, ep_library: Path, output_name: st
     cpu_out = cpu.run([output_name], inputs)[0]
     ggml_out = ggml.run([output_name], inputs)[0]
     np.testing.assert_allclose(ggml_out, cpu_out, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
 
 
 def gru_inputs() -> dict[str, np.ndarray]:
@@ -176,14 +177,12 @@ def gru_inputs() -> dict[str, np.ndarray]:
 
 
 def test_single_add(suite_tmpdir, ep_library: Path) -> None:
-    model_path = suite_tmpdir / "single_add.onnx"
-    build_single_add_model(model_path)
+    model_path = build_single_add_model(suite_tmpdir)
     assert_model_matches_cpu(model_path, ep_library, "z", standard_inputs())
 
 
 def test_dynamic_add_cache_reuse(suite_tmpdir, ep_library: Path, debug_api) -> None:
-    dynamic_model_path = suite_tmpdir / "dynamic_add.onnx"
-    build_dynamic_add_model(dynamic_model_path)
+    dynamic_model_path = build_dynamic_add_model(suite_tmpdir)
     cpu = cpu_session(dynamic_model_path)
     ggml = ggml_session(dynamic_model_path, ep_library)
 
@@ -211,11 +210,11 @@ def test_dynamic_add_cache_reuse(suite_tmpdir, ep_library: Path, debug_api) -> N
     ggml_out = ggml.run(["z"], second_shape_inputs)[0]
     np.testing.assert_allclose(ggml_out, cpu_out, rtol=1e-6, atol=1e-6)
     assert debug_api.graph_build_count() == 2
+    assert_all_nodes_run_on_ggml(ggml)
 
 
 def test_broadcast_add_runs_on_ggml(suite_tmpdir, ep_library: Path, debug_api) -> None:
-    model_path = suite_tmpdir / "broadcast_add.onnx"
-    build_broadcast_add_model(model_path)
+    model_path = build_broadcast_add_model(suite_tmpdir)
     cpu = cpu_session(model_path)
     ggml = ggml_session(model_path, ep_library)
 
@@ -228,18 +227,17 @@ def test_broadcast_add_runs_on_ggml(suite_tmpdir, ep_library: Path, debug_api) -
     ggml_out = ggml.run(["z"], broadcast_inputs)[0]
     np.testing.assert_allclose(ggml_out, cpu_out, rtol=1e-6, atol=1e-6)
     assert debug_api.graph_build_count() == 1
+    assert_all_nodes_run_on_ggml(ggml)
 
 
 @pytest.mark.parametrize("op_type", ["Add", "Sub", "Mul", "Div"])
 def test_single_binary_ops(suite_tmpdir, ep_library: Path, op_type: str) -> None:
-    model_path = suite_tmpdir / f"single_{op_type.lower()}.onnx"
-    build_single_binary_model(model_path, op_type)
+    model_path = build_single_binary_model(suite_tmpdir, op_type)
     assert_model_matches_cpu(model_path, ep_library, "z", standard_inputs())
 
 
 def test_dynamic_mixed_binary_cache_reuse(suite_tmpdir, ep_library: Path, debug_api) -> None:
-    model_path = suite_tmpdir / "dynamic_mixed_binary.onnx"
-    build_dynamic_mixed_binary_model(model_path)
+    model_path = build_dynamic_mixed_binary_model(suite_tmpdir)
     cpu = cpu_session(model_path)
     ggml = ggml_session(model_path, ep_library)
 
@@ -270,11 +268,11 @@ def test_dynamic_mixed_binary_cache_reuse(suite_tmpdir, ep_library: Path, debug_
     ggml_out = ggml.run(["z"], second_shape_inputs)[0]
     np.testing.assert_allclose(ggml_out, cpu_out, rtol=1e-6, atol=1e-6)
     assert debug_api.graph_build_count() == 2
+    assert_all_nodes_run_on_ggml(ggml)
 
 
 def test_single_gru_matches_cpu(suite_tmpdir, ep_library: Path) -> None:
-    model_path = suite_tmpdir / "single_gru.onnx"
-    build_single_gru_model(model_path)
+    model_path = build_single_gru_model(suite_tmpdir)
     cpu = cpu_session(model_path)
     ggml = ggml_session(model_path, ep_library)
 
@@ -283,3 +281,4 @@ def test_single_gru_matches_cpu(suite_tmpdir, ep_library: Path) -> None:
     ggml_y, ggml_y_h = ggml.run(["y", "y_h"], inputs)
     np.testing.assert_allclose(ggml_y, cpu_y, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(ggml_y_h, cpu_y_h, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)

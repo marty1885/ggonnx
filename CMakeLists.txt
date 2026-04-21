@@ -30,6 +30,7 @@ endforeach()
 add_library(ggonnx_ep SHARED
   src/inner/ort_api_helpers.cc
   src/ggml_execution_provider.cc
+  src/ops.cpp
 )
 
 target_include_directories(ggonnx_ep
