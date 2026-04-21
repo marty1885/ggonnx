@@ -271,6 +271,316 @@ def test_dynamic_mixed_binary_cache_reuse(suite_tmpdir, ep_library: Path, debug_
     assert_all_nodes_run_on_ggml(ggml)
 
 
+def build_single_unary_model(tmpdir: Path, op_type: str, shape=(2, 3), **attrs) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(shape))
+    node = helper.make_node(op_type, ["x"], ["y"], name=f"{op_type.lower()}_0", **attrs)
+    graph = helper.make_graph([node], f"single_{op_type.lower()}", [x], [y])
+    return ensure_model(tmpdir, graph)
+
+
+def build_matmul_model(tmpdir: Path, a_shape, b_shape, out_shape) -> Path:
+    a = helper.make_tensor_value_info("a", TensorProto.FLOAT, list(a_shape))
+    b = helper.make_tensor_value_info("b", TensorProto.FLOAT, list(b_shape))
+    c = helper.make_tensor_value_info("c", TensorProto.FLOAT, list(out_shape))
+    node = helper.make_node("MatMul", ["a", "b"], ["c"], name="matmul_0")
+    graph = helper.make_graph([node], "single_matmul", [a, b], [c])
+    return ensure_model(tmpdir, graph)
+
+
+_UNARY_INPUT_OVERRIDES = {
+    # Inputs suited to each op's valid domain.
+    "Sqrt": np.array([[0.25, 1.0, 4.0], [9.0, 0.5, 2.0]], dtype=np.float32),
+    "Log":  np.array([[0.5, 1.0, 2.0], [3.0, 4.0, 0.1]], dtype=np.float32),
+}
+
+
+@pytest.mark.parametrize(
+    "op_type",
+    ["Relu", "Sigmoid", "Tanh", "Neg", "Abs", "Sqrt", "Exp", "Log", "Softplus", "Elu"],
+)
+def test_single_unary_ops(suite_tmpdir, ep_library: Path, op_type: str) -> None:
+    model_path = build_single_unary_model(suite_tmpdir, op_type)
+    default_x = np.array([[1.0, -2.0, 0.5], [-0.25, 3.0, -1.5]], dtype=np.float32)
+    inputs = {"x": _UNARY_INPUT_OVERRIDES.get(op_type, default_x)}
+    assert_model_matches_cpu(model_path, ep_library, "y", inputs)
+
+
+@pytest.mark.parametrize("alpha", [0.01, 0.2])
+def test_single_leaky_relu(suite_tmpdir, ep_library: Path, alpha: float) -> None:
+    model_path = build_single_unary_model(suite_tmpdir, "LeakyRelu", alpha=alpha)
+    inputs = {"x": np.array([[1.0, -2.0, 0.5], [-0.25, 3.0, -1.5]], dtype=np.float32)}
+    assert_model_matches_cpu(model_path, ep_library, "y", inputs)
+
+
+@pytest.mark.parametrize("shape,axis", [((2, 4), -1), ((2, 4), 1), ((2, 3, 4), -1)])
+def test_single_softmax(suite_tmpdir, ep_library: Path, shape, axis: int) -> None:
+    model_path = build_single_unary_model(suite_tmpdir, "Softmax", shape=shape, axis=axis)
+    rng = np.random.default_rng(0)
+    inputs = {"x": rng.standard_normal(shape).astype(np.float32)}
+    assert_model_matches_cpu(model_path, ep_library, "y", inputs)
+
+
+@pytest.mark.parametrize(
+    "a_shape,b_shape,out_shape",
+    [
+        ((3, 4), (4, 5), (3, 5)),
+        ((2, 3, 4), (2, 4, 5), (2, 3, 5)),
+        ((2, 2, 3, 4), (2, 2, 4, 5), (2, 2, 3, 5)),
+    ],
+)
+def test_single_matmul(suite_tmpdir, ep_library: Path, a_shape, b_shape, out_shape) -> None:
+    model_path = build_matmul_model(suite_tmpdir, a_shape, b_shape, out_shape)
+    rng = np.random.default_rng(1)
+    inputs = {
+        "a": rng.standard_normal(a_shape).astype(np.float32),
+        "b": rng.standard_normal(b_shape).astype(np.float32),
+    }
+    model = cpu_session(model_path)
+    expected = model.run(["c"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["c"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_conv_model(
+    tmpdir: Path,
+    x_shape,
+    w_shape,
+    y_shape,
+    *,
+    with_bias: bool = False,
+    **attrs,
+) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    w = helper.make_tensor_value_info("w", TensorProto.FLOAT, list(w_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    graph_inputs = [x, w]
+    node_inputs = ["x", "w"]
+    if with_bias:
+        b = helper.make_tensor_value_info("b", TensorProto.FLOAT, [w_shape[0]])
+        graph_inputs.append(b)
+        node_inputs.append("b")
+    node = helper.make_node("Conv", node_inputs, ["y"], name="conv_0", **attrs)
+    graph = helper.make_graph([node], "single_conv", graph_inputs, [y])
+    return ensure_model(tmpdir, graph)
+
+
+def _conv_inputs(x_shape, w_shape, with_bias: bool):
+    rng = np.random.default_rng(2)
+    inputs = {
+        "x": rng.standard_normal(x_shape).astype(np.float32),
+        "w": rng.standard_normal(w_shape).astype(np.float32),
+    }
+    if with_bias:
+        inputs["b"] = rng.standard_normal((w_shape[0],)).astype(np.float32)
+    return inputs
+
+
+# (x_shape, w_shape, y_shape, attrs, with_bias)
+_CONV_CASES = [
+    # plain 3x3, no pad, stride 1 — [N=1, C=1, 5, 5] * [4,1,3,3] -> [1,4,3,3]
+    ((1, 1, 5, 5), (4, 1, 3, 3), (1, 4, 3, 3),
+     dict(kernel_shape=[3, 3]), False),
+    # with bias
+    ((1, 1, 5, 5), (4, 1, 3, 3), (1, 4, 3, 3),
+     dict(kernel_shape=[3, 3]), True),
+    # stride 2
+    ((1, 3, 8, 8), (6, 3, 3, 3), (1, 6, 3, 3),
+     dict(kernel_shape=[3, 3], strides=[2, 2]), True),
+    # padding 1 (preserves spatial with 3x3 s=1)
+    ((2, 3, 7, 7), (5, 3, 3, 3), (2, 5, 7, 7),
+     dict(kernel_shape=[3, 3], pads=[1, 1, 1, 1]), True),
+    # LeNet-style: 1x28x28 with 5x5 kernel, 6 out channels, no pad, s=1 -> 1x6x24x24
+    ((1, 1, 28, 28), (6, 1, 5, 5), (1, 6, 24, 24),
+     dict(kernel_shape=[5, 5]), True),
+    # LeNet conv2: 6->16, 5x5, no pad -> from 12x12 -> 8x8
+    ((1, 6, 12, 12), (16, 6, 5, 5), (1, 16, 8, 8),
+     dict(kernel_shape=[5, 5]), True),
+    # dilation 2
+    ((1, 2, 9, 9), (4, 2, 3, 3), (1, 4, 5, 5),
+     dict(kernel_shape=[3, 3], dilations=[2, 2]), False),
+    # asymmetric kernel
+    ((1, 2, 6, 8), (3, 2, 1, 3), (1, 3, 6, 6),
+     dict(kernel_shape=[1, 3]), True),
+]
+
+
+@pytest.mark.parametrize("x_shape,w_shape,y_shape,attrs,with_bias", _CONV_CASES)
+def test_single_conv(suite_tmpdir, ep_library: Path, x_shape, w_shape, y_shape, attrs, with_bias) -> None:
+    model_path = build_conv_model(
+        suite_tmpdir, x_shape, w_shape, y_shape, with_bias=with_bias, **attrs
+    )
+    inputs = _conv_inputs(x_shape, w_shape, with_bias)
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_matmul_const_b_model(tmpdir: Path, a_shape, b_shape, out_shape, b_values) -> Path:
+    a = helper.make_tensor_value_info("a", TensorProto.FLOAT, list(a_shape))
+    c = helper.make_tensor_value_info("c", TensorProto.FLOAT, list(out_shape))
+    b_init = helper.make_tensor("b", TensorProto.FLOAT, list(b_shape), b_values.flatten().tolist())
+    node = helper.make_node("MatMul", ["a", "b"], ["c"], name="matmul_const")
+    graph = helper.make_graph([node], "matmul_const_b", [a], [c], initializer=[b_init])
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "a_shape,b_shape,out_shape",
+    [
+        ((3, 4), (4, 5), (3, 5)),
+        ((2, 3, 4), (2, 4, 5), (2, 3, 5)),
+    ],
+)
+def test_matmul_constant_b(suite_tmpdir, ep_library: Path, a_shape, b_shape, out_shape) -> None:
+    rng = np.random.default_rng(7)
+    b_values = rng.standard_normal(b_shape).astype(np.float32)
+    model_path = build_matmul_const_b_model(suite_tmpdir, a_shape, b_shape, out_shape, b_values)
+    inputs = {"a": rng.standard_normal(a_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["c"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["c"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_gemm_const_b_model(
+    tmpdir: Path, a_shape, b_shape, y_shape, b_values, *, trans_b: int = 0
+) -> Path:
+    a = helper.make_tensor_value_info("a", TensorProto.FLOAT, list(a_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    b_init = helper.make_tensor("b", TensorProto.FLOAT, list(b_shape), b_values.flatten().tolist())
+    node = helper.make_node("Gemm", ["a", "b"], ["y"], name="gemm_const", transB=trans_b)
+    graph = helper.make_graph([node], "gemm_const_b", [a], [y], initializer=[b_init])
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "a_shape,b_shape,y_shape,trans_b",
+    [
+        ((4, 5), (5, 3), (4, 3), 0),
+        ((4, 5), (3, 5), (4, 3), 1),
+    ],
+)
+def test_gemm_constant_b(suite_tmpdir, ep_library: Path, a_shape, b_shape, y_shape, trans_b) -> None:
+    rng = np.random.default_rng(8)
+    b_values = rng.standard_normal(b_shape).astype(np.float32)
+    model_path = build_gemm_const_b_model(
+        suite_tmpdir, a_shape, b_shape, y_shape, b_values, trans_b=trans_b
+    )
+    inputs = {"a": rng.standard_normal(a_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_gemm_model(
+    tmpdir: Path,
+    a_shape,
+    b_shape,
+    y_shape,
+    *,
+    with_c: bool = False,
+    c_shape=None,
+    **attrs,
+) -> Path:
+    a = helper.make_tensor_value_info("a", TensorProto.FLOAT, list(a_shape))
+    b = helper.make_tensor_value_info("b", TensorProto.FLOAT, list(b_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    graph_inputs = [a, b]
+    node_inputs = ["a", "b"]
+    if with_c:
+        c = helper.make_tensor_value_info("c", TensorProto.FLOAT, list(c_shape))
+        graph_inputs.append(c)
+        node_inputs.append("c")
+    node = helper.make_node("Gemm", node_inputs, ["y"], name="gemm_0", **attrs)
+    graph = helper.make_graph([node], "single_gemm", graph_inputs, [y])
+    return ensure_model(tmpdir, graph)
+
+
+# (a_shape, b_shape, y_shape, attrs, c_shape or None)
+_GEMM_CASES = [
+    # plain: A[M,K] @ B[K,N]
+    ((4, 5), (5, 3), (4, 3), {}, None),
+    # with bias vector [N]
+    ((4, 5), (5, 3), (4, 3), {}, (3,)),
+    # with bias [M,N]
+    ((4, 5), (5, 3), (4, 3), {}, (4, 3)),
+    # transA
+    ((5, 4), (5, 3), (4, 3), dict(transA=1), (3,)),
+    # transB
+    ((4, 5), (3, 5), (4, 3), dict(transB=1), (3,)),
+    # transA + transB
+    ((5, 4), (3, 5), (4, 3), dict(transA=1, transB=1), (3,)),
+    # alpha + beta
+    ((4, 5), (5, 3), (4, 3), dict(alpha=0.5, beta=2.0), (3,)),
+]
+
+
+@pytest.mark.parametrize("a_shape,b_shape,y_shape,attrs,c_shape", _GEMM_CASES)
+def test_single_gemm(suite_tmpdir, ep_library: Path, a_shape, b_shape, y_shape, attrs, c_shape) -> None:
+    with_c = c_shape is not None
+    model_path = build_gemm_model(
+        suite_tmpdir, a_shape, b_shape, y_shape, with_c=with_c, c_shape=c_shape, **attrs
+    )
+    rng = np.random.default_rng(3)
+    inputs = {
+        "a": rng.standard_normal(a_shape).astype(np.float32),
+        "b": rng.standard_normal(b_shape).astype(np.float32),
+    }
+    if with_c:
+        inputs["c"] = rng.standard_normal(c_shape).astype(np.float32)
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_reshape_model(tmpdir: Path, in_shape, out_shape) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(in_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(out_shape))
+    shape_init = helper.make_tensor(
+        "shape", TensorProto.INT64, [len(out_shape)], list(out_shape)
+    )
+    node = helper.make_node("Reshape", ["x", "shape"], ["y"], name="reshape_0")
+    graph = helper.make_graph(
+        [node], "single_reshape", [x], [y], initializer=[shape_init]
+    )
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "in_shape,out_shape",
+    [
+        ((2, 3, 4), (6, 4)),
+        ((1, 6, 12, 12), (1, 864)),
+        ((24,), (2, 3, 4)),
+        ((2, 3, 4, 5), (2, 60)),
+    ],
+)
+def test_single_reshape(suite_tmpdir, ep_library: Path, in_shape, out_shape) -> None:
+    model_path = build_reshape_model(suite_tmpdir, in_shape, out_shape)
+    rng = np.random.default_rng(4)
+    inputs = {"x": rng.standard_normal(in_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 def test_single_gru_matches_cpu(suite_tmpdir, ep_library: Path) -> None:
     model_path = build_single_gru_model(suite_tmpdir)
     cpu = cpu_session(model_path)

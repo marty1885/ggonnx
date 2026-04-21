@@ -59,7 +59,38 @@ struct CompiledPartition {
   std::vector<ValueDesc> values;
   std::vector<size_t> graph_inputs;
   std::vector<size_t> graph_outputs;
+  // Kernel-input-index → value_id. Non-float kernel inputs (e.g. Reshape's
+  // int64 shape tensor) are represented as kOptionalValueAbsent and ignored
+  // at runtime — their semantic role was already consumed at compile time.
+  std::vector<size_t> kernel_input_to_value;
   std::vector<NodeDesc> nodes;
+  // Persistent ggml context holding pre-materialized constant initializers.
+  // Entries in `constants` are indexed by value_id; nullptr means "not a
+  // constant". Constants never appear in graph_inputs — their data is snapshotted
+  // at compile time, with per-op layout hints (e.g. MatMul B is pre-transposed).
+  ggml_context* constant_ctx{nullptr};
+  std::vector<ggml_tensor*> constants;
+
+  CompiledPartition() = default;
+  CompiledPartition(const CompiledPartition&) = delete;
+  CompiledPartition& operator=(const CompiledPartition&) = delete;
+  CompiledPartition(CompiledPartition&& other) noexcept { *this = std::move(other); }
+  CompiledPartition& operator=(CompiledPartition&& other) noexcept {
+    if (this == &other) return *this;
+    if (constant_ctx != nullptr) ggml_free(constant_ctx);
+    values = std::move(other.values);
+    graph_inputs = std::move(other.graph_inputs);
+    graph_outputs = std::move(other.graph_outputs);
+    kernel_input_to_value = std::move(other.kernel_input_to_value);
+    nodes = std::move(other.nodes);
+    constant_ctx = other.constant_ctx;
+    constants = std::move(other.constants);
+    other.constant_ctx = nullptr;
+    return *this;
+  }
+  ~CompiledPartition() {
+    if (constant_ctx != nullptr) ggml_free(constant_ctx);
+  }
 };
 
 struct ShapeKey {
@@ -85,7 +116,7 @@ struct MaterializedGraph {
 };
 
 struct GGMLComputeState {
-  CompiledPartition partition;
+  const CompiledPartition* partition{nullptr};  // owned by GGMLNodeComputeInfo
   std::unique_ptr<MaterializedGraph> active_graph;
 };
 
@@ -199,7 +230,48 @@ size_t EstimateInitialGraphDataBytes(const CompiledPartition& partition,
   // Leave plenty of headroom for intermediates and outputs. GGML will do the final
   // graph-level planning; this context size only needs to be safely sufficient.
   bytes *= std::max<size_t>(partition.nodes.size() + partition.graph_outputs.size(), 4);
-  return std::max<size_t>(bytes, 256 * 1024);
+  // Ops like Conv2D allocate substantial work buffers via ggml_new_buffer during
+  // graph_compute. Keep a generous floor so we don't segfault on small inputs.
+  return std::max<size_t>(bytes, 64 * 1024 * 1024);
+}
+
+// Byte count for a constant value given its ONNX dims (float32 only).
+size_t ConstantByteSize(const std::vector<int64_t>& dims) {
+  return elementCount(dims) * sizeof(float);
+}
+
+// Copy ONNX float data into a ggml tensor according to `layout`. For AS_IS,
+// bytes are identical to ONNX (ggml col-major reinterpretation already flips
+// the dim order). For MATMUL_WEIGHT_TRANSPOSED, we physically transpose the
+// last two ONNX dims, so the resulting ggml tensor has ne[0]=K and is ready
+// to feed as the first arg of ggml_mul_mat.
+void MaterializeConstantData(const float* src,
+                             const std::vector<int64_t>& onnx_dims,
+                             ConstantLayout layout,
+                             ggml_tensor* dst) {
+  if (layout == ConstantLayout::AS_IS) {
+    std::memcpy(dst->data, src, ConstantByteSize(onnx_dims));
+    return;
+  }
+  GGONNX_ASSERT(onnx_dims.size() >= 2,
+                "MATMUL_WEIGHT_TRANSPOSED layout requires rank >= 2");
+  // Transpose the last two ONNX dims. For ONNX shape [..., K, N], produce
+  // data in ONNX shape [..., N, K], which under ggml's reversed interpretation
+  // becomes ne=[K, N, ...] — exactly what ggml_mul_mat wants.
+  const int64_t K = onnx_dims[onnx_dims.size() - 2];
+  const int64_t N = onnx_dims[onnx_dims.size() - 1];
+  int64_t batch = 1;
+  for (size_t i = 0; i + 2 < onnx_dims.size(); ++i) batch *= onnx_dims[i];
+  float* out = static_cast<float*>(dst->data);
+  for (int64_t b = 0; b < batch; ++b) {
+    const float* src_mat = src + b * K * N;
+    float* dst_mat = out + b * K * N;
+    for (int64_t k = 0; k < K; ++k) {
+      for (int64_t n = 0; n < N; ++n) {
+        dst_mat[n * K + k] = src_mat[k * N + n];
+      }
+    }
+  }
 }
 
 CompiledPartition CompilePartition(const OrtGraph* graph) {
@@ -207,6 +279,26 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
   const Ort::ConstGraph ort_graph{graph};
   CompiledPartition partition;
   std::unordered_map<std::string, size_t> value_ids;
+  // name -> OrtValue* for constant initializers. Populated up front, consumed
+  // when we decide on per-use layouts during node walking.
+  std::unordered_map<std::string, Ort::ConstValue> constants_by_name;
+  for (Ort::ConstValueInfo init : ort_graph.GetInitializers()) {
+    if (init == nullptr) continue;
+    if (!init.IsConstantInitializer()) continue;
+    Ort::ConstValue value{nullptr};
+    Ort::ThrowOnError(init.GetInitializer(value));
+    if (value == nullptr) continue;
+    constants_by_name.emplace(init.GetName(), value);
+  }
+  // value_id -> chosen layout. Populated during node walking; first writer wins,
+  // later uses that disagree force AS_IS and the op falls back to runtime transpose.
+  std::unordered_map<size_t, ConstantLayout> constant_layout_by_id;
+  auto record_constant_use = [&](size_t value_id, ConstantLayout layout) {
+    auto [it, inserted] = constant_layout_by_id.emplace(value_id, layout);
+    if (!inserted && it->second != layout) {
+      it->second = ConstantLayout::AS_IS;
+    }
+  };
 
   auto ensure_value = [&](Ort::ConstValueInfo value_info) -> size_t {
     const std::string name = value_info.GetName();
@@ -234,9 +326,26 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
   const auto graph_inputs = ort_graph.GetInputs();
   for (Ort::ConstValueInfo input : graph_inputs) {
     GGONNX_ASSERT(input != nullptr, "graph input metadata must not be null");
+    // Non-float graph inputs (e.g. Reshape's int64 shape initializer lifted by
+    // ORT into the subgraph boundary) are consumed at compile time via
+    // attributes; they are not ggml runtime values.
+    const TensorMetadata meta = getTensorMetadata(input);
+    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      partition.kernel_input_to_value.push_back(kOptionalValueAbsent);
+      continue;
+    }
+    // Constant initializers: materialize once at compile time. ORT still passes
+    // them as kernel inputs so we reserve a kernel slot but ignore the value at
+    // runtime — the compile-time copy in partition.constants is authoritative.
+    if (constants_by_name.count(std::string(input.GetName())) > 0) {
+      ensure_value(input);  // reserve value_id so node walking can reference it
+      partition.kernel_input_to_value.push_back(kOptionalValueAbsent);
+      continue;
+    }
     const size_t id = ensure_value(input);
     partition.values[id].is_graph_input = true;
     partition.graph_inputs.push_back(id);
+    partition.kernel_input_to_value.push_back(id);
   }
 
   const auto graph_outputs = ort_graph.GetOutputs();
@@ -266,12 +375,27 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
       op->compile_attrs(node, &compiled_node);
     }
 
-    for (Ort::ConstValueInfo input : node_inputs) {
+    for (size_t input_idx = 0; input_idx < node_inputs.size(); ++input_idx) {
+      Ort::ConstValueInfo input = node_inputs[input_idx];
       if (input == nullptr) {
         compiled_node.inputs.push_back(kOptionalValueAbsent);
         continue;
       }
-      compiled_node.inputs.push_back(ensure_value(input));
+      // Non-float inputs (e.g. Reshape's int64 shape input) are consumed at
+      // compile time via attributes/output metadata and have no ggml value.
+      const TensorMetadata meta = getTensorMetadata(input);
+      if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        compiled_node.inputs.push_back(kOptionalValueAbsent);
+        continue;
+      }
+      const size_t id = ensure_value(input);
+      compiled_node.inputs.push_back(id);
+      if (constants_by_name.count(std::string(input.GetName())) > 0) {
+        const ConstantLayout layout = (op->constant_layout != nullptr)
+            ? op->constant_layout(compiled_node, input_idx)
+            : ConstantLayout::AS_IS;
+        record_constant_use(id, layout);
+      }
     }
     for (Ort::ConstValueInfo output : node_outputs) {
       if (output == nullptr) {
@@ -286,6 +410,50 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
 
   GGONNX_ASSERT(!partition.nodes.empty(), "compiled partition must contain at least one node");
   GGONNX_ASSERT(!partition.graph_outputs.empty(), "compiled partition must contain at least one graph output");
+
+  // Materialize detected constants into a persistent ggml context. Sized
+  // tightly: sum of constant data bytes + per-tensor overhead + slack.
+  if (!constant_layout_by_id.empty()) {
+    size_t constant_bytes = 0;
+    for (const auto& [id, layout] : constant_layout_by_id) {
+      constant_bytes += ConstantByteSize(partition.values[id].dims);
+    }
+    const size_t mem_size =
+        constant_bytes +
+        (constant_layout_by_id.size() + 4) * ggml_tensor_overhead() +
+        4 * 1024;
+
+    ggml_init_params p{};
+    p.mem_size = mem_size;
+    p.mem_buffer = nullptr;
+    p.no_alloc = false;
+    partition.constant_ctx = ggml_init(p);
+    GGONNX_NOT_NULL(partition.constant_ctx, "ggml_init failed for constants");
+
+    partition.constants.assign(partition.values.size(), nullptr);
+    for (const auto& [id, layout] : constant_layout_by_id) {
+      const ValueDesc& value = partition.values[id];
+      auto it = constants_by_name.find(value.name);
+      GGONNX_ASSERT(it != constants_by_name.end(), "constant tensor lost during compile");
+
+      const void* src_data = nullptr;
+      THROW_ON_ERROR(GetOrtApi().GetTensorData(it->second, &src_data));
+      GGONNX_NOT_NULL(src_data, "ORT returned null tensor data for constant");
+
+      std::vector<int64_t> tensor_dims = value.dims;
+      if (layout == ConstantLayout::MATMUL_WEIGHT_TRANSPOSED && tensor_dims.size() >= 2) {
+        std::swap(tensor_dims[tensor_dims.size() - 2], tensor_dims[tensor_dims.size() - 1]);
+      }
+      const std::array<int64_t, GGML_MAX_DIMS> ggml_dims = ToGGMLDims(tensor_dims);
+      ggml_tensor* t = ggml_new_tensor(partition.constant_ctx, GGML_TYPE_F32,
+                                       static_cast<int>(tensor_dims.size()),
+                                       ggml_dims.data());
+      GGONNX_NOT_NULL(t, "ggml_new_tensor failed for constant");
+      MaterializeConstantData(static_cast<const float*>(src_data), value.dims, layout, t);
+      partition.constants[id] = t;
+    }
+  }
+
   return partition;
 }
 
@@ -378,6 +546,16 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
     graph_state->input_tensors.resize(partition.graph_inputs.size(), nullptr);
     graph_state->output_tensors.resize(partition.graph_outputs.size(), nullptr);
 
+    // Preload compile-time constants into the value table. value_dims keeps
+    // the declared (logical) ONNX shape even if the constant was physically
+    // pre-transposed — emits that use these tensors inspect ne[] directly.
+    for (size_t id = 0; id < partition.constants.size(); ++id) {
+      ggml_tensor* c = partition.constants[id];
+      if (c == nullptr) continue;
+      graph_state->values[id] = c;
+      graph_state->value_dims[id] = partition.values[id].dims;
+    }
+
     for (size_t i = 0; i < partition.graph_inputs.size(); ++i) {
       const size_t value_id = partition.graph_inputs[i];
       const TensorMetadata& meta = input_metadata[i];
@@ -446,7 +624,8 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
 }
 
 void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_context) {
-  const CompiledPartition& partition = state.partition;
+  GGONNX_NOT_NULL(state.partition, "compute state missing compiled partition");
+  const CompiledPartition& partition = *state.partition;
   GGONNX_NOT_NULL(kernel_context, "kernel context must not be null");
   GGONNX_ASSERT(!partition.graph_inputs.empty(), "compiled partition must contain graph inputs");
   GGONNX_ASSERT(!partition.graph_outputs.empty(), "compiled partition must contain graph outputs");
@@ -455,26 +634,33 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
   size_t num_outputs = 0;
   THROW_ON_ERROR(GetOrtApi().KernelContext_GetInputCount(kernel_context, &num_inputs));
   THROW_ON_ERROR(GetOrtApi().KernelContext_GetOutputCount(kernel_context, &num_outputs));
-  if (num_inputs != partition.graph_inputs.size() || num_outputs != partition.graph_outputs.size()) {
+  if (num_inputs != partition.kernel_input_to_value.size() ||
+      num_outputs != partition.graph_outputs.size()) {
     throw std::runtime_error("kernel IO count does not match compiled partition");
   }
 
-  std::vector<const OrtValue*> input_values(num_inputs, nullptr);
+  std::vector<const OrtValue*> float_input_values;
   std::vector<TensorMetadata> input_metadata;
-  input_metadata.reserve(num_inputs);
+  float_input_values.reserve(partition.graph_inputs.size());
+  input_metadata.reserve(partition.graph_inputs.size());
   for (size_t i = 0; i < num_inputs; ++i) {
-    THROW_ON_ERROR(GetOrtApi().KernelContext_GetInput(kernel_context, i, &input_values[i]));
-    if (input_values[i] == nullptr) {
+    const OrtValue* value = nullptr;
+    THROW_ON_ERROR(GetOrtApi().KernelContext_GetInput(kernel_context, i, &value));
+    if (value == nullptr) {
       throw std::runtime_error("compiled partition received null input");
     }
 
     int is_tensor = 0;
-    THROW_ON_ERROR(GetOrtApi().IsTensor(input_values[i], &is_tensor));
+    THROW_ON_ERROR(GetOrtApi().IsTensor(value, &is_tensor));
     if (!is_tensor) {
       throw std::runtime_error("compiled partition input is not a tensor");
     }
 
-    input_metadata.push_back(getTensorMetadata(Ort::ConstValue{input_values[i]}));
+    if (partition.kernel_input_to_value[i] == kOptionalValueAbsent) {
+      continue;  // compile-time-only input, ignore at runtime
+    }
+    float_input_values.push_back(value);
+    input_metadata.push_back(getTensorMetadata(Ort::ConstValue{value}));
   }
 
   const ShapeKey shape_key = MakeShapeKey(input_metadata);
@@ -486,7 +672,7 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
   GGONNX_NOT_NULL(state.active_graph.get(), "active GGML graph must not be null");
   for (size_t i = 0; i < partition.graph_inputs.size(); ++i) {
     const size_t input_id = partition.graph_inputs[i];
-    CopyInputDataToTensor(input_values[i],
+    CopyInputDataToTensor(float_input_values[i],
                           state.active_graph->value_dims[input_id],
                           partition.values[input_id].name,
                           state.active_graph->input_tensors[i]);
@@ -532,7 +718,7 @@ OrtStatus* NodeComputeInfoCreateState(OrtNodeComputeInfo* this_ptr,
     GGONNX_NOT_NULL(compute_state, "compute_state output must not be null");
     auto* info = AsNodeComputeInfo(this_ptr);
     auto state = std::make_unique<GGMLComputeState>();
-    state->partition = info->partition;
+    state->partition = &info->partition;
     *compute_state = state.release();
   });
 }
@@ -619,18 +805,28 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
     GGONNX_NOT_NULL(graph_support_info, "graph support info must not be null");
     const Ort::ConstGraph ort_graph{graph};
 
-    std::vector<const OrtNode*> supported_nodes;
-    for (Ort::ConstNode node : ort_graph.GetNodes()) {
-      if (!isNodeSupported(node)) {
-        continue;
-      }
-      supported_nodes.push_back(node);
-    }
-
-    if (!supported_nodes.empty()) {
+    // Partition by walking nodes in topological order (how ORT yields them) and
+    // sealing the current fuse group whenever we hit an unsupported node. Any
+    // directed path between two supported nodes must pass through every node
+    // that lies strictly between them in topological order, so an unsupported
+    // node on such a path is guaranteed to split them into different groups
+    // Because ONNX wants that and will complain if not in that way
+    std::vector<const OrtNode*> current_group;
+    auto flush_group = [&] {
+      if (current_group.empty()) return;
       THROW_ON_ERROR(GetOrtEpApi().EpGraphSupportInfo_AddNodesToFuse(
-          graph_support_info, supported_nodes.data(), supported_nodes.size(), nullptr));
+          graph_support_info, current_group.data(), current_group.size(), nullptr));
+      current_group.clear();
+    };
+
+    for (Ort::ConstNode node : ort_graph.GetNodes()) {
+      if (isNodeSupported(node)) {
+        current_group.push_back(node);
+      } else {
+        flush_group();
+      }
     }
+    flush_group();
   });
 }
 

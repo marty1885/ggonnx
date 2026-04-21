@@ -80,8 +80,28 @@ struct NodeDesc {
   struct GRUAttrs {
     int64_t hidden_size{};
   };
+  struct AlphaAttrs {
+    float alpha{};
+  };
+  struct AxisAttrs {
+    int64_t axis{};
+  };
+  struct Conv2DAttrs {
+    int s0{1}, s1{1};
+    int p0{0}, p1{0};
+    int d0{1}, d1{1};
+  };
+  struct GemmAttrs {
+    float alpha{1.0f};
+    float beta{1.0f};
+    bool trans_a{false};
+    bool trans_b{false};
+  };
+  struct ReshapeAttrs {
+    std::vector<int64_t> onnx_dims;  // fully static target shape
+  };
 
-  using Attrs = std::variant<NoAttrs, GRUAttrs>;
+  using Attrs = std::variant<NoAttrs, GRUAttrs, AlphaAttrs, AxisAttrs, Conv2DAttrs, GemmAttrs, ReshapeAttrs>;
 
   std::string op_type;
   std::string domain;
@@ -98,10 +118,27 @@ using EmitNodeFn = EmitResult (*)(ggml_context* ctx,
                                   const std::vector<ggml_tensor*>& values);
 using CompileAttrsFn = void (*)(Ort::ConstNode node, NodeDesc* compiled_node);
 
+// Layout hint for constant-initializer inputs materialized at compile time.
+// AS_IS: ggml ne = reversed ONNX dims, data byte-identical.
+// MATMUL_WEIGHT_TRANSPOSED: swap the last two ONNX dims before storing. For a
+//   [K, N] ONNX weight this yields ggml ne=[K, N] with contiguous data, which
+//   is what ggml_mul_mat(weight, activation) wants — so the runtime transpose
+//   + cont vanishes. Extends naturally to batched [..., K, N].
+enum class ConstantLayout {
+  AS_IS,
+  MATMUL_WEIGHT_TRANSPOSED,
+};
+
+// Per-op hook: given a compiled node and an input index that is a constant
+// initializer, return the desired layout. Nullable on OpDefinition; nullptr
+// means "always AS_IS".
+using ConstantLayoutFn = ConstantLayout (*)(const NodeDesc& node, size_t input_idx);
+
 struct OpDefinition {
   bool (*support)(Ort::ConstNode node);
   CompileAttrsFn compile_attrs;
   EmitNodeFn emit;
+  ConstantLayoutFn constant_layout;
 };
 
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type);
