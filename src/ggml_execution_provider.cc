@@ -175,7 +175,7 @@ struct TensorMetadata {
   std::vector<int64_t> dims;
 };
 
-TensorMetadata GetTensorMetadata(Ort::ConstValueInfo value_info) {
+TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info) {
   const auto tensor_info = value_info.TypeInfo().GetTensorTypeAndShapeInfo();
 
   TensorMetadata result;
@@ -184,7 +184,7 @@ TensorMetadata GetTensorMetadata(Ort::ConstValueInfo value_info) {
   return result;
 }
 
-TensorMetadata GetTensorMetadata(Ort::ConstValue value) {
+TensorMetadata getTensorMetadata(Ort::ConstValue value) {
   const auto tensor_info = value.GetTensorTypeAndShapeInfo();
 
   TensorMetadata result;
@@ -193,30 +193,16 @@ TensorMetadata GetTensorMetadata(Ort::ConstValue value) {
   return result;
 }
 
-bool HasFullyStaticShape(const TensorMetadata& tensor) {
+bool shapeIsFullyStatic(const TensorMetadata& tensor) {
   return std::all_of(tensor.dims.begin(), tensor.dims.end(), [](int64_t dim) { return dim >= 0; });
 }
 
-inline bool HasSupportedGGMLRank(const TensorMetadata& tensor) {
+inline bool rankSupportedByGGML(const TensorMetadata& tensor) {
   return tensor.dims.size() <= GGML_MAX_DIMS;
 }
 
-bool HasFullyStaticShape(const std::vector<int64_t>& dims) {
+bool shapeIsFullyStatic(const std::vector<int64_t>& dims) {
   return std::all_of(dims.begin(), dims.end(), [](int64_t dim) { return dim >= 0; });
-}
-
-bool AreShapesCompatible(const std::vector<int64_t>& lhs, const std::vector<int64_t>& rhs) {
-  if (lhs.size() != rhs.size()) {
-    return false;
-  }
-
-  for (size_t i = 0; i < lhs.size(); ++i) {
-    if (lhs[i] >= 0 && rhs[i] >= 0 && lhs[i] != rhs[i]) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 void AssertShapeMatchesGGML(const std::vector<int64_t>& expected_onnx_dims,
@@ -231,14 +217,14 @@ void AssertShapeMatchesGGML(const std::vector<int64_t>& expected_onnx_dims,
   }
 }
 
-// IsBroadcastSupportedByGGML
+// broadcastSupportedByGGML
 // @brief Returns true the requested broadcast in ONNX format is supported by GGML's
 //   tensor broadcasting rules.
 // @param lhs_dims The dimensions of the left-hand side tensor.
 // @param rhs_dims The dimensions of the right-hand side tensor.
 // @return True if the broadcast is supported, false otherwise.
-bool IsBroadcastSupportedByGGML(const std::vector<int64_t>& lhs_dims,
-                                const std::vector<int64_t>& rhs_dims) {
+bool broadcastSupportedByGGML(const std::vector<int64_t>& lhs_dims,
+                              const std::vector<int64_t>& rhs_dims) {
   const std::array<int64_t, GGML_MAX_DIMS> lhs_ggml_dims = ToPaddedGGMLDims(lhs_dims);
   const std::array<int64_t, GGML_MAX_DIMS> rhs_ggml_dims = ToPaddedGGMLDims(rhs_dims);
 
@@ -259,7 +245,7 @@ bool IsBroadcastSupportedByGGML(const std::vector<int64_t>& lhs_dims,
   return can_repeat(lhs_ggml_dims, rhs_ggml_dims);
 }
 
-std::vector<int64_t> InferBroadcastOutputDims(const std::vector<int64_t>& lhs_dims,
+std::vector<int64_t> inferBroadcastOutputDims(const std::vector<int64_t>& lhs_dims,
                                               const std::vector<int64_t>& rhs_dims) {
   const size_t output_rank = std::max(lhs_dims.size(), rhs_dims.size());
   std::vector<int64_t> output_dims(output_rank, 1);
@@ -288,7 +274,7 @@ bool IsSupportedElementwiseBinaryOpType(std::string_view op_type) {
 }
 
 template <typename T>
-std::optional<T> ReadNodeAttribute(Ort::ConstNode node, const char* attribute_name) {
+std::optional<T> readNodeAttribute(Ort::ConstNode node, const char* attribute_name) {
   Ort::ConstOpAttr attr{nullptr};
   auto status = node.GetAttributeByName(attribute_name, attr);
   if (status.IsOK()) {
@@ -329,22 +315,22 @@ bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_t
   GGONNX_ASSERT(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
                 "ORT returned null binary op input/output metadata");
 
-  const TensorMetadata lhs = GetTensorMetadata(inputs[0]);
-  const TensorMetadata rhs = GetTensorMetadata(inputs[1]);
-  const TensorMetadata out = GetTensorMetadata(outputs[0]);
+  const TensorMetadata lhs = getTensorMetadata(inputs[0]);
+  const TensorMetadata rhs = getTensorMetadata(inputs[1]);
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
 
   if (lhs.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
       rhs.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
       out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     return false;
   }
-  if (!HasSupportedGGMLRank(lhs) || !HasSupportedGGMLRank(rhs) || !HasSupportedGGMLRank(out)) {
+  if (!rankSupportedByGGML(lhs) || !rankSupportedByGGML(rhs) || !rankSupportedByGGML(out)) {
     return false;
   }
-  if (!IsBroadcastSupportedByGGML(lhs.dims, rhs.dims)) {
+  if (!broadcastSupportedByGGML(lhs.dims, rhs.dims)) {
     return false;
   }
-  if (!AreShapesCompatible(lhs.dims, out.dims)) {
+  if (!broadcastSupportedByGGML(lhs.dims, out.dims)) {
     return false;
   }
 
@@ -366,27 +352,27 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
     return false;
   }
 
-  std::string direction = ReadNodeAttribute<std::string>(node, "direction").value_or("forward");
+  std::string direction = readNodeAttribute<std::string>(node, "direction").value_or("forward");
   if (direction != "forward") {
     return false;
   }
 
-  const int64_t layout = ReadNodeAttribute<int64_t>(node, "layout").value_or(0);
+  const int64_t layout = readNodeAttribute<int64_t>(node, "layout").value_or(0);
   if (layout != 0) {
     return false;
   }
 
   const int64_t linear_before_reset =
-      ReadNodeAttribute<int64_t>(node, "linear_before_reset").value_or(0);
+      readNodeAttribute<int64_t>(node, "linear_before_reset").value_or(0);
   if (linear_before_reset != 0) {
     return false;
   }
 
-  if (ReadNodeAttribute<float>(node, "clip").has_value()) {
+  if (readNodeAttribute<float>(node, "clip").has_value()) {
     return false;
   }
 
-  if (const auto activations = ReadNodeAttribute<std::vector<std::string>>(node, "activations")) {
+  if (const auto activations = readNodeAttribute<std::vector<std::string>>(node, "activations")) {
     if (activations->size() != 2 || (*activations)[0] != "Sigmoid" || (*activations)[1] != "Tanh") {
       return false;
     }
@@ -399,9 +385,9 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
     return false;
   }
 
-  const TensorMetadata x = GetTensorMetadata(inputs[0]);
-  const TensorMetadata w = GetTensorMetadata(inputs[1]);
-  const TensorMetadata r = GetTensorMetadata(inputs[2]);
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata w = getTensorMetadata(inputs[1]);
+  const TensorMetadata r = getTensorMetadata(inputs[2]);
   if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
       w.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
       r.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
@@ -410,11 +396,11 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
   if (x.dims.size() != 3 || w.dims.size() != 3 || r.dims.size() != 3) {
     return false;
   }
-  if (!HasSupportedGGMLRank(x) || !HasSupportedGGMLRank(w) || !HasSupportedGGMLRank(r)) {
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(w) || !rankSupportedByGGML(r)) {
     return false;
   }
 
-  const auto hidden_size = ReadNodeAttribute<int64_t>(node, "hidden_size");
+  const auto hidden_size = readNodeAttribute<int64_t>(node, "hidden_size");
   if (!hidden_size.has_value()) {
     return false;
   }
@@ -427,7 +413,7 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
   }
 
   if (inputs.size() > 3 && inputs[3] != nullptr) {
-    const TensorMetadata b = GetTensorMetadata(inputs[3]);
+    const TensorMetadata b = getTensorMetadata(inputs[3]);
     if (b.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || b.dims.size() != 2 || b.dims[0] != 1 ||
         b.dims[1] != *hidden_size * 6) {
       return false;
@@ -435,7 +421,7 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
   }
 
   if (inputs.size() > 5 && inputs[5] != nullptr) {
-    const TensorMetadata initial_h = GetTensorMetadata(inputs[5]);
+    const TensorMetadata initial_h = getTensorMetadata(inputs[5]);
     if (initial_h.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || initial_h.dims.size() != 3 ||
         initial_h.dims[0] != 1 || initial_h.dims[2] != *hidden_size) {
       return false;
@@ -449,8 +435,8 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
     if (output == nullptr) {
       continue;
     }
-    const TensorMetadata meta = GetTensorMetadata(output);
-    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || !HasSupportedGGMLRank(meta)) {
+    const TensorMetadata meta = getTensorMetadata(output);
+    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || !rankSupportedByGGML(meta)) {
       return false;
     }
   }
@@ -460,15 +446,15 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
 
 void CompileGRUAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
-  compiled_node->direction = ReadNodeAttribute<std::string>(node, "direction").value_or("forward");
+  compiled_node->direction = readNodeAttribute<std::string>(node, "direction").value_or("forward");
   GGONNX_ASSERT(compiled_node->direction == "forward", "only forward GRU direction is supported");
-  const auto hidden_size = ReadNodeAttribute<int64_t>(node, "hidden_size");
+  const auto hidden_size = readNodeAttribute<int64_t>(node, "hidden_size");
   GGONNX_ASSERT(hidden_size.has_value() && *hidden_size > 0,
                 "GRU hidden_size attribute must be present and positive");
   compiled_node->hidden_size = *hidden_size;
-  compiled_node->layout = ReadNodeAttribute<int64_t>(node, "layout").value_or(0);
+  compiled_node->layout = readNodeAttribute<int64_t>(node, "layout").value_or(0);
   compiled_node->linear_before_reset =
-      ReadNodeAttribute<int64_t>(node, "linear_before_reset").value_or(0);
+      readNodeAttribute<int64_t>(node, "linear_before_reset").value_or(0);
 }
 
 EmitResult EmitElementwiseBinaryNode(ggml_context* ctx,
@@ -685,7 +671,7 @@ size_t EstimateInitialGraphDataBytes(const CompiledPartition& partition,
   for (const TensorMetadata& meta : input_metadata) {
     GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
                   "GGONNX runtime input must be float32");
-    GGONNX_ASSERT(HasFullyStaticShape(meta.dims), "runtime input shapes must be concrete");
+    GGONNX_ASSERT(shapeIsFullyStatic(meta.dims), "runtime input shapes must be concrete");
     bytes += ElementCount(meta.dims) * sizeof(float);
   }
 
@@ -703,10 +689,10 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
 
   auto ensure_value = [&](Ort::ConstValueInfo value_info) -> size_t {
     const std::string name = value_info.GetName();
-    const TensorMetadata metadata = GetTensorMetadata(value_info);
+    const TensorMetadata metadata = getTensorMetadata(value_info);
     GGONNX_ASSERT(metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             "compiled partition currently supports only float32 tensors");
-    GGONNX_ASSERT(HasSupportedGGMLRank(metadata),
+    GGONNX_ASSERT(rankSupportedByGGML(metadata),
                   "compiled partition requires tensor rank <= " + std::to_string(GGML_MAX_DIMS) +
                       ", got " + std::to_string(metadata.dims.size()) + " for value '" + name + "'");
     const auto it = value_ids.find(name);
@@ -786,7 +772,7 @@ ShapeKey MakeShapeKey(const std::vector<TensorMetadata>& input_metadata) {
   ShapeKey key;
   key.input_dims.reserve(input_metadata.size());
   for (const TensorMetadata& meta : input_metadata) {
-    GGONNX_ASSERT(HasFullyStaticShape(meta.dims),
+    GGONNX_ASSERT(shapeIsFullyStatic(meta.dims),
                   "runtime input shapes must be concrete before GGML execution");
     key.input_dims.push_back(meta.dims);
   }
@@ -809,7 +795,7 @@ void CopyInputDataToTensor(const OrtValue* input_value,
                            ggml_tensor* tensor) {
   GGONNX_NOT_NULL(input_value, "graph input value must not be null");
   GGONNX_NOT_NULL(tensor, "cached GGML input tensor must not be null");
-  const TensorMetadata meta = GetTensorMetadata(Ort::ConstValue{input_value});
+  const TensorMetadata meta = getTensorMetadata(Ort::ConstValue{input_value});
   if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     throw std::runtime_error("GGONNX graph input must be float32");
   }
@@ -877,10 +863,10 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
       const ValueDesc& value = partition.values[value_id];
       GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
                     "GGONNX runtime input must be float32");
-      GGONNX_ASSERT(AreShapesCompatible(value.dims, meta.dims),
+      GGONNX_ASSERT(broadcastSupportedByGGML(value.dims, meta.dims),
                     "runtime input shape mismatch for tensor '" + value.name + "': declared " +
                         FormatDims(value.dims) + ", got " + FormatDims(meta.dims));
-      GGONNX_ASSERT(HasFullyStaticShape(meta.dims),
+      GGONNX_ASSERT(shapeIsFullyStatic(meta.dims),
                     "runtime input shapes must be concrete for tensor '" + value.name + "'");
 
       ggml_tensor* input_tensor = CreateTensorForOnnxShape(ctx, meta.dims);
@@ -907,7 +893,7 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
                       "compiled node output slot already populated");
         ggml_tensor* node_output = (*emitted_outputs)[emitted_index++];
         const std::vector<int64_t> output_dims = ToOnnxDims(node_output);
-        GGONNX_ASSERT(AreShapesCompatible(partition.values[output_id].dims, output_dims),
+        GGONNX_ASSERT(broadcastSupportedByGGML(partition.values[output_id].dims, output_dims),
                       "emitted output shape mismatch for tensor '" + partition.values[output_id].name +
                           "': declared " + FormatDims(partition.values[output_id].dims) + ", got " +
                           FormatDims(output_dims));
@@ -965,7 +951,7 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
       throw std::runtime_error("compiled partition input is not a tensor");
     }
 
-    input_metadata.push_back(GetTensorMetadata(Ort::ConstValue{input_values[i]}));
+    input_metadata.push_back(getTensorMetadata(Ort::ConstValue{input_values[i]}));
   }
 
   const ShapeKey shape_key = MakeShapeKey(input_metadata);
