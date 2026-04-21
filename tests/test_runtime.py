@@ -620,6 +620,134 @@ def test_single_pad_reflect(suite_tmpdir, ep_library: Path, variant, x_shape, y_
     assert_all_nodes_run_on_ggml(ggml)
 
 
+@pytest.mark.parametrize(
+    "x_shape,y_shape,pads",
+    [
+        # pure pad (waifu2x does not exercise this path, but it's the obvious case)
+        ((1, 1, 4, 5), (1, 1, 6, 7), [0, 0, 1, 1, 0, 0, 1, 1]),
+        # asymmetric pads
+        ((1, 2, 3, 3), (1, 2, 5, 6), [0, 0, 1, 2, 0, 0, 1, 1]),
+        # pure crop (waifu2x pattern: negative pads both sides)
+        ((1, 3, 16, 16), (1, 3, 8, 8), [0, 0, -4, -4, 0, 0, -4, -4]),
+        # mixed pad + crop per spatial dim
+        ((1, 2, 6, 6), (1, 2, 5, 8), [0, 0, -1, 1, 0, 0, 0, 1]),
+    ],
+)
+def test_single_pad_constant(suite_tmpdir, ep_library: Path, x_shape, y_shape, pads) -> None:
+    model_path = build_pad_model(
+        suite_tmpdir, x_shape, y_shape, pads=pads, mode="constant", variant="input_pads"
+    )
+    rng = np.random.default_rng(42)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_conv_transpose_model(
+    tmpdir: Path, x_shape, w_shape, y_shape, *, with_bias: bool = False, **attrs
+) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    w = helper.make_tensor_value_info("w", TensorProto.FLOAT, list(w_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    graph_inputs = [x, w]
+    node_inputs = ["x", "w"]
+    if with_bias:
+        b = helper.make_tensor_value_info("b", TensorProto.FLOAT, [w_shape[1]])
+        graph_inputs.append(b)
+        node_inputs.append("b")
+    node = helper.make_node(
+        "ConvTranspose", node_inputs, ["y"], name="conv_transpose_0", **attrs
+    )
+    graph = helper.make_graph([node], "single_conv_transpose", graph_inputs, [y])
+    return ensure_model(tmpdir, graph)
+
+
+# (x_shape, w_shape, y_shape, attrs, with_bias) — ONNX ConvTranspose weight
+# layout is [IC, OC, KH, KW]; output = (in-1)*stride - 2*pad + kernel.
+_CONV_TRANSPOSE_CASES = [
+    # 2x upsample with 2x2 kernel, no pad (waifu2x conv2_up/conv3_up pattern)
+    ((1, 4, 5, 5), (4, 8, 2, 2), (1, 8, 10, 10),
+     dict(kernel_shape=[2, 2], strides=[2, 2]), True),
+    # 2x upsample with 4x4 kernel, symmetric pad=3 (waifu2x conv_bottom pattern)
+    ((1, 4, 6, 6), (4, 3, 4, 4), (1, 3, 12, 12),
+     dict(kernel_shape=[4, 4], strides=[2, 2], pads=[3, 3, 3, 3]), True),
+    # stride 1, no pad, no bias
+    ((1, 2, 4, 4), (2, 3, 3, 3), (1, 3, 6, 6),
+     dict(kernel_shape=[3, 3], strides=[1, 1]), False),
+]
+
+
+@pytest.mark.parametrize(
+    "x_shape,w_shape,y_shape,attrs,with_bias", _CONV_TRANSPOSE_CASES
+)
+def test_single_conv_transpose(
+    suite_tmpdir, ep_library: Path, x_shape, w_shape, y_shape, attrs, with_bias
+) -> None:
+    model_path = build_conv_transpose_model(
+        suite_tmpdir, x_shape, w_shape, y_shape, with_bias=with_bias, **attrs
+    )
+    rng = np.random.default_rng(3)
+    inputs = {
+        "x": rng.standard_normal(x_shape).astype(np.float32),
+        "w": rng.standard_normal(w_shape).astype(np.float32),
+    }
+    if with_bias:
+        inputs["b"] = rng.standard_normal((w_shape[1],)).astype(np.float32)
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_expand_model(tmpdir: Path, x_shape, target_shape) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    # Broadcasting leading dims are allowed in ONNX Expand even when ranks differ.
+    out_rank = max(len(x_shape), len(target_shape))
+    padded_x = [1] * (out_rank - len(x_shape)) + list(x_shape)
+    padded_t = [1] * (out_rank - len(target_shape)) + list(target_shape)
+    y_shape = [max(a, b) for a, b in zip(padded_x, padded_t)]
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, y_shape)
+    shape_init = helper.make_tensor(
+        "shape", TensorProto.INT64, [len(target_shape)], list(target_shape)
+    )
+    node = helper.make_node("Expand", ["x", "shape"], ["y"], name="expand_0")
+    graph = helper.make_graph(
+        [node], "single_expand", [x], [y], initializer=[shape_init]
+    )
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "x_shape,target_shape",
+    [
+        # SE-block broadcast from [N,C,1,1] to [N,C,H,W] — the waifu2x case
+        ((1, 8, 1, 1), [1, 8, 16, 16]),
+        # scalar broadcast to 4D
+        ((1,), [2, 3, 4, 5]),
+        # partial broadcast: 2D input expanded by prepending a new leading dim
+        ((3, 1), [4, 3, 5]),
+        # identity shape (no actual broadcasting needed)
+        ((2, 3, 4, 5), [2, 3, 4, 5]),
+    ],
+)
+def test_single_expand(suite_tmpdir, ep_library: Path, x_shape, target_shape) -> None:
+    model_path = build_expand_model(suite_tmpdir, x_shape, target_shape)
+    rng = np.random.default_rng(4)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 @pytest.mark.parametrize("x_shape", [(1, 3, 8, 8), (2, 4, 5, 7)])
 def test_single_instance_normalization(suite_tmpdir, ep_library: Path, x_shape) -> None:
     model_path = build_instance_norm_model(suite_tmpdir, x_shape)

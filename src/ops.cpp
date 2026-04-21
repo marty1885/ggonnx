@@ -1252,6 +1252,181 @@ EmitResult EmitConvNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
+// ONNX ConvTranspose: 2D only, square stride, symmetric pads. Maps to
+// ggml_conv_transpose_2d_p0 (no built-in padding) followed by a center crop
+// when ONNX pads are non-zero, since output = (in-1)*s - 2p + kernel.
+bool IsSupportedConvTransposeNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
+      node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata w = getTensorMetadata(inputs[1]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      w.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (x.dims.size() != 4 || w.dims.size() != 4 || y.dims.size() != 4) return false;
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(w) || !rankSupportedByGGML(y)) return false;
+
+  if (readNodeAttribute<int64_t>(node, "group").value_or(1) != 1) return false;
+  const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
+  if (auto_pad != "NOTSET") return false;
+  if (readNodeAttribute<std::vector<int64_t>>(node, "output_padding").has_value()) {
+    const auto op = *readNodeAttribute<std::vector<int64_t>>(node, "output_padding");
+    for (int64_t v : op) if (v != 0) return false;
+  }
+  if (readNodeAttribute<std::vector<int64_t>>(node, "output_shape").has_value()) return false;
+
+  if (const auto dilations = readNodeAttribute<std::vector<int64_t>>(node, "dilations")) {
+    if (dilations->size() != 2 || (*dilations)[0] != 1 || (*dilations)[1] != 1) return false;
+  }
+
+  const auto strides = readNodeAttribute<std::vector<int64_t>>(node, "strides");
+  if (!strides || strides->size() != 2) return false;
+  if ((*strides)[0] != (*strides)[1]) return false;
+
+  if (const auto pads = readNodeAttribute<std::vector<int64_t>>(node, "pads")) {
+    if (pads->size() != 4) return false;
+    if ((*pads)[0] != (*pads)[2] || (*pads)[1] != (*pads)[3]) return false;
+    if ((*pads)[0] < 0 || (*pads)[1] < 0) return false;
+  }
+
+  if (inputs.size() == 3 && inputs[2] != nullptr) {
+    const TensorMetadata b = getTensorMetadata(inputs[2]);
+    if (b.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || b.dims.size() != 1) return false;
+  }
+  return true;
+}
+
+void CompileConvTransposeAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  NodeDesc::ConvTransposeAttrs attrs;
+  const auto strides = readNodeAttribute<std::vector<int64_t>>(node, "strides");
+  GGONNX_ASSERT(strides && strides->size() == 2, "ConvTranspose needs 2D strides");
+  attrs.stride = static_cast<int>((*strides)[0]);
+  if (const auto pads = readNodeAttribute<std::vector<int64_t>>(node, "pads")) {
+    attrs.pad_h = static_cast<int>((*pads)[0]);
+    attrs.pad_w = static_cast<int>((*pads)[1]);
+  }
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitConvTransposeNode(ggml_context* ctx,
+                                 const NodeDesc& node,
+                                 const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::ConvTransposeAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled ConvTranspose node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  ggml_tensor* w = values[node.inputs[1]];
+  GGONNX_NOT_NULL(x, "ConvTranspose missing X input");
+  GGONNX_NOT_NULL(w, "ConvTranspose missing W input");
+
+  ggml_tensor* out = ggml_conv_transpose_2d_p0(ctx, w, x, attrs->stride);
+  if (attrs->pad_w != 0 || attrs->pad_h != 0) {
+    // Emulate ONNX symmetric padding by cropping p pixels from each spatial edge.
+    const int64_t new_w = out->ne[0] - 2 * attrs->pad_w;
+    const int64_t new_h = out->ne[1] - 2 * attrs->pad_h;
+    GGONNX_ASSERT(new_w > 0 && new_h > 0, "ConvTranspose crop produced non-positive size");
+    ggml_tensor* cropped = ggml_view_4d(
+        ctx, out, new_w, new_h, out->ne[2], out->ne[3],
+        out->nb[1], out->nb[2], out->nb[3],
+        static_cast<size_t>(attrs->pad_w) * out->nb[0] +
+            static_cast<size_t>(attrs->pad_h) * out->nb[1]);
+    out = ggml_cont(ctx, cropped);
+  }
+  if (node.inputs.size() == 3 && node.inputs[2] != kOptionalValueAbsent) {
+    ggml_tensor* bias = values[node.inputs[2]];
+    GGONNX_NOT_NULL(bias, "ConvTranspose missing B input");
+    ggml_tensor* bias_4d = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
+    out = ggml_add(ctx, out, bias_4d);
+  }
+  return EmitOutputs{out};
+}
+
+// ONNX Expand: broadcast input to a given shape. We require the shape input to
+// be a compile-time constant so the target dims land in the compiled attrs —
+// ORT's shape inference typically leaves the output shape symbolic when the
+// shape tensor comes from a Where/Equal chain.
+bool IsSupportedExpandNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr) return false;
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) return false;
+  if (!shapeIsFullyStatic(x)) return false;
+
+  const auto target = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  if (!target) return false;
+  std::vector<int64_t> target_dims(target->begin(), target->end());
+  if (!rankSupportedByGGML({ONNXTensorElementDataType{}, target_dims})) return false;
+
+  // Align to the longer rank (ONNX Expand broadcasts leading dims).
+  const size_t out_rank = std::max(x.dims.size(), target_dims.size());
+  std::vector<int64_t> padded_x(out_rank, 1);
+  std::vector<int64_t> padded_t(out_rank, 1);
+  std::copy_backward(x.dims.begin(), x.dims.end(), padded_x.end());
+  std::copy_backward(target_dims.begin(), target_dims.end(), padded_t.end());
+  for (size_t i = 0; i < out_rank; ++i) {
+    if (padded_x[i] != 1 && padded_t[i] != 1 && padded_x[i] != padded_t[i]) return false;
+    if (padded_t[i] < 0) return false;
+  }
+  return true;
+}
+
+void CompileExpandAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto inputs = node.GetInputs();
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const auto target = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  GGONNX_ASSERT(target.has_value(), "Expand compile: shape must be constant");
+  std::vector<int64_t> target_dims = *target;
+  const size_t out_rank = std::max(x.dims.size(), target_dims.size());
+  std::vector<int64_t> padded_x(out_rank, 1);
+  std::vector<int64_t> padded_t(out_rank, 1);
+  std::copy_backward(x.dims.begin(), x.dims.end(), padded_x.end());
+  std::copy_backward(target_dims.begin(), target_dims.end(), padded_t.end());
+  std::vector<int64_t> out_dims(out_rank);
+  for (size_t i = 0; i < out_rank; ++i) {
+    out_dims[i] = std::max<int64_t>(padded_x[i], padded_t[i]);
+  }
+  compiled_node->attrs = NodeDesc::ExpandAttrs{.onnx_dims = std::move(out_dims)};
+}
+
+EmitResult EmitExpandNode(ggml_context* ctx,
+                          const NodeDesc& node,
+                          const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::ExpandAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Expand node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "Expand missing input");
+
+  const std::array<int64_t, GGML_MAX_DIMS> ggml_ne = ToPaddedGGMLDims(attrs->onnx_dims);
+  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+  // ggml_repeat_4d handles integer-multiple broadcasting; source dims of 1
+  // become N = target / 1 = target, which is what ONNX Expand means for those
+  // axes.
+  ggml_tensor* out = ggml_repeat_4d(ctx, src, ggml_ne[0], ggml_ne[1], ggml_ne[2], ggml_ne[3]);
+  return EmitOutputs{out};
+}
+
 // ONNX Gemm: Y = alpha * A' @ B' + beta * C, where A' = transA ? A^T : A (shape [M,K])
 // and B' = transB ? B^T : B (shape [K,N]). Maps to ggml_mul_mat after making both
 // operands have the shared K dim at ne[0].
@@ -1652,7 +1827,7 @@ bool IsSupportedPadNode(Ort::ConstNode node) {
   }
 
   const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("constant");
-  if (mode != "reflect") {
+  if (mode != "reflect" && mode != "constant") {
     return false;
   }
 
@@ -1664,15 +1839,40 @@ bool IsSupportedPadNode(Ort::ConstNode node) {
   if ((*pads)[0] != 0 || (*pads)[1] != 0 || (*pads)[4] != 0 || (*pads)[5] != 0) {
     return false;
   }
-  if ((*pads)[2] < 0 || (*pads)[3] < 0 || (*pads)[6] < 0 || (*pads)[7] < 0) {
+  if (mode == "reflect" &&
+      ((*pads)[2] < 0 || (*pads)[3] < 0 || (*pads)[6] < 0 || (*pads)[7] < 0)) {
+    return false;
+  }
+  // Negative pads (cropping) are accepted for constant mode, but only as long
+  // as they don't shrink the spatial dim below 1.
+  if (x.dims[2] >= 0 &&
+      static_cast<int64_t>((*pads)[2] + (*pads)[6]) + x.dims[2] <= 0) {
+    return false;
+  }
+  if (x.dims[3] >= 0 &&
+      static_cast<int64_t>((*pads)[3] + (*pads)[7]) + x.dims[3] <= 0) {
     return false;
   }
 
-  if (x.dims[2] >= 0 && ((*pads)[2] >= x.dims[2] || (*pads)[6] >= x.dims[2])) {
-    return false;
-  }
-  if (x.dims[3] >= 0 && ((*pads)[3] >= x.dims[3] || (*pads)[7] >= x.dims[3])) {
-    return false;
+  if (mode == "reflect") {
+    // ggml_pad_reflect_1d requires the pad amount to be strictly less than the
+    // source length — anything equal or larger would reflect past the edge.
+    if (x.dims[2] >= 0 && ((*pads)[2] >= x.dims[2] || (*pads)[6] >= x.dims[2])) {
+      return false;
+    }
+    if (x.dims[3] >= 0 && ((*pads)[3] >= x.dims[3] || (*pads)[7] >= x.dims[3])) {
+      return false;
+    }
+  } else {
+    // constant mode: only zero fill is supported. Accept an absent constant
+    // input or one that folds to a single zero float.
+    const auto node_inputs = node.GetInputs();
+    if (node_inputs.size() >= 3 && node_inputs[2] != nullptr) {
+      const auto v = readConstantInputArray<float>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+      if (!v) return false;
+      if (v->size() > 1) return false;
+      if (!v->empty() && (*v)[0] != 0.0f) return false;
+    }
   }
 
   return true;
@@ -1682,8 +1882,11 @@ void CompilePadAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto pads = readPadVector(node);
   GGONNX_ASSERT(pads.has_value() && pads->size() == 8,
-                "Pad reflect node must provide 8-element pads");
+                "Pad node must provide 8-element pads");
+  const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("constant");
   compiled_node->attrs = NodeDesc::PadAttrs{
+      .mode = mode == "reflect" ? NodeDesc::PadAttrs::Mode::Reflect
+                                : NodeDesc::PadAttrs::Mode::Constant,
       .pad_w_left = static_cast<int>((*pads)[3]),
       .pad_w_right = static_cast<int>((*pads)[7]),
       .pad_h_top = static_cast<int>((*pads)[2]),
@@ -1704,6 +1907,34 @@ EmitResult EmitPadNode(ggml_context* ctx,
   GGONNX_NOT_NULL(x, "compiled Pad node missing GGML input");
 
   ggml_tensor* out = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+  if (attrs->mode == NodeDesc::PadAttrs::Mode::Constant) {
+    const int crop_w_left = std::max(0, -attrs->pad_w_left);
+    const int crop_w_right = std::max(0, -attrs->pad_w_right);
+    const int crop_h_top = std::max(0, -attrs->pad_h_top);
+    const int crop_h_bottom = std::max(0, -attrs->pad_h_bottom);
+    if (crop_w_left || crop_w_right || crop_h_top || crop_h_bottom) {
+      const int64_t new_w = out->ne[0] - crop_w_left - crop_w_right;
+      const int64_t new_h = out->ne[1] - crop_h_top - crop_h_bottom;
+      GGONNX_ASSERT(new_w > 0 && new_h > 0, "Pad crop produced non-positive size");
+      ggml_tensor* cropped = ggml_view_4d(
+          ctx, out, new_w, new_h, out->ne[2], out->ne[3],
+          out->nb[1], out->nb[2], out->nb[3],
+          static_cast<size_t>(crop_w_left) * out->nb[0] +
+              static_cast<size_t>(crop_h_top) * out->nb[1]);
+      out = ggml_cont(ctx, cropped);
+    }
+    const int pad_w_left = std::max(0, attrs->pad_w_left);
+    const int pad_w_right = std::max(0, attrs->pad_w_right);
+    const int pad_h_top = std::max(0, attrs->pad_h_top);
+    const int pad_h_bottom = std::max(0, attrs->pad_h_bottom);
+    if (pad_w_left || pad_w_right || pad_h_top || pad_h_bottom) {
+      out = ggml_pad_ext(ctx, out,
+                         pad_w_left, pad_w_right,
+                         pad_h_top, pad_h_bottom,
+                         0, 0, 0, 0);
+    }
+    return EmitOutputs{out};
+  }
   if (attrs->pad_w_left != 0 || attrs->pad_w_right != 0) {
     out = ggml_pad_reflect_1d(ctx, out, attrs->pad_w_left, attrs->pad_w_right);
   }
@@ -2596,6 +2827,8 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Softmax"},  {IsSupportedSoftmaxNode, CompileSoftmaxAttributes, EmitSoftmaxNode}},
       {{"", "MatMul"},   {IsSupportedMatMulNode, nullptr, EmitMatMulNode, MatMulConstantLayout}},
       {{"", "Conv"},     {IsSupportedConvNode, CompileConvAttributes, EmitConvNode, nullptr}},
+      {{"", "ConvTranspose"}, {IsSupportedConvTransposeNode, CompileConvTransposeAttributes, EmitConvTransposeNode}},
+      {{"", "Expand"},   {IsSupportedExpandNode, CompileExpandAttributes, EmitExpandNode}},
       {{"", "Gemm"},     {IsSupportedGemmNode, CompileGemmAttributes, EmitGemmNode, GemmConstantLayout}},
       {{"", "Reshape"},  {IsSupportedReshapeNode, CompileReshapeAttributes, EmitReshapeNode}},
       {{"", "Flatten"},  {IsSupportedFlattenNode, CompileFlattenAttributes, EmitReshapeNode}},

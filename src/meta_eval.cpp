@@ -22,6 +22,7 @@ size_t ByteWidth(ONNXTensorElementDataType element_type) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return sizeof(float);
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return sizeof(int32_t);
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return sizeof(int64_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: return sizeof(uint8_t);
     default:
       throw std::runtime_error("unsupported compile-time constant dtype");
   }
@@ -39,7 +40,8 @@ size_t ElementCount(const std::vector<int64_t>& dims) {
 bool IsFoldableDType(ONNXTensorElementDataType element_type) {
   return element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
          element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 ||
-         element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+         element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 ||
+         element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;
 }
 
 bool FitsFoldLimit(const std::vector<int64_t>& dims) {
@@ -685,8 +687,286 @@ std::optional<std::vector<ConstantTensor>> EvalArangeLoop(const ConstantValueMap
   return std::nullopt;
 }
 
+std::optional<ConstantTensor> EvalConstant(const ConstantValueMap& /*constants*/,
+                                            Ort::ConstNode node) {
+  // Constant ops usually carry a `value` tensor attribute; other attr forms
+  // (value_float, value_int, value_ints, ...) are rare in practice, so we only
+  // handle the tensor form here.
+  Ort::ConstOpAttr attr{nullptr};
+  const Ort::Status status = node.GetAttributeByName("value", attr);
+  if (!status.IsOK() || attr == nullptr) return std::nullopt;
+  Ort::Value value{nullptr};
+  const Ort::Status vstatus = attr.GetTensorAttributeAsOrtValue(value);
+  if (!vstatus.IsOK() || !value) return std::nullopt;
+  const auto tshape = value.GetTensorTypeAndShapeInfo();
+  const ONNXTensorElementDataType et = tshape.GetElementType();
+  if (!IsFoldableDType(et)) return std::nullopt;
+  const std::vector<int64_t> dims = tshape.GetShape();
+  if (!FitsFoldLimit(dims)) return std::nullopt;
+  const size_t count = ElementCount(dims);
+  const size_t elem = ByteWidth(et);
+  const void* src = nullptr;
+  THROW_ON_ERROR(GetOrtApi().GetTensorData(value, &src));
+  GGONNX_NOT_NULL(src, "ORT returned null Constant tensor data");
+  ConstantTensor out;
+  out.element_type = et;
+  out.dims = dims;
+  out.data.resize(count * elem);
+  if (count > 0) std::memcpy(out.data.data(), src, count * elem);
+  return out;
+}
+
+std::optional<ConstantTensor> EvalTranspose(const ConstantValueMap& constants, Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 1 || inputs[0] == nullptr) return std::nullopt;
+  const auto data = LookupConstant(constants, inputs[0]);
+  if (!data) return std::nullopt;
+  const int64_t rank = static_cast<int64_t>(data->dims.size());
+  std::vector<int64_t> perm(rank);
+  Ort::ConstOpAttr attr{nullptr};
+  const Ort::Status status = node.GetAttributeByName("perm", attr);
+  if (status.IsOK() && attr != nullptr) {
+    Ort::ThrowOnError(attr.GetValueArray(perm));
+    if (static_cast<int64_t>(perm.size()) != rank) return std::nullopt;
+  } else {
+    for (int64_t i = 0; i < rank; ++i) perm[static_cast<size_t>(i)] = rank - 1 - i;
+  }
+  std::vector<int64_t> out_dims(rank);
+  for (int64_t i = 0; i < rank; ++i) {
+    const int64_t p = perm[static_cast<size_t>(i)];
+    if (p < 0 || p >= rank) return std::nullopt;
+    out_dims[static_cast<size_t>(i)] = data->dims[static_cast<size_t>(p)];
+  }
+  if (!FitsFoldLimit(out_dims)) return std::nullopt;
+
+  const size_t elem = ByteWidth(data->element_type);
+  const size_t count = ElementCount(out_dims);
+  const auto in_strides = MakeStrides(data->dims);
+  const auto out_strides = MakeStrides(out_dims);
+
+  ConstantTensor out;
+  out.element_type = data->element_type;
+  out.dims = out_dims;
+  out.data.resize(count * elem);
+  std::vector<int64_t> coord(rank, 0);
+  for (size_t linear = 0; linear < count; ++linear) {
+    int64_t src_linear = 0;
+    for (int64_t i = 0; i < rank; ++i) {
+      src_linear += coord[static_cast<size_t>(i)] * in_strides[static_cast<size_t>(perm[static_cast<size_t>(i)])];
+    }
+    std::memcpy(out.data.data() + linear * elem,
+                data->data.data() + static_cast<size_t>(src_linear) * elem, elem);
+    for (int64_t axis = rank - 1; axis >= 0; --axis) {
+      coord[static_cast<size_t>(axis)]++;
+      if (coord[static_cast<size_t>(axis)] < out_dims[static_cast<size_t>(axis)]) break;
+      coord[static_cast<size_t>(axis)] = 0;
+    }
+  }
+  return out;
+}
+
+std::optional<ConstantTensor> EvalGather(const ConstantValueMap& constants, Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 2 || inputs[0] == nullptr || inputs[1] == nullptr) return std::nullopt;
+  const auto data = LookupConstant(constants, inputs[0]);
+  const auto indices = LookupConstant(constants, inputs[1]);
+  if (!data || !indices) return std::nullopt;
+  if (indices->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 &&
+      indices->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+    return std::nullopt;
+  }
+  const int64_t data_rank = static_cast<int64_t>(data->dims.size());
+  if (data_rank == 0) return std::nullopt;
+
+  int64_t axis = 0;
+  if (auto attr = [&]() -> std::optional<int64_t> {
+        Ort::ConstOpAttr a{nullptr};
+        const Ort::Status s = node.GetAttributeByName("axis", a);
+        if (!s.IsOK() || a == nullptr) return std::nullopt;
+        int64_t v = 0;
+        Ort::ThrowOnError(a.GetValue(v));
+        return v;
+      }()) {
+    axis = *attr;
+  }
+  if (axis < 0) axis += data_rank;
+  if (axis < 0 || axis >= data_rank) return std::nullopt;
+
+  std::vector<int64_t> idx_values;
+  if (indices->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+    idx_values = ReadTypedData<int64_t>(*indices);
+  } else {
+    const auto v32 = ReadTypedData<int32_t>(*indices);
+    idx_values.assign(v32.begin(), v32.end());
+  }
+  const int64_t axis_len = data->dims[static_cast<size_t>(axis)];
+  for (int64_t& idx : idx_values) {
+    if (idx < 0) idx += axis_len;
+    if (idx < 0 || idx >= axis_len) return std::nullopt;
+  }
+
+  std::vector<int64_t> out_dims;
+  out_dims.reserve(data->dims.size() + indices->dims.size() - 1);
+  for (int64_t i = 0; i < axis; ++i) out_dims.push_back(data->dims[static_cast<size_t>(i)]);
+  for (int64_t d : indices->dims) out_dims.push_back(d);
+  for (int64_t i = axis + 1; i < data_rank; ++i) out_dims.push_back(data->dims[static_cast<size_t>(i)]);
+  if (!FitsFoldLimit(out_dims)) return std::nullopt;
+
+  // Element stride along the gather axis.
+  int64_t inner = 1;
+  for (int64_t i = axis + 1; i < data_rank; ++i) inner *= data->dims[static_cast<size_t>(i)];
+  int64_t outer = 1;
+  for (int64_t i = 0; i < axis; ++i) outer *= data->dims[static_cast<size_t>(i)];
+  const size_t elem_size = ByteWidth(data->element_type);
+  const size_t inner_bytes = static_cast<size_t>(inner) * elem_size;
+
+  ConstantTensor out;
+  out.element_type = data->element_type;
+  out.dims = std::move(out_dims);
+  out.data.resize(ElementCount(out.dims) * elem_size);
+  uint8_t* dst = out.data.data();
+  for (int64_t o = 0; o < outer; ++o) {
+    for (int64_t k : idx_values) {
+      const size_t src_offset =
+          (static_cast<size_t>(o) * static_cast<size_t>(axis_len) + static_cast<size_t>(k)) *
+          inner_bytes;
+      std::memcpy(dst, data->data.data() + src_offset, inner_bytes);
+      dst += inner_bytes;
+    }
+  }
+  return out;
+}
+
+std::optional<ConstantTensor> EvalConstantOfShape(const ConstantValueMap& constants,
+                                                  Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 1 || inputs[0] == nullptr) return std::nullopt;
+  const auto shape_tensor = LookupConstant(constants, inputs[0]);
+  if (!shape_tensor || shape_tensor->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+    return std::nullopt;
+  }
+  const auto shape_values = ReadTypedData<int64_t>(*shape_tensor);
+  for (int64_t d : shape_values) {
+    if (d < 0) return std::nullopt;
+  }
+  if (!FitsFoldLimit(shape_values)) return std::nullopt;
+
+  // Default value is float 0. An optional "value" attribute supplies a single-
+  // element tensor whose dtype determines the output dtype.
+  ONNXTensorElementDataType element_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+  std::vector<uint8_t> scalar_bytes(sizeof(float), 0);
+
+  Ort::ConstOpAttr attr{nullptr};
+  const Ort::Status status = node.GetAttributeByName("value", attr);
+  if (status.IsOK() && attr != nullptr) {
+    Ort::Value value{nullptr};
+    const Ort::Status v_status = attr.GetTensorAttributeAsOrtValue(value);
+    if (v_status.IsOK() && value) {
+      const auto tshape = value.GetTensorTypeAndShapeInfo();
+      const ONNXTensorElementDataType et = tshape.GetElementType();
+      if (!IsFoldableDType(et)) return std::nullopt;
+      element_type = et;
+      const void* src = nullptr;
+      THROW_ON_ERROR(GetOrtApi().GetTensorData(value, &src));
+      GGONNX_NOT_NULL(src, "ORT returned null ConstantOfShape value data");
+      const size_t elem = ByteWidth(element_type);
+      scalar_bytes.assign(static_cast<const uint8_t*>(src),
+                          static_cast<const uint8_t*>(src) + elem);
+    }
+  }
+
+  const size_t elem_size = ByteWidth(element_type);
+  const size_t count = ElementCount(shape_values);
+  ConstantTensor out;
+  out.element_type = element_type;
+  out.dims = shape_values;
+  out.data.resize(count * elem_size);
+  for (size_t i = 0; i < count; ++i) {
+    std::memcpy(out.data.data() + i * elem_size, scalar_bytes.data(), elem_size);
+  }
+  return out;
+}
+
+template <typename T>
+std::optional<ConstantTensor> EvalEqualTyped(const ConstantTensor& lhs, const ConstantTensor& rhs) {
+  const size_t lhs_count = ElementCount(lhs.dims);
+  const size_t rhs_count = ElementCount(rhs.dims);
+  const bool lhs_scalar = lhs_count == 1;
+  const bool rhs_scalar = rhs_count == 1;
+  if (!lhs_scalar && !rhs_scalar && lhs.dims != rhs.dims) return std::nullopt;
+  const std::vector<int64_t> out_dims = lhs_scalar ? rhs.dims : lhs.dims;
+  const size_t out_count = std::max(lhs_count, rhs_count);
+  if (!FitsFoldLimit(out_dims)) return std::nullopt;
+  const auto a = ReadTypedData<T>(lhs);
+  const auto b = ReadTypedData<T>(rhs);
+  std::vector<uint8_t> out(out_count);
+  for (size_t i = 0; i < out_count; ++i) {
+    out[i] = a[lhs_scalar ? 0 : i] == b[rhs_scalar ? 0 : i] ? 1u : 0u;
+  }
+  ConstantTensor tensor;
+  tensor.element_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;
+  tensor.dims = out_dims;
+  tensor.data.resize(out.size());
+  std::memcpy(tensor.data.data(), out.data(), out.size());
+  return tensor;
+}
+
+std::optional<ConstantTensor> EvalEqual(const ConstantValueMap& constants, Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 2 || inputs[0] == nullptr || inputs[1] == nullptr) return std::nullopt;
+  const auto lhs = LookupConstant(constants, inputs[0]);
+  const auto rhs = LookupConstant(constants, inputs[1]);
+  if (!lhs || !rhs || lhs->element_type != rhs->element_type) return std::nullopt;
+  switch (lhs->element_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return EvalEqualTyped<int32_t>(*lhs, *rhs);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return EvalEqualTyped<int64_t>(*lhs, *rhs);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return EvalEqualTyped<float>(*lhs, *rhs);
+    default: return std::nullopt;
+  }
+}
+
+std::optional<ConstantTensor> EvalWhere(const ConstantValueMap& constants, Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 3 || inputs[0] == nullptr || inputs[1] == nullptr || inputs[2] == nullptr) {
+    return std::nullopt;
+  }
+  const auto cond = LookupConstant(constants, inputs[0]);
+  const auto lhs = LookupConstant(constants, inputs[1]);
+  const auto rhs = LookupConstant(constants, inputs[2]);
+  if (!cond || !lhs || !rhs) return std::nullopt;
+  if (cond->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) return std::nullopt;
+  if (lhs->element_type != rhs->element_type) return std::nullopt;
+  // Limit broadcasting: all three equal-shape, or any scalar.
+  const size_t c = ElementCount(cond->dims);
+  const size_t l = ElementCount(lhs->dims);
+  const size_t r = ElementCount(rhs->dims);
+  const size_t out_count = std::max({c, l, r});
+  std::vector<int64_t> out_dims;
+  if (c == out_count) out_dims = cond->dims;
+  else if (l == out_count) out_dims = lhs->dims;
+  else out_dims = rhs->dims;
+  auto pick = [&](size_t i, const ConstantTensor& t, size_t n) -> size_t {
+    return n == 1 ? 0 : i;
+  };
+  if (!FitsFoldLimit(out_dims)) return std::nullopt;
+
+  const size_t elem = ByteWidth(lhs->element_type);
+  ConstantTensor out;
+  out.element_type = lhs->element_type;
+  out.dims = out_dims;
+  out.data.resize(out_count * elem);
+  for (size_t i = 0; i < out_count; ++i) {
+    const uint8_t cval = cond->data[pick(i, *cond, c)];
+    const uint8_t* src = (cval ? lhs->data.data() + pick(i, *lhs, l) * elem
+                               : rhs->data.data() + pick(i, *rhs, r) * elem);
+    std::memcpy(out.data.data() + i * elem, src, elem);
+  }
+  return out;
+}
+
 std::optional<ConstantTensor> TryFoldNode(const ConstantValueMap& constants, Ort::ConstNode node) {
   const std::string op_type = node.GetOperatorType();
+  if (op_type == "Constant") return EvalConstant(constants, node);
   if (op_type == "Shape") return EvalShape(constants, node);
   if (op_type == "Cast") return EvalCast(constants, node);
   if (op_type == "Identity") return EvalIdentity(constants, node);
@@ -699,6 +979,11 @@ std::optional<ConstantTensor> TryFoldNode(const ConstantValueMap& constants, Ort
   if (op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div") {
     return EvalBinary(constants, node);
   }
+  if (op_type == "Transpose") return EvalTranspose(constants, node);
+  if (op_type == "Gather") return EvalGather(constants, node);
+  if (op_type == "ConstantOfShape") return EvalConstantOfShape(constants, node);
+  if (op_type == "Equal") return EvalEqual(constants, node);
+  if (op_type == "Where") return EvalWhere(constants, node);
   return std::nullopt;
 }
 

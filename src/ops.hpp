@@ -128,10 +128,20 @@ struct NodeDesc {
     int p0{0}, p1{0};
   };
   struct PadAttrs {
+    enum class Mode { Reflect, Constant };
+    Mode mode{Mode::Reflect};
     int pad_w_left{0};
     int pad_w_right{0};
     int pad_h_top{0};
     int pad_h_bottom{0};
+  };
+  struct ConvTransposeAttrs {
+    int stride{1};
+    int pad_w{0};
+    int pad_h{0};
+  };
+  struct ExpandAttrs {
+    std::vector<int64_t> onnx_dims;  // fully static target shape, broadcasted
   };
   struct InstanceNormAttrs {
     float epsilon{1e-5f};
@@ -189,7 +199,9 @@ struct NodeDesc {
                              TransposeAttrs,
                              SliceAttrs,
                              SplitAttrs,
-                             ReduceAttrs>;
+                             ReduceAttrs,
+                             ConvTransposeAttrs,
+                             ExpandAttrs>;
 
   std::string op_type;
   std::string domain;

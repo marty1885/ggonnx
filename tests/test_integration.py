@@ -61,6 +61,42 @@ _TINYSTORIES_LSTM_MODEL_URL = (
 _TINYSTORIES_LSTM_VOCAB_URL = (
     "https://huggingface.co/phmd/TinyStories-LSTM-5.5M/raw/main/vocab.txt"
 )
+_WAIFU2X_CUNET_MODEL_URL = (
+    "https://huggingface.co/deepghs/waifu2x_onnx/resolve/main/"
+    "20250502/onnx_models/cunet/art/noise0_scale2x.onnx?download=true"
+)
+
+
+def _esperanto_flag(height: int, width: int) -> np.ndarray:
+    # Renders a esperanto flag for testing purposes
+    green = np.array([0.0, 154.0, 73.0], dtype=np.float32) / 255.0
+    image = np.broadcast_to(green[:, None, None], (3, height, width)).copy()
+
+    canton = min(height, width) // 2
+    image[:, :canton, :canton] = 1.0
+
+    cy = cx = canton / 2.0
+    r_outer = canton * 0.45
+    r_inner = r_outer * np.sin(np.pi / 10.0) / np.sin(7.0 * np.pi / 10.0)
+    verts = []
+    for k in range(10):
+        angle = -np.pi / 2.0 + k * np.pi / 5.0
+        r = r_outer if k % 2 == 0 else r_inner
+        verts.append((cx + r * np.cos(angle), cy + r * np.sin(angle)))
+
+    ys, xs = np.mgrid[:canton, :canton].astype(np.float32) + 0.5
+    inside = np.zeros((canton, canton), dtype=bool)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for i in range(len(verts)):
+            xi, yi = verts[i]
+            xj, yj = verts[i - 1]
+            crosses = ((yi > ys) != (yj > ys)) & (
+                xs < (xj - xi) * (ys - yi) / (yj - yi) + xi
+            )
+            inside ^= crosses
+
+    image[:, :canton, :canton][:, inside] = green[:, None]
+    return image[None, ...]
 
 
 def _concretize_input_dims(model_path: Path, overrides: dict[str, list[int]]) -> Path:
@@ -255,9 +291,7 @@ def test_shufflenetv2_matches_cpu(ep_library: Path) -> None:
 
 @pytest.mark.integration
 def test_tinystories_lstm_matches_cpu(ep_library: Path) -> None:
-    model_path = cached_model_path(
-        "tinystories_lstm.onnx", _TINYSTORIES_LSTM_MODEL_URL
-    )
+    model_path = cached_model_path("tinystories_lstm.onnx", _TINYSTORIES_LSTM_MODEL_URL)
     vocab_path = cached_model_path(
         "tinystories_lstm_vocab.txt", _TINYSTORIES_LSTM_VOCAB_URL
     )
@@ -313,6 +347,27 @@ def test_tinystories_lstm_matches_cpu(ep_library: Path) -> None:
         )
         cpu_seq.append(cpu_next)
         ggml_seq.append(ggml_next)
+
+
+@pytest.mark.integration
+def test_waifu2x_cunet_matches_cpu(ep_library: Path) -> None:
+    raw_path = cached_model_path(
+        "waifu2x_cunet_noise0_scale2x.onnx", _WAIFU2X_CUNET_MODEL_URL
+    )
+    model_path = _concretize_input_dims(raw_path, {"x": [1, 3, 128, 128]})
+
+    inputs = {"x": _esperanto_flag(128, 128)}
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    output_names = [out.name for out in cpu.get_outputs()]
+    cpu_out = cpu.run(output_names, inputs)
+    ggml_out = ggml.run(output_names, inputs)
+
+    for got, expected in zip(ggml_out, cpu_out):
+        np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
+    assert_all_nodes_run_on_ggml(ggml)
 
 
 @pytest.mark.integration
