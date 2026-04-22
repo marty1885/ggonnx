@@ -222,6 +222,16 @@ struct NodeDesc {
     // Output ONNX dims (from the trailing Reshape's output).
     std::vector<int64_t> output_onnx_dims;
   };
+  struct ChannelShuffleAttrs {
+    // Rank-5 intermediate ONNX dims [N, g, k, H, W] for a
+    // Reshape(4D->5D)->Transpose(perm=[0,2,1,3,4])->Reshape(5D->4D) triple.
+    // The transpose swaps ONNX dims 1 and 2 (group/channel axes); in ggml's
+    // reversed layout we fold spatial into one axis and permute within rank-4,
+    // avoiding the rank-5 intermediate that blocks the individual nodes.
+    std::array<int64_t, 5> onnx_rank5_dims{};
+    // Output ONNX dims (from the trailing Reshape's output).
+    std::vector<int64_t> output_onnx_dims;
+  };
   struct ReduceAttrs {
     // Reduce a contiguous suffix of the ONNX dims. Stored as the count of
     // trailing ONNX axes to reduce; emit collapses them into a single ggml
@@ -259,6 +269,7 @@ struct NodeDesc {
                              ExpandAttrs,
                              DepthToSpaceAttrs,
                              WindowShuffleAttrs,
+                             ChannelShuffleAttrs,
                              QKVSplitAttrs,
                              MatMulAttrs>;
 
@@ -306,6 +317,9 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
 struct FusionPlan {
   // Anchor node key (output-or-name of the Transpose) -> fused attrs.
   std::unordered_map<std::string, NodeDesc::WindowShuffleAttrs> window_shuffle_anchors;
+  // Anchor node key (the Transpose) -> fused attrs for ShuffleNet-style
+  // Reshape(4D->5D)->Transpose(perm=[0,2,1,3,4])->Reshape(5D->4D) triples.
+  std::unordered_map<std::string, NodeDesc::ChannelShuffleAttrs> channel_shuffle_anchors;
   // Anchor node key (the Split) -> fused QKV split attrs. Produces three
   // rank-4 outputs from one rank-3 input, bypassing the rank-5 intermediates.
   std::unordered_map<std::string, NodeDesc::QKVSplitAttrs> qkv_split_anchors;

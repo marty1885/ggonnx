@@ -1195,6 +1195,138 @@ void DetectWindowShuffleFusions(const Ort::ConstGraph& ort_graph,
   }
 }
 
+void DetectChannelShuffleFusions(const Ort::ConstGraph& ort_graph,
+                                 const ConstantValueMap& constants,
+                                 FusionPlan& plan) {
+  // Build producer map and per-value consumer counts.
+  std::unordered_map<std::string, Ort::ConstNode> producer;
+  std::unordered_map<std::string, int> consumer_count;
+  const auto nodes = ort_graph.GetNodes();
+  for (Ort::ConstNode n : nodes) {
+    for (Ort::ConstValueInfo out : n.GetOutputs()) {
+      if (out != nullptr) producer[std::string(out.GetName())] = n;
+    }
+    for (Ort::ConstValueInfo in : n.GetInputs()) {
+      if (in != nullptr) consumer_count[std::string(in.GetName())]++;
+    }
+  }
+  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
+    if (out != nullptr) consumer_count[std::string(out.GetName())]++;
+  }
+
+  std::unordered_set<std::string> claimed;
+  auto claim = [&](const std::string& key) {
+    return claimed.insert(key).second;
+  };
+
+  // Detect: Reshape(4D->5D) -> Transpose(perm=[0,2,1,3,4]) -> Reshape(5D->4D).
+  for (Ort::ConstNode trans : nodes) {
+    if (trans.GetOperatorType() != "Transpose") continue;
+    const auto perm = ReadTransposePerm(trans);
+    if (!perm || perm->size() != 5) continue;
+    const std::vector<int64_t> expected = {0, 2, 1, 3, 4};
+    if (*perm != expected) continue;
+
+    const auto trans_inputs = trans.GetInputs();
+    const auto trans_outputs = trans.GetOutputs();
+    if (trans_inputs.size() != 1 || trans_outputs.size() != 1) continue;
+    if (trans_inputs[0] == nullptr || trans_outputs[0] == nullptr) continue;
+
+    const std::string r1_out = std::string(trans_inputs[0].GetName());
+    auto prod_it = producer.find(r1_out);
+    if (prod_it == producer.end()) continue;
+    Ort::ConstNode r1 = prod_it->second;
+    if (r1.GetOperatorType() != "Reshape") continue;
+    if (consumer_count[r1_out] != 1) continue;
+
+    const std::string trans_out_name = std::string(trans_outputs[0].GetName());
+    if (consumer_count[trans_out_name] != 1) continue;
+
+    // Find the single downstream consumer — must be a Reshape.
+    Ort::ConstNode r2{nullptr};
+    for (Ort::ConstNode n : nodes) {
+      for (Ort::ConstValueInfo in : n.GetInputs()) {
+        if (in != nullptr && std::string(in.GetName()) == trans_out_name) {
+          r2 = n;
+          break;
+        }
+      }
+      if (r2 != nullptr) break;
+    }
+    if (r2 == nullptr) continue;
+    if (r2.GetOperatorType() != "Reshape") continue;
+
+    const auto r1_inputs = r1.GetInputs();
+    const auto r2_inputs = r2.GetInputs();
+    const auto r2_outputs = r2.GetOutputs();
+    if (r1_inputs.size() != 2 || r2_inputs.size() != 2 || r2_outputs.size() != 1) continue;
+    if (r1_inputs[0] == nullptr || r1_inputs[1] == nullptr ||
+        r2_inputs[0] == nullptr || r2_inputs[1] == nullptr || r2_outputs[0] == nullptr) {
+      continue;
+    }
+
+    // r1 input must be fully static rank-4.
+    const TensorMetadata r1_in_meta = getTensorMetadata(r1_inputs[0]);
+    if (!shapeIsFullyStatic(r1_in_meta) || r1_in_meta.dims.size() != 4) continue;
+
+    // r1 target must resolve to exactly rank-5.
+    auto r1_target = ReadConstantInt64Input(constants, r1, 1);
+    if (!r1_target || r1_target->size() != 5) continue;
+    auto r1_resolved = ResolveReshapeTarget(*r1_target, r1_in_meta.dims);
+    if (!r1_resolved || r1_resolved->size() != 5) continue;
+    for (int64_t d : *r1_resolved) {
+      if (d <= 0) { r1_resolved.reset(); break; }
+    }
+    if (!r1_resolved) continue;
+
+    // r2 output must resolve to rank-4.
+    std::vector<int64_t> r2_input_dims = *r1_resolved;
+    std::swap(r2_input_dims[1], r2_input_dims[2]);  // transpose swaps ONNX dims 1 and 2
+
+    auto r2_target = ReadConstantInt64Input(constants, r2, 1);
+    std::optional<std::vector<int64_t>> r2_resolved;
+    if (r2_target) {
+      r2_resolved = ResolveReshapeTarget(*r2_target, r2_input_dims);
+    } else {
+      const TensorMetadata r2_out_meta = getTensorMetadata(r2_outputs[0]);
+      if (shapeIsFullyStatic(r2_out_meta)) r2_resolved = r2_out_meta.dims;
+    }
+    if (!r2_resolved || r2_resolved->size() != 4) continue;
+    for (int64_t d : *r2_resolved) {
+      if (d <= 0) { r2_resolved.reset(); break; }
+    }
+    if (!r2_resolved) continue;
+
+    // Element count must be conserved.
+    auto prod = [](const std::vector<int64_t>& v) {
+      int64_t p = 1; for (int64_t d : v) p *= d; return p;
+    };
+    if (prod(*r1_resolved) != prod(r1_in_meta.dims) ||
+        prod(*r2_resolved) != prod(*r1_resolved)) {
+      continue;
+    }
+
+    const std::string r1_key = NodeKey(r1);
+    const std::string r2_key = NodeKey(r2);
+    const std::string anchor_key = NodeKey(trans);
+    if (!claim(r1_key) || !claim(r2_key) || !claim(anchor_key)) continue;
+
+    NodeDesc::ChannelShuffleAttrs attrs;
+    for (size_t i = 0; i < 5; ++i) attrs.onnx_rank5_dims[i] = (*r1_resolved)[i];
+    attrs.output_onnx_dims = *r2_resolved;
+
+    FusionPlan::AnchorIO io;
+    io.input_values.push_back(std::string(r1_inputs[0].GetName()));
+    io.output_values.push_back(std::string(r2_outputs[0].GetName()));
+    io.anchor_node_name = std::string(trans.GetName());
+
+    plan.channel_shuffle_anchors.emplace(anchor_key, std::move(attrs));
+    plan.anchor_io.emplace(anchor_key, std::move(io));
+    plan.consumed_nodes.insert(r1_key);
+    plan.consumed_nodes.insert(r2_key);
+  }
+}
+
 std::optional<int64_t> ReadInt64Attr(Ort::ConstNode node, const char* name) {
   Ort::ConstOpAttr attr{nullptr};
   const Ort::Status status = node.GetAttributeByName(name, attr);
@@ -1726,6 +1858,7 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
     }
   }
   DetectWindowShuffleFusions(ort_graph, analysis.constants, analysis.fusions);
+  DetectChannelShuffleFusions(ort_graph, analysis.constants, analysis.fusions);
   // WindowMaskAdd runs before QKVSplit: the mask-apply rank-5 bubble sits
   // between the QKV Gathers in topological order, so fusing it out first
   // lets QKVSplit's span check clear the (now much shorter) span.

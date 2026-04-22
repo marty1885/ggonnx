@@ -726,6 +726,25 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       partition.nodes.push_back(std::move(compiled_node));
       continue;
     }
+    if (meta_analysis.fusions.channel_shuffle_anchors.count(node_key) > 0) {
+      const auto& attrs = meta_analysis.fusions.channel_shuffle_anchors.at(node_key);
+      const auto& io = meta_analysis.fusions.anchor_io.at(node_key);
+      NodeDesc compiled_node;
+      compiled_node.op_type = "__ChannelShuffle";
+      compiled_node.domain = "";
+      compiled_node.name = io.anchor_node_name;
+      compiled_node.attrs = attrs;
+      GGONNX_ASSERT(io.input_values.size() == 1 && io.output_values.size() == 1,
+                    "channel-shuffle fusion must have one input and one output");
+      Ort::ConstValueInfo in_vi = find_value_info_for(io.input_values[0]);
+      Ort::ConstValueInfo out_vi = find_value_info_for(io.output_values[0]);
+      GGONNX_ASSERT(in_vi != nullptr && out_vi != nullptr,
+                    "channel-shuffle fusion input/output value_info not found");
+      compiled_node.inputs.push_back(ensure_value(in_vi));
+      compiled_node.outputs.push_back(ensure_value(out_vi));
+      partition.nodes.push_back(std::move(compiled_node));
+      continue;
+    }
     if (meta_analysis.fusions.window_mask_add_anchors.count(node_key) > 0) {
       const auto& io = meta_analysis.fusions.anchor_io.at(node_key);
       GGONNX_ASSERT(io.input_values.size() == 2 && io.output_values.size() == 1,
@@ -1413,6 +1432,7 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
       const std::string key = NodeKey(node);
       const bool is_fusion_anchor =
           meta_analysis.fusions.window_shuffle_anchors.count(key) > 0 ||
+          meta_analysis.fusions.channel_shuffle_anchors.count(key) > 0 ||
           meta_analysis.fusions.qkv_split_anchors.count(key) > 0 ||
           meta_analysis.fusions.window_mask_add_anchors.count(key) > 0;
       const bool is_fusion_consumed = meta_analysis.fusions.consumed_nodes.count(key) > 0;
