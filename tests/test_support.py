@@ -167,9 +167,7 @@ def assert_provider_does_not_run_ops(
     provider: str,
     op_names: set[str],
 ) -> None:
-    profile_path = Path(session.end_profiling())
-    with profile_path.open() as f:
-        profile = json.load(f)
+    profile = end_profiling_profile(session)
 
     forbidden_events = [
         event
@@ -181,3 +179,44 @@ def assert_provider_does_not_run_ops(
     assert not forbidden_events, (
         f"found forbidden {provider} node events in profile: {forbidden_events}"
     )
+
+
+def assert_provider_runs_ops(
+    session: ort.InferenceSession,
+    provider: str,
+    op_names: set[str],
+) -> None:
+    profile = end_profiling_profile(session)
+
+    matching_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == provider
+        and event.get("args", {}).get("op_name") in op_names
+    ]
+    assert matching_events, (
+        f"expected {provider} to run one of {sorted(op_names)}, "
+        f"but found none in profile"
+    )
+
+
+def assert_provider_runs_any_node(
+    session: ort.InferenceSession,
+    provider: str,
+) -> None:
+    profile = end_profiling_profile(session)
+
+    matching_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == provider
+    ]
+    assert matching_events, f"expected at least one node event on {provider}"
+
+
+def end_profiling_profile(session: ort.InferenceSession) -> list[dict]:
+    profile_path = Path(session.end_profiling())
+    with profile_path.open() as f:
+        return json.load(f)

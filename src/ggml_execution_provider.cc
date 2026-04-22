@@ -208,6 +208,17 @@ std::vector<int64_t> inferBroadcastOutputDims(const std::vector<int64_t>& lhs_di
 }
 
 bool isNodeSupported(Ort::ConstNode node) {
+  const Ort::ConstGraph graph = node.GetGraph();
+  if (graph.GetParentNode() != nullptr) {
+    for (Ort::ConstValueInfo output : node.GetOutputs()) {
+      if (output == nullptr) continue;
+      const TensorMetadata meta = getTensorMetadata(output);
+      if (meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+          meta.dims.empty()) {
+        return false;
+      }
+    }
+  }
   const std::string op_type = node.GetOperatorType();
   const std::string domain = node.GetDomain();
   const OpDefinition* op = FindOpDefinition(domain, op_type);
@@ -320,7 +331,12 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
     const auto it = value_ids.find(name);
     if (it != value_ids.end()) {
       partition.values[it->second].element_type = metadata.element_type;
-      partition.values[it->second].dims = metadata.dims;
+      // Nested If subgraphs sometimes omit output shape metadata entirely. Do
+      // not overwrite a known shape with "unknown" ([]); the materialized GGML
+      // graph will fill any still-unknown outputs from the emitted tensor.
+      if (!metadata.dims.empty() || partition.values[it->second].dims.empty()) {
+        partition.values[it->second].dims = metadata.dims;
+      }
       return it->second;
     }
 
@@ -750,7 +766,11 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
         // like (1, S, V) would otherwise collapse to (S, V) when taken straight
         // from the ggml tensor. Merge right-aligned — declared wins when
         // concrete, emitted fills in dynamic slots.
-        if (shapeIsFullyStatic(declared_dims)) {
+        if (declared_dims.empty() && !emitted_dims.empty()) {
+          // ORT may omit tensor shape metadata for nested-subgraph values even
+          // though the emitted GGML tensor has a concrete non-scalar shape.
+          graph_state->value_dims[output_id] = emitted_dims;
+        } else if (shapeIsFullyStatic(declared_dims)) {
           graph_state->value_dims[output_id] = declared_dims;
         } else {
           std::vector<int64_t> merged(declared_dims.size(), 1);

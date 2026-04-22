@@ -299,7 +299,10 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
       r.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     return false;
   }
-  if (x.dims.size() != 3 || w.dims.size() != 3 || r.dims.size() != 3) {
+  if (w.dims.size() != 3 || r.dims.size() != 3) {
+    return false;
+  }
+  if (!x.dims.empty() && x.dims.size() != 3) {
     return false;
   }
   if (!rankSupportedByGGML(x) || !rankSupportedByGGML(w) || !rankSupportedByGGML(r)) {
@@ -314,7 +317,7 @@ bool IsSupportedGRUNode(Ort::ConstNode node) {
       r.dims[1] != *hidden_size * 3 || w.dims[2] <= 0 || r.dims[2] != *hidden_size) {
     return false;
   }
-  if (x.dims[2] >= 0 && x.dims[2] != w.dims[2]) {
+  if (!x.dims.empty() && x.dims[2] >= 0 && x.dims[2] != w.dims[2]) {
     return false;
   }
 
@@ -633,11 +636,13 @@ bool IsSupportedLSTMNode(Ort::ConstNode node) {
       return true;
     }
     const TensorMetadata s = getTensorMetadata(inputs[idx]);
-    if (s.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || s.dims.size() != 3 ||
-        s.dims[0] != 1 || s.dims[2] != *hidden_size) {
+    if (s.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
       return false;
     }
-    if (x.dims[1] >= 0 && s.dims[1] >= 0 && x.dims[1] != s.dims[1]) {
+    if (!s.dims.empty() && (s.dims.size() != 3 || s.dims[0] != 1 || s.dims[2] != *hidden_size)) {
+      return false;
+    }
+    if (!x.dims.empty() && !s.dims.empty() && x.dims[1] >= 0 && s.dims[1] >= 0 && x.dims[1] != s.dims[1]) {
       return false;
     }
     return true;
@@ -1155,7 +1160,12 @@ bool IsSupportedConvNode(Ort::ConstNode node) {
       y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     return false;
   }
-  if (x.dims.size() != 4 || w.dims.size() != 4 || y.dims.size() != 4) {
+  if (w.dims.size() != 3 && w.dims.size() != 4) {
+    return false;
+  }
+  const size_t spatial_rank = w.dims.size() - 2;
+  if ((x.dims.empty() ? false : x.dims.size() != spatial_rank + 2) ||
+      (y.dims.empty() ? false : y.dims.size() != spatial_rank + 2)) {
     return false;
   }
   if (!rankSupportedByGGML(x) || !rankSupportedByGGML(w) || !rankSupportedByGGML(y)) {
@@ -1166,11 +1176,13 @@ bool IsSupportedConvNode(Ort::ConstNode node) {
   // weight shape [C, 1, kH, kW]). Depthwise maps to ggml_conv_2d_dw_direct.
   const int64_t group = readNodeAttribute<int64_t>(node, "group").value_or(1);
   if (group != 1) {
-    if (x.dims[1] < 0 || w.dims[0] < 0 || w.dims[1] < 0 || y.dims[1] < 0) return false;
-    if (group != x.dims[1]) return false;           // must equal C_in
+    if (!x.dims.empty() && x.dims[1] < 0) return false;
+    if (w.dims[0] < 0 || w.dims[1] < 0) return false;
+    if (!y.dims.empty() && y.dims[1] < 0) return false;
+    if (!x.dims.empty() && group != x.dims[1]) return false;  // must equal C_in
     if (w.dims[0] != group) return false;           // C_out == group (multiplier 1)
     if (w.dims[1] != 1) return false;               // weight IC/group == 1
-    if (y.dims[1] != group) return false;
+    if (!y.dims.empty() && y.dims[1] != group) return false;
   }
 
   const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
@@ -1179,23 +1191,33 @@ bool IsSupportedConvNode(Ort::ConstNode node) {
   }
 
   if (const auto pads = readNodeAttribute<std::vector<int64_t>>(node, "pads")) {
-    if (pads->size() != 4) return false;
-    if ((*pads)[0] != (*pads)[2] || (*pads)[1] != (*pads)[3]) return false;
-    if (auto_pad == "VALID" && ((*pads)[0] != 0 || (*pads)[1] != 0)) return false;
+    if (spatial_rank == 1) {
+      if (pads->size() != 2) return false;
+      if ((*pads)[0] != (*pads)[1]) return false;
+      if (auto_pad == "VALID" && (*pads)[0] != 0) return false;
+    } else {
+      if (pads->size() != 4) return false;
+      if ((*pads)[0] != (*pads)[2] || (*pads)[1] != (*pads)[3]) return false;
+      if (auto_pad == "VALID" && ((*pads)[0] != 0 || (*pads)[1] != 0)) return false;
+    }
   }
   if (const auto strides = readNodeAttribute<std::vector<int64_t>>(node, "strides")) {
-    if (strides->size() != 2) return false;
+    if (strides->size() != spatial_rank) return false;
   }
   if (const auto dilations = readNodeAttribute<std::vector<int64_t>>(node, "dilations")) {
-    if (dilations->size() != 2) return false;
+    if (dilations->size() != spatial_rank) return false;
   }
   if (const auto kernel_shape = readNodeAttribute<std::vector<int64_t>>(node, "kernel_shape")) {
-    if (kernel_shape->size() != 2) return false;
-    if (w.dims[2] >= 0 && (*kernel_shape)[0] != w.dims[2]) return false;
-    if (w.dims[3] >= 0 && (*kernel_shape)[1] != w.dims[3]) return false;
+    if (kernel_shape->size() != spatial_rank) return false;
+    if (spatial_rank == 1) {
+      if (w.dims[2] >= 0 && (*kernel_shape)[0] != w.dims[2]) return false;
+    } else {
+      if (w.dims[2] >= 0 && (*kernel_shape)[0] != w.dims[2]) return false;
+      if (w.dims[3] >= 0 && (*kernel_shape)[1] != w.dims[3]) return false;
+    }
   }
 
-  if (group == 1 && x.dims[1] >= 0 && w.dims[1] >= 0 && x.dims[1] != w.dims[1]) {
+  if (group == 1 && !x.dims.empty() && x.dims[1] >= 0 && w.dims[1] >= 0 && x.dims[1] != w.dims[1]) {
     return false;  // IC mismatch (group=1 path).
   }
 
@@ -1211,23 +1233,42 @@ bool IsSupportedConvNode(Ort::ConstNode node) {
 void CompileConvAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   NodeDesc::Conv2DAttrs attrs;
+  const auto inputs = node.GetInputs();
+  GGONNX_ASSERT(inputs.size() >= 2 && inputs[1] != nullptr,
+                "Conv must have a weight input");
+  const TensorMetadata w = getTensorMetadata(inputs[1]);
+  GGONNX_ASSERT(w.dims.size() == 3 || w.dims.size() == 4,
+                "Conv compile requires 1D or 2D weight rank");
+  attrs.spatial_rank = static_cast<int>(w.dims.size() - 2);
 
   if (const auto strides = readNodeAttribute<std::vector<int64_t>>(node, "strides")) {
-    // ONNX [stride_h, stride_w] -> ggml (s0=width, s1=height).
-    attrs.s0 = static_cast<int>((*strides)[1]);
-    attrs.s1 = static_cast<int>((*strides)[0]);
+    if (attrs.spatial_rank == 1) {
+      attrs.s0 = static_cast<int>((*strides)[0]);
+    } else {
+      // ONNX [stride_h, stride_w] -> ggml (s0=width, s1=height).
+      attrs.s0 = static_cast<int>((*strides)[1]);
+      attrs.s1 = static_cast<int>((*strides)[0]);
+    }
   }
   if (const auto dilations = readNodeAttribute<std::vector<int64_t>>(node, "dilations")) {
-    attrs.d0 = static_cast<int>((*dilations)[1]);
-    attrs.d1 = static_cast<int>((*dilations)[0]);
+    if (attrs.spatial_rank == 1) {
+      attrs.d0 = static_cast<int>((*dilations)[0]);
+    } else {
+      attrs.d0 = static_cast<int>((*dilations)[1]);
+      attrs.d1 = static_cast<int>((*dilations)[0]);
+    }
   }
 
   const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
   if (auto_pad == "NOTSET") {
     if (const auto pads = readNodeAttribute<std::vector<int64_t>>(node, "pads")) {
-      // pads=[h_begin, w_begin, h_end, w_end], already validated symmetric.
-      attrs.p0 = static_cast<int>((*pads)[1]);
-      attrs.p1 = static_cast<int>((*pads)[0]);
+      if (attrs.spatial_rank == 1) {
+        attrs.p0 = static_cast<int>((*pads)[0]);
+      } else {
+        // pads=[h_begin, w_begin, h_end, w_end], already validated symmetric.
+        attrs.p0 = static_cast<int>((*pads)[1]);
+        attrs.p1 = static_cast<int>((*pads)[0]);
+      }
     }
   }
   // VALID => pads remain 0.
@@ -1250,22 +1291,49 @@ EmitResult EmitConvNode(ggml_context* ctx,
   GGONNX_NOT_NULL(x, "compiled Conv node missing GGML X input");
   GGONNX_NOT_NULL(w, "compiled Conv node missing GGML W input");
 
-  ggml_tensor* out = attrs->is_depthwise
-      ? ggml_conv_2d_dw_direct(ctx, w, x,
-                               attrs->s0, attrs->s1,
-                               attrs->p0, attrs->p1,
-                               attrs->d0, attrs->d1)
-      : ggml_conv_2d_direct(ctx, w, x,
-                            attrs->s0, attrs->s1,
-                            attrs->p0, attrs->p1,
-                            attrs->d0, attrs->d1);
+  ggml_tensor* out = nullptr;
+  if (attrs->spatial_rank == 1) {
+    // Lower ONNX Conv1D as a degenerate Conv2D so we stay on the same direct
+    // kernel family as Conv2D. Layout:
+    //   X [N,C,W]      -> [N,C,1,W]
+    //   W [OC,IC,K]    -> [OC,IC,1,K]
+    //   Y [N,OC,OW]    -> [N,OC,1,OW] -> squeeze H
+    ggml_tensor* x_4d = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], x->ne[2]);
+    ggml_tensor* w_4d = ggml_reshape_4d(ctx, w, w->ne[0], 1, w->ne[1], w->ne[2]);
+    ggml_tensor* out_4d = attrs->is_depthwise
+        ? ggml_conv_2d_dw_direct(ctx, w_4d, x_4d,
+                                 attrs->s0, 1,
+                                 attrs->p0, 0,
+                                 attrs->d0, 1)
+        : ggml_conv_2d_direct(ctx, w_4d, x_4d,
+                              attrs->s0, 1,
+                              attrs->p0, 0,
+                              attrs->d0, 1);
+    out = ggml_reshape_3d(ctx, out_4d, out_4d->ne[0], out_4d->ne[2], out_4d->ne[3]);
+  } else {
+    out = attrs->is_depthwise
+        ? ggml_conv_2d_dw_direct(ctx, w, x,
+                                 attrs->s0, attrs->s1,
+                                 attrs->p0, attrs->p1,
+                                 attrs->d0, attrs->d1)
+        : ggml_conv_2d_direct(ctx, w, x,
+                              attrs->s0, attrs->s1,
+                              attrs->p0, attrs->p1,
+                              attrs->d0, attrs->d1);
+  }
 
   if (node.inputs.size() == 3 && node.inputs[2] != kOptionalValueAbsent) {
     ggml_tensor* bias = values[node.inputs[2]];
     GGONNX_NOT_NULL(bias, "compiled Conv node missing GGML B input");
-    // bias ne=[OC] -> [1,1,OC,1] to broadcast across W,H,N of conv output ne=[OW,OH,OC,N].
-    ggml_tensor* bias_4d = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
-    out = ggml_add(ctx, out, bias_4d);
+    if (attrs->spatial_rank == 1) {
+      // bias ne=[OC] -> [1,OC,1] to broadcast across W,N of conv output ne=[OW,OC,N].
+      ggml_tensor* bias_3d = ggml_reshape_3d(ctx, bias, 1, bias->ne[0], 1);
+      out = ggml_add(ctx, out, bias_3d);
+    } else {
+      // bias ne=[OC] -> [1,1,OC,1] to broadcast across W,H,N of conv output ne=[OW,OH,OC,N].
+      ggml_tensor* bias_4d = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
+      out = ggml_add(ctx, out, bias_4d);
+    }
   }
 
   return EmitOutputs{out};

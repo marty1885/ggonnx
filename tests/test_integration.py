@@ -10,6 +10,7 @@ from test_support import (
     assert_all_nodes_run_on_ggml,
     cached_model_path,
     cpu_session,
+    end_profiling_profile,
     ggml_session,
 )
 
@@ -68,6 +69,10 @@ _WAIFU2X_CUNET_MODEL_URL = (
 _WAIFU2X_SWIN_UNET_MODEL_URL = (
     "https://huggingface.co/deepghs/waifu2x_onnx/resolve/main/"
     "20250502/onnx_models/swin_unet/art/noise0_scale2x.onnx?download=true"
+)
+_SILERO_VAD_MODEL_URL = (
+    "https://huggingface.co/onnx-community/silero-vad/resolve/main/onnx/"
+    "model.onnx?download=true"
 )
 
 
@@ -131,6 +136,18 @@ def _mnist_one_input() -> np.ndarray:
     image = np.zeros((1, 1, 28, 28), dtype=np.float32)
     image[0, 0, 4:24, 14:16] = 1.0
     return image
+
+
+def _silero_vad_chunks() -> list[np.ndarray]:
+    t = np.arange(512, dtype=np.float32) / 16000.0
+    rng = np.random.default_rng(7)
+    return [
+        np.zeros((1, 512), dtype=np.float32),
+        (0.20 * np.sin(2.0 * np.pi * 440.0 * t)).astype(np.float32)[None, :],
+        (0.10 * np.sin(2.0 * np.pi * 220.0 * t)).astype(np.float32)[None, :],
+        (0.02 * rng.standard_normal((1, 512))).astype(np.float32),
+        np.linspace(-0.25, 0.25, 512, dtype=np.float32)[None, :],
+    ]
 
 
 @pytest.mark.integration
@@ -413,3 +430,59 @@ def test_openwakeword_embedding_matches_cpu(ep_library: Path) -> None:
     for got, expected in zip(ggml_out, cpu_out):
         np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
     assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.integration
+def test_silero_vad_streaming_matches_cpu(ep_library: Path) -> None:
+    model_path = cached_model_path("silero-vad.onnx", _SILERO_VAD_MODEL_URL)
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    cpu_state = np.zeros((2, 1, 128), dtype=np.float32)
+    ggml_state = np.zeros((2, 1, 128), dtype=np.float32)
+    sample_rate = np.array(16000, dtype=np.int64)
+
+    cpu_probs = []
+    ggml_probs = []
+    for chunk in _silero_vad_chunks():
+        cpu_prob, cpu_state = cpu.run(
+            None,
+            {"input": chunk, "state": cpu_state, "sr": sample_rate},
+        )
+        ggml_prob, ggml_state = ggml.run(
+            None,
+            {"input": chunk, "state": ggml_state, "sr": sample_rate},
+        )
+        cpu_probs.append(cpu_prob)
+        ggml_probs.append(ggml_prob)
+        np.testing.assert_allclose(ggml_prob, cpu_prob, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(ggml_state, cpu_state, rtol=1e-5, atol=2e-5)
+
+    np.testing.assert_allclose(
+        np.concatenate(ggml_probs, axis=0),
+        np.concatenate(cpu_probs, axis=0),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    # ORT profiles GGML fused partitions under opaque fused-node ids rather than
+    # the inner ONNX op names, so assert on provider activity plus the absence
+    # of plain CPU Conv nodes in the encoder path.
+    profile = end_profiling_profile(ggml)
+    ggml_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
+    ]
+    assert ggml_events, "expected at least one GGML node event in Silero profile"
+    cpu_plain_conv_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and event.get("args", {}).get("op_name") == "Conv"
+    ]
+    assert not cpu_plain_conv_events, (
+        f"found plain CPU Conv node events in Silero profile: {cpu_plain_conv_events}"
+    )

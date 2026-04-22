@@ -103,6 +103,7 @@ struct NodeDesc {
     int64_t axis{};
   };
   struct Conv2DAttrs {
+    int spatial_rank{2};
     int s0{1}, s1{1};
     int p0{0}, p1{0};
     int d0{1}, d1{1};

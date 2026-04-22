@@ -272,6 +272,10 @@ std::optional<ConstantTensor> EvalShape(const ConstantValueMap& /*constants*/, O
   const auto inputs = node.GetInputs();
   if (inputs.size() != 1 || inputs[0] == nullptr) return std::nullopt;
   const TensorMetadata meta = getTensorMetadata(inputs[0]);
+  // ORT nested subgraphs may omit shape metadata entirely; GetShape() then
+  // comes back as [] even for non-scalar tensors. Treat [] as "unknown" here
+  // instead of folding Shape(x) to an empty constant.
+  if (meta.dims.empty()) return std::nullopt;
   if (!shapeIsFullyStatic(meta)) return std::nullopt;
   std::vector<int64_t> values = meta.dims;
   return MakeConstant<int64_t>({static_cast<int64_t>(values.size())}, std::move(values),

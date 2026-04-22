@@ -431,6 +431,15 @@ def _conv_inputs(x_shape, w_shape, with_bias: bool):
 
 # (x_shape, w_shape, y_shape, attrs, with_bias)
 _CONV_CASES = [
+    # 1D conv, no pad, stride 1: [N=1, C=2, W=8] * [4,2,3] -> [1,4,6]
+    ((1, 2, 8), (4, 2, 3), (1, 4, 6),
+     dict(kernel_shape=[3]), False),
+    # 1D conv with bias and symmetric pad
+    ((2, 3, 11), (5, 3, 3), (2, 5, 11),
+     dict(kernel_shape=[3], pads=[1, 1]), True),
+    # 1D conv stride 2
+    ((1, 4, 12), (6, 4, 3), (1, 6, 5),
+     dict(kernel_shape=[3], strides=[2]), True),
     # plain 3x3, no pad, stride 1 — [N=1, C=1, 5, 5] * [4,1,3,3] -> [1,4,3,3]
     ((1, 1, 5, 5), (4, 1, 3, 3), (1, 4, 3, 3),
      dict(kernel_shape=[3, 3]), False),
