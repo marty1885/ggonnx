@@ -350,6 +350,82 @@ def test_abs_float16(suite_tmpdir, ep_library: Path) -> None:
     assert_all_nodes_run_on_ggml(ggml)
 
 
+@pytest.mark.parametrize(
+    "op_type",
+    ["Add", "Sub", "Mul", "Div", "PRelu", "Clip", "Concat",
+     "Relu", "Sigmoid", "Tanh", "Neg", "Abs", "Sqrt", "Exp", "Log", "Softplus", "Elu"],
+)
+def test_float16_op(suite_tmpdir, ep_library: Path, op_type: str) -> None:
+    rng = np.random.default_rng(42)
+    shape = [2, 3]
+
+    def f16(arr: np.ndarray) -> np.ndarray:
+        return arr.astype(np.float16)
+
+    if op_type in ("Add", "Sub", "Mul", "Div"):
+        a_info = helper.make_tensor_value_info("a", TensorProto.FLOAT16, shape)
+        b_info = helper.make_tensor_value_info("b", TensorProto.FLOAT16, shape)
+        c_info = helper.make_tensor_value_info("c", TensorProto.FLOAT16, shape)
+        node = helper.make_node(op_type, ["a", "b"], ["c"])
+        graph = helper.make_graph([node], f"{op_type.lower()}_f16", [a_info, b_info], [c_info])
+        model_path = ensure_model(suite_tmpdir, graph)
+        a = f16(rng.uniform(0.5, 2.0, shape))
+        b = f16(rng.uniform(0.5, 2.0, shape))
+        inputs = {"a": a, "b": b}
+        output_name = "c"
+    elif op_type == "PRelu":
+        x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT16, shape)
+        s_info = helper.make_tensor_value_info("slope", TensorProto.FLOAT16, [1])
+        y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT16, shape)
+        node = helper.make_node("PRelu", ["x", "slope"], ["y"])
+        graph = helper.make_graph([node], "prelu_f16", [x_info, s_info], [y_info])
+        model_path = ensure_model(suite_tmpdir, graph)
+        inputs = {"x": f16(rng.uniform(-2.0, 2.0, shape)), "slope": f16(np.array([0.1]))}
+        output_name = "y"
+    elif op_type == "Clip":
+        import onnx
+        x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT16, shape)
+        y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT16, shape)
+        min_t = onnx.numpy_helper.from_array(np.array(-1.0, dtype=np.float16), name="clip_min")
+        max_t = onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float16), name="clip_max")
+        node = helper.make_node("Clip", ["x", "clip_min", "clip_max"], ["y"])
+        graph = helper.make_graph([node], "clip_f16", [x_info], [y_info], initializer=[min_t, max_t])
+        model_path = ensure_model(suite_tmpdir, graph)
+        inputs = {"x": f16(rng.uniform(-3.0, 3.0, shape))}
+        output_name = "y"
+    elif op_type == "Concat":
+        a_info = helper.make_tensor_value_info("a", TensorProto.FLOAT16, shape)
+        b_info = helper.make_tensor_value_info("b", TensorProto.FLOAT16, shape)
+        c_info = helper.make_tensor_value_info("c", TensorProto.FLOAT16, [shape[0], shape[1] * 2])
+        node = helper.make_node("Concat", ["a", "b"], ["c"], axis=1)
+        graph = helper.make_graph([node], "concat_f16", [a_info, b_info], [c_info])
+        model_path = ensure_model(suite_tmpdir, graph)
+        inputs = {"a": f16(rng.standard_normal(shape)), "b": f16(rng.standard_normal(shape))}
+        output_name = "c"
+    else:
+        # Unary ops
+        overrides = {
+            "Sqrt": f16(np.array([[0.25, 1.0, 4.0], [9.0, 0.5, 2.0]])),
+            "Log":  f16(np.array([[0.5, 1.0, 2.0], [3.0, 4.0, 0.1]])),
+        }
+        x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT16, shape)
+        y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT16, shape)
+        node = helper.make_node(op_type, ["x"], ["y"])
+        graph = helper.make_graph([node], f"{op_type.lower()}_f16", [x_info], [y_info])
+        model_path = ensure_model(suite_tmpdir, graph)
+        inputs = {"x": overrides.get(op_type, f16(np.array([[1.0, -2.0, 0.5], [-0.25, 3.0, -1.5]])))}
+        output_name = "y"
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    cpu_out = cpu.run([output_name], inputs)[0]
+    ggml_out = ggml.run([output_name], inputs)[0]
+
+    assert ggml_out.dtype == np.float16
+    np.testing.assert_allclose(ggml_out, cpu_out, rtol=1e-2, atol=1e-2)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 @pytest.mark.parametrize("alpha", [0.01, 0.2])
 def test_single_leaky_relu(suite_tmpdir, ep_library: Path, alpha: float) -> None:
     model_path = build_single_unary_model(suite_tmpdir, "LeakyRelu", alpha=alpha)

@@ -481,6 +481,17 @@ bool isNodeSupported(Ort::ConstNode node, const ConstantValueMap& constants) {
   return op != nullptr && op->support(node, &constants);
 }
 
+// Maps ONNX element types to GGML types for tensors that flow through the GGML
+// runtime graph. Returns nullopt for types that have no GGML representation
+// (e.g. int64, bool) — those are consumed at compile time as attributes.
+static std::optional<ggml_type> OnnxTypeToGGML(ONNXTensorElementDataType t) {
+  switch (t) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   return GGML_TYPE_F32;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return GGML_TYPE_F16;
+    default: return std::nullopt;
+  }
+}
+
 size_t elementCount(const std::vector<int64_t>& dims) {
   size_t count = 1;
   for (const int64_t dim : dims) {
@@ -594,8 +605,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
     if (override_it != meta_analysis.fusions.constant_override_dims.end()) {
       metadata.dims = override_it->second;
     }
-    if (metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-        metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+    if (OnnxTypeToGGML(metadata.element_type).has_value()) {
       GGONNX_ASSERT(rankSupportedByGGML(metadata),
                     "compiled partition requires tensor rank <= " + std::to_string(GGML_MAX_DIMS) +
                         ", got " + std::to_string(metadata.dims.size()) + " for value '" + name + "'");
@@ -629,8 +639,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
     // ORT into the subgraph boundary) are consumed at compile time via
     // attributes; they are not ggml runtime values.
     const TensorMetadata meta = getTensorMetadata(input);
-    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
-        meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+    if (!OnnxTypeToGGML(meta.element_type).has_value()) {
       partition.kernel_input_to_value.push_back(kOptionalValueAbsent);
       continue;
     }
@@ -808,11 +817,10 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
         compiled_node.inputs.push_back(kOptionalValueAbsent);
         continue;
       }
-      // Non-float inputs (e.g. Reshape's int64 shape input) are consumed at
-      // compile time via attributes/output metadata and have no ggml value.
+      // Inputs with no GGML representation (e.g. Reshape's int64 shape tensor)
+      // are consumed at compile time via attributes and have no ggml value.
       const TensorMetadata meta = getTensorMetadata(input);
-      if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
-          meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+      if (!OnnxTypeToGGML(meta.element_type).has_value()) {
         compiled_node.inputs.push_back(kOptionalValueAbsent);
         continue;
       }
@@ -869,8 +877,8 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       const ValueDesc& value = partition.values[id];
       auto it = constants_by_name.find(value.name);
       GGONNX_ASSERT(it != constants_by_name.end(), "constant tensor lost during compile");
-      GGONNX_ASSERT(it->second.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                    "GGML constants must be float32");
+      const auto gtype = OnnxTypeToGGML(it->second.element_type);
+      GGONNX_ASSERT(gtype.has_value(), "GGML constant has no GGML type representation");
 
       std::vector<int64_t> tensor_dims = value.dims;
       if (layout == ConstantLayout::MATMUL_WEIGHT_TRANSPOSED && tensor_dims.size() >= 2) {
@@ -879,7 +887,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       // Scalar ONNX constants (rank 0) are represented in ggml as a rank-1 size-1 tensor.
       std::vector<int64_t> ggml_src_dims = tensor_dims.empty() ? std::vector<int64_t>{1} : tensor_dims;
       const std::array<int64_t, GGML_MAX_DIMS> ggml_dims = ToGGMLDims(ggml_src_dims);
-      ggml_tensor* t = ggml_new_tensor(partition.constant_ctx, GGML_TYPE_F32,
+      ggml_tensor* t = ggml_new_tensor(partition.constant_ctx, *gtype,
                                        static_cast<int>(ggml_src_dims.size()),
                                        ggml_dims.data());
       GGONNX_NOT_NULL(t, "ggml_new_tensor failed for constant");
@@ -898,13 +906,18 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       const ValueDesc& value = partition.values[id];
       auto it = constants_by_name.find(value.name);
       GGONNX_ASSERT(it != constants_by_name.end(), "constant tensor lost during backend upload");
-      GGONNX_ASSERT(it->second.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                    "GGML constants must be float32");
+      GGONNX_ASSERT(OnnxTypeToGGML(it->second.element_type).has_value(),
+                    "GGML constant has no GGML type representation");
 
-      std::vector<float> materialized(elementCount(value.dims));
-      MaterializeConstantData(reinterpret_cast<const float*>(it->second.data.data()),
-                              value.dims, layout, materialized.data());
-      ggml_backend_tensor_set(t, materialized.data(), 0, materialized.size() * sizeof(float));
+      if (it->second.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        std::vector<float> materialized(elementCount(value.dims));
+        MaterializeConstantData(reinterpret_cast<const float*>(it->second.data.data()),
+                                value.dims, layout, materialized.data());
+        ggml_backend_tensor_set(t, materialized.data(), 0, materialized.size() * sizeof(float));
+      } else {
+        // Non-F32 constants: upload raw bytes as-is (no transposition support for now).
+        ggml_backend_tensor_set(t, it->second.data.data(), 0, it->second.data.size());
+      }
     }
   }
 
@@ -936,21 +949,17 @@ ShapeKey MakeShapeKey(const std::vector<TensorMetadata>& input_metadata) {
   return key;
 }
 
-static ggml_type OnnxTypeToGGML(ONNXTensorElementDataType t) {
-  if (t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) return GGML_TYPE_F16;
-  return GGML_TYPE_F32;
-}
-
 ggml_tensor* CreateTensorForOnnxShape(ggml_context* ctx, const std::vector<int64_t>& dims,
                                       ONNXTensorElementDataType element_type) {
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
-  const ggml_type gtype = OnnxTypeToGGML(element_type);
+  const auto gtype = OnnxTypeToGGML(element_type);
+  GGONNX_ASSERT(gtype.has_value(), "unsupported ONNX element type for GGML tensor");
   if (dims.empty()) {
-    return ggml_new_tensor_1d(ctx, gtype, 1);
+    return ggml_new_tensor_1d(ctx, *gtype, 1);
   }
 
   const std::array<int64_t, GGML_MAX_DIMS> ggml_dims = ToGGMLDims(dims);
-  return ggml_new_tensor(ctx, gtype, static_cast<int>(dims.size()), ggml_dims.data());
+  return ggml_new_tensor(ctx, *gtype, static_cast<int>(dims.size()), ggml_dims.data());
 }
 
 void CopyInputDataToTensor(const OrtValue* input_value,
@@ -960,9 +969,8 @@ void CopyInputDataToTensor(const OrtValue* input_value,
   GGONNX_NOT_NULL(input_value, "graph input value must not be null");
   GGONNX_NOT_NULL(tensor, "cached GGML input tensor must not be null");
   const TensorMetadata meta = getTensorMetadata(Ort::ConstValue{input_value});
-  if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
-      meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
-    throw std::runtime_error("GGONNX graph input must be float32 or float16");
+  if (!OnnxTypeToGGML(meta.element_type).has_value()) {
+    throw std::runtime_error("GGONNX graph input has no GGML type representation");
   }
 
   const void* input_data = nullptr;
@@ -1041,9 +1049,8 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
       const size_t value_id = partition.graph_inputs[i];
       const TensorMetadata& meta = input_metadata[i];
       const ValueDesc& value = partition.values[value_id];
-      GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-                    meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
-                    "GGONNX runtime input must be float32 or float16");
+      GGONNX_ASSERT(OnnxTypeToGGML(meta.element_type).has_value(),
+                    "GGONNX runtime input has no GGML type representation");
       GGONNX_ASSERT(broadcastSupportedByGGML(value.dims, meta.dims),
                     "runtime input shape mismatch for tensor '" + value.name + "': declared " +
                         FormatDims(value.dims) + ", got " + FormatDims(meta.dims));

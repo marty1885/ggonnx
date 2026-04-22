@@ -22,7 +22,8 @@ constexpr size_t kMaxInitializerElements = 1 << 20;  // 1M elements (~4 MB f32)
 
 size_t ByteWidth(ONNXTensorElementDataType element_type) {
   switch (element_type) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return sizeof(float);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   return sizeof(float);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return sizeof(uint16_t);
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return sizeof(int32_t);
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return sizeof(int64_t);
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: return sizeof(uint8_t);
@@ -41,7 +42,8 @@ size_t ElementCount(const std::vector<int64_t>& dims) {
 }
 
 bool IsFoldableDType(ONNXTensorElementDataType element_type) {
-  return element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+  return element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT   ||
+         element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ||
          element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 ||
          element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 ||
          element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;

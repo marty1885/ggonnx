@@ -8,6 +8,11 @@
 
 namespace {
 
+static bool isGGMLFloatType(ONNXTensorElementDataType t) {
+  return t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+         t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+}
+
 void ComputeErf(ggml_tensor* dst, const ggml_tensor* src, int ith, int nth, void* /*userdata*/) {
   GGONNX_NOT_NULL(dst, "Erf custom op destination must not be null");
   GGONNX_NOT_NULL(src, "Erf custom op source must not be null");
@@ -34,9 +39,10 @@ std::optional<ConstantTensor> LookupCompileTimeConstant(Ort::ConstValueInfo valu
       const TensorMetadata meta = getTensorMetadata(value);
       const auto tensor_info = value.GetTensorTypeAndShapeInfo();
       const size_t bytes = tensor_info.GetElementCount() *
-                           (meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ? sizeof(float)
-                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 ? sizeof(int32_t)
-                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 ? sizeof(int64_t)
+                           (meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT   ? sizeof(float)
+                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? sizeof(uint16_t)
+                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32   ? sizeof(int32_t)
+                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64   ? sizeof(int64_t)
                             : 0);
       if (bytes == 0 && tensor_info.GetElementCount() != 0) {
         return std::nullopt;
@@ -215,9 +221,14 @@ bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_t
   const TensorMetadata rhs = getTensorMetadata(inputs[1]);
   const TensorMetadata out = getTensorMetadata(outputs[0]);
 
-  if (lhs.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      rhs.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+  if (!isGGMLFloatType(lhs.element_type) ||
+      rhs.element_type != lhs.element_type ||
+      out.element_type != lhs.element_type) {
+    return false;
+  }
+  // Max/Min are synthesized via ggml_scale which is F32-only on CPU.
+  if ((op_type == "Max" || op_type == "Min") &&
+      lhs.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     return false;
   }
   if (!rankSupportedByGGML(lhs) || !rankSupportedByGGML(rhs) || !rankSupportedByGGML(out)) {
@@ -943,9 +954,9 @@ bool IsSupportedPReluNode(Ort::ConstNode node, const ConstantValueMap* /*constan
   const TensorMetadata x = getTensorMetadata(inputs[0]);
   const TensorMetadata slope = getTensorMetadata(inputs[1]);
   const TensorMetadata y = getTensorMetadata(outputs[0]);
-  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      slope.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+  if (!isGGMLFloatType(x.element_type) ||
+      slope.element_type != x.element_type ||
+      y.element_type != x.element_type) {
     return false;
   }
   if (!rankSupportedByGGML(x) || !rankSupportedByGGML(slope) || !rankSupportedByGGML(y)) {
@@ -979,6 +990,22 @@ EmitResult EmitPReluNode(ggml_context* ctx,
 // node attributes; opset 11+ reads them from inputs[1] and inputs[2] (both
 // optional, defaulting to -inf / +inf). ggml_clamp takes the two bounds as
 // plain floats, so we require the input forms to be compile-time scalars.
+// Read a Clip bound (min or max) as a float, accepting F32 or F16 scalar constants.
+static std::optional<float> readClipBound(Ort::ConstNode node, size_t input_idx,
+                                          const ConstantValueMap* constants) {
+  if (const auto v = readConstantInputArray<float>(node, input_idx,
+                                                   ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, constants)) {
+    if (v->size() == 1) return (*v)[0];
+    return std::nullopt;
+  }
+  if (const auto v = readConstantInputArray<ggml_fp16_t>(node, input_idx,
+                                                         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, constants)) {
+    if (v->size() == 1) return ggml_fp16_to_fp32((*v)[0]);
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 bool IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -989,8 +1016,7 @@ bool IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* constants)
   if (inputs[0] == nullptr || outputs[0] == nullptr) return false;
   const TensorMetadata x = getTensorMetadata(inputs[0]);
   const TensorMetadata y = getTensorMetadata(outputs[0]);
-  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+  if (!isGGMLFloatType(x.element_type) || y.element_type != x.element_type) {
     return false;
   }
   if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) return false;
@@ -999,8 +1025,7 @@ bool IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* constants)
   // constants so ggml_clamp can take float literals.
   for (size_t i = 1; i < inputs.size(); ++i) {
     if (inputs[i] == nullptr) continue;  // optional, absent
-    const auto v = readConstantInputArray<float>(node, i, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, constants);
-    if (!v.has_value() || v->size() != 1) return false;
+    if (!readClipBound(node, i, constants).has_value()) return false;
   }
   return true;
 }
@@ -1013,12 +1038,12 @@ void CompileClipAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const C
   if (const auto max_attr = readNodeAttribute<float>(node, "max")) attrs.max = *max_attr;
   const auto inputs = node.GetInputs();
   if (inputs.size() >= 2 && inputs[1] != nullptr) {
-    const auto v = readConstantInputArray<float>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, constants);
-    if (v && v->size() == 1) attrs.min = (*v)[0];
+    const auto v = readClipBound(node, 1, constants);
+    if (v) attrs.min = *v;
   }
   if (inputs.size() >= 3 && inputs[2] != nullptr) {
-    const auto v = readConstantInputArray<float>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, constants);
-    if (v && v->size() == 1) attrs.max = (*v)[0];
+    const auto v = readClipBound(node, 2, constants);
+    if (v) attrs.max = *v;
   }
   compiled_node->attrs = attrs;
 }
@@ -2711,7 +2736,7 @@ bool IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap* /*consta
   }
   if (outputs[0] == nullptr) return false;
   const TensorMetadata out = getTensorMetadata(outputs[0]);
-  if (out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || !rankSupportedByGGML(out)) {
+  if (!isGGMLFloatType(out.element_type) || !rankSupportedByGGML(out)) {
     return false;
   }
   const size_t rank = out.dims.size();
@@ -2726,7 +2751,7 @@ bool IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap* /*consta
   for (Ort::ConstValueInfo input : inputs) {
     if (input == nullptr) return false;
     const TensorMetadata meta = getTensorMetadata(input);
-    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
+    if (meta.element_type != out.element_type) return false;
     if (meta.dims.size() != rank) return false;
     if (!rankSupportedByGGML(meta)) return false;
   }
