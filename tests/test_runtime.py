@@ -987,6 +987,51 @@ def test_single_squeeze(
     assert_all_nodes_run_on_ggml(ggml)
 
 
+def build_window_shuffle_model(tmpdir: Path, in_shape, mid_shape, out_shape) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(in_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(out_shape))
+    s1 = helper.make_tensor("shape1", TensorProto.INT64, [len(mid_shape)], list(mid_shape))
+    perm_out = list(mid_shape)
+    perm_out[2], perm_out[3] = perm_out[3], perm_out[2]
+    s2 = helper.make_tensor("shape2", TensorProto.INT64, [len(out_shape)], list(out_shape))
+    nodes = [
+        helper.make_node("Reshape", ["x", "shape1"], ["r1"], name="reshape_1"),
+        helper.make_node("Transpose", ["r1"], ["t"], name="transpose_0", perm=[0, 1, 3, 2, 4, 5]),
+        helper.make_node("Reshape", ["t", "shape2"], ["y"], name="reshape_2"),
+    ]
+    graph = helper.make_graph(
+        nodes, "window_shuffle", [x], [y], initializer=[s1, s2]
+    )
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "in_shape,mid_shape,out_shape",
+    [
+        # window_partition: [B, H, W, C] -> 6D -> [B*nw, M*M, C]
+        ((1, 16, 16, 32), (1, 2, 8, 2, 8, 32), (4, 64, 32)),
+        # window_reverse: [B*nw, M*M, C] -> 6D -> [B, H, W, C]
+        ((4, 64, 32), (1, 2, 2, 8, 8, 32), (1, 16, 16, 32)),
+        # Non-unit batch (B=2)
+        ((2, 16, 16, 48), (2, 2, 8, 2, 8, 48), (8, 64, 48)),
+        # Rectangular feature map H != W
+        ((1, 16, 8, 32), (1, 2, 8, 1, 8, 32), (2, 64, 32)),
+    ],
+)
+def test_single_window_shuffle(
+    suite_tmpdir, ep_library: Path, in_shape, mid_shape, out_shape
+) -> None:
+    model_path = build_window_shuffle_model(suite_tmpdir, in_shape, mid_shape, out_shape)
+    rng = np.random.default_rng(42)
+    inputs = {"x": rng.standard_normal(in_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 def build_slice_model(tmpdir: Path, x_shape, y_shape, starts, ends, axes=None, steps=None) -> Path:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
@@ -1308,6 +1353,54 @@ def test_single_lstm_matches_cpu(suite_tmpdir, ep_library: Path) -> None:
     np.testing.assert_allclose(ggml_y, cpu_y, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(ggml_y_h, cpu_y_h, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(ggml_y_c, cpu_y_c, rtol=1e-5, atol=1e-5)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_depth_to_space_model(
+    tmpdir: Path, x_shape, y_shape, blocksize: int, mode: str
+) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x_shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))
+    node = helper.make_node(
+        "DepthToSpace",
+        ["x"],
+        ["y"],
+        name="d2s_0",
+        blocksize=blocksize,
+        mode=mode,
+    )
+    graph = helper.make_graph([node], "single_depth_to_space", [x], [y])
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize("mode", ["DCR", "CRD"])
+@pytest.mark.parametrize(
+    "x_shape,blocksize",
+    [
+        ((1, 4, 2, 3), 2),
+        ((1, 12, 5, 7), 2),
+        ((1, 9, 4, 4), 3),
+        ((1, 8, 1, 1), 2),
+        ((2, 4, 2, 3), 2),
+        ((3, 12, 5, 7), 2),
+        ((4, 9, 4, 4), 3),
+    ],
+)
+def test_single_depth_to_space(
+    suite_tmpdir, ep_library: Path, x_shape, blocksize, mode
+) -> None:
+    n, c, h, w = x_shape
+    y_shape = (n, c // (blocksize * blocksize), h * blocksize, w * blocksize)
+    model_path = build_depth_to_space_model(
+        suite_tmpdir, x_shape, y_shape, blocksize, mode
+    )
+    rng = np.random.default_rng(57)
+    inputs = {"x": rng.standard_normal(x_shape).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
     assert_all_nodes_run_on_ggml(ggml)
 
 

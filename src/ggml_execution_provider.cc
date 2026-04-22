@@ -360,14 +360,63 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
     partition.graph_outputs.push_back(id);
   }
 
+  // Helper to locate graph-input value_info for a given name — needed when a
+  // fusion anchor's wired-in input is a graph input (not produced by a node).
+  auto find_input_value_info = [&](const std::string& name) -> Ort::ConstValueInfo {
+    for (Ort::ConstValueInfo v : ort_graph.GetInputs()) {
+      if (v != nullptr && std::string(v.GetName()) == name) return v;
+    }
+    return Ort::ConstValueInfo{nullptr};
+  };
+  auto find_value_info_for = [&](const std::string& name) -> Ort::ConstValueInfo {
+    for (Ort::ConstNode n : ort_graph.GetNodes()) {
+      for (Ort::ConstValueInfo v : n.GetOutputs()) {
+        if (v != nullptr && std::string(v.GetName()) == name) return v;
+      }
+      for (Ort::ConstValueInfo v : n.GetInputs()) {
+        if (v != nullptr && std::string(v.GetName()) == name) return v;
+      }
+    }
+    return find_input_value_info(name);
+  };
+
   for (Ort::ConstNode node : ort_graph.GetNodes()) {
     GGONNX_ASSERT(node != nullptr, "graph node must not be null");
-    if (meta_analysis.folded_nodes.count(NodeKey(node)) > 0) {
+    const std::string node_key = NodeKey(node);
+    if (meta_analysis.folded_nodes.count(node_key) > 0) {
       for (Ort::ConstValueInfo output : node.GetOutputs()) {
         if (output != nullptr) {
           ensure_value(output);
         }
       }
+      continue;
+    }
+    // Fusion-consumed nodes (the two Reshapes bracketing a window-shuffle
+    // Transpose) are dropped entirely — their rank-6 outputs would trip the
+    // ensure_value rank check, and they're never referenced by any retained
+    // node because the synthetic __WindowShuffle wires directly to the leading
+    // Reshape's input and the trailing Reshape's output.
+    if (meta_analysis.fusions.consumed_nodes.count(node_key) > 0) {
+      continue;
+    }
+    // Fusion anchor (the Transpose): emit a synthetic __WindowShuffle NodeDesc
+    // bypassing the usual support/compile_attrs path. Inputs/outputs cross the
+    // whole triple so we never materialize the rank-6 intermediates.
+    if (meta_analysis.fusions.window_shuffle_anchors.count(node_key) > 0) {
+      const auto& attrs = meta_analysis.fusions.window_shuffle_anchors.at(node_key);
+      const auto& io = meta_analysis.fusions.anchor_io.at(node_key);
+      NodeDesc compiled_node;
+      compiled_node.op_type = "__WindowShuffle";
+      compiled_node.domain = "";
+      compiled_node.name = io.anchor_node_name;
+      compiled_node.attrs = attrs;
+      Ort::ConstValueInfo in_vi = find_value_info_for(io.input_value);
+      Ort::ConstValueInfo out_vi = find_value_info_for(io.output_value);
+      GGONNX_ASSERT(in_vi != nullptr && out_vi != nullptr,
+                    "window-shuffle fusion input/output value_info not found");
+      compiled_node.inputs.push_back(ensure_value(in_vi));
+      compiled_node.outputs.push_back(ensure_value(out_vi));
+      partition.nodes.push_back(std::move(compiled_node));
       continue;
     }
     if (!isNodeSupported(node)) {
@@ -952,8 +1001,12 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
     };
 
     for (Ort::ConstNode node : ort_graph.GetNodes()) {
-      const bool supported = isNodeSupported(node) && has_visible_output(node);
-      if (supported || meta_analysis.folded_nodes.count(NodeKey(node)) > 0) {
+      const std::string key = NodeKey(node);
+      const bool is_fusion_anchor = meta_analysis.fusions.window_shuffle_anchors.count(key) > 0;
+      const bool is_fusion_consumed = meta_analysis.fusions.consumed_nodes.count(key) > 0;
+      const bool supported =
+          (isNodeSupported(node) || is_fusion_anchor) && has_visible_output(node);
+      if (supported || meta_analysis.folded_nodes.count(key) > 0 || is_fusion_consumed) {
         current_group.push_back(node);
         current_group_has_runtime_node = current_group_has_runtime_node || supported;
       } else {

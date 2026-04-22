@@ -10,6 +10,7 @@
 struct MetaAnalysis {
   ConstantValueMap constants;
   std::unordered_set<std::string> folded_nodes;
+  FusionPlan fusions;
 };
 
 MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph);

@@ -2850,6 +2850,189 @@ EmitResult EmitReduceMeanNode(ggml_context* ctx,
       ggml_reshape_4d(ctx, cont, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
 }
 
+// ONNX DepthToSpace: [N, C, H, W] -> [N, C/b^2, H*b, W*b]. Two modes:
+//   DCR (default) reshapes C as [b, b, C/b^2] (row-block outer, col-block middle).
+//   CRD            reshapes C as [C/b^2, b, b] (channel outer, then row, col).
+// A faithful lowering needs a 5D intermediate (ggml max is 4D), so we split it
+// into two 4D permute+reshape passes — one expands H, one expands W — by
+// factoring the C axis into two at a time. With N == 1 the batch axis is free
+// and both passes fit in 4D directly. For N > 1 we first pay an NCHW -> CNHW
+// permute to fold N into the height axis, run the N == 1 shuffle on the fat
+// height, then unfold and swap N/Cout back. The N == 1 fast path is kept
+// separate — waifu2x / image SR hit it almost exclusively and we don't want
+// to pay the extra conts there.
+//
+// KNOWN INEFFICIENCY: the N == 1 path emits two ggml_cont copies (one per
+// pass, each materializing a permuted view before the following reshape can
+// collapse two axes). Within 4D ggml ops this is the floor — the output index
+// 'wb*b + cb' can't be encoded as a constant-stride axis over the input, so
+// no single strided view can feed a lone cont. The N > 1 path stacks another
+// two conts on top of that (input N<->C and output N<->Cout). A custom kernel
+// (ggml_custom_4d with hand-rolled stride math) could collapse everything to
+// a single pass but we're staying pure-ggml here; revisit if a profile pins a
+// hot model on this op.
+
+// Emit the 2-pass shuffle for a tensor with ne=[W, H, C, 1]; returns
+// ne=[W*b, H*b, C/(b*b), 1]. Requires `src` to be contiguous.
+static ggml_tensor* EmitDepthToSpaceShuffleBatch1(ggml_context* ctx,
+                                                  ggml_tensor* src,
+                                                  int b,
+                                                  bool crd) {
+  const int64_t W = src->ne[0];
+  const int64_t H = src->ne[1];
+  const int64_t C = src->ne[2];
+  const int64_t Cout = C / (b * b);
+
+  if (!crd) {
+    // DCR: channel c = r*b*Cout + c_blk*Cout + cc.
+    // Pass 1 — expand H. Factor C as (b_row outer, b_col*Cout inner).
+    // ggml ne=[W, H, b_col*Cout, b_row] -> permute (b_row between H and W-inner) ->
+    // ne=[W, b_row, H, b_col*Cout], then collapse axes 1,2 into H*b.
+    ggml_tensor* v1 = ggml_reshape_4d(ctx, src, W, H, b * Cout, b);
+    ggml_tensor* p1 = ggml_cont(ctx, ggml_permute(ctx, v1, 0, 2, 3, 1));
+    ggml_tensor* r1 = ggml_reshape_4d(ctx, p1, W, H * b, b * Cout, 1);
+
+    // Pass 2 — expand W. Factor b_col*Cout as (b_col outer, Cout inner).
+    // ggml ne=[W, H*b, Cout, b_col] -> permute (b_col innermost) ->
+    // ne=[b_col, W, H*b, Cout], then collapse axes 0,1 into W*b.
+    ggml_tensor* v2 = ggml_reshape_4d(ctx, r1, W, H * b, Cout, b);
+    ggml_tensor* p2 = ggml_cont(ctx, ggml_permute(ctx, v2, 1, 2, 3, 0));
+    return ggml_reshape_4d(ctx, p2, W * b, H * b, Cout, 1);
+  }
+
+  // CRD: channel c = cc*b*b + r*b + c_blk.
+  // Pass 1 — expand W. Factor C as (Cout*b_row outer, b_col inner).
+  // ggml ne=[W, H, b_col, Cout*b_row] -> permute (b_col innermost) ->
+  // ne=[b_col, W, H, Cout*b_row], then collapse axes 0,1 into W*b.
+  ggml_tensor* v1 = ggml_reshape_4d(ctx, src, W, H, b, Cout * b);
+  ggml_tensor* p1 = ggml_cont(ctx, ggml_permute(ctx, v1, 1, 2, 0, 3));
+  ggml_tensor* r1 = ggml_reshape_4d(ctx, p1, W * b, H, Cout * b, 1);
+
+  // Pass 2 — expand H. Factor Cout*b_row as (Cout outer, b_row inner).
+  // ggml ne=[W*b, H, b_row, Cout] -> permute (b_row between H and W) ->
+  // ne=[W*b, b_row, H, Cout], then collapse axes 1,2 into H*b.
+  ggml_tensor* v2 = ggml_reshape_4d(ctx, r1, W * b, H, b, Cout);
+  ggml_tensor* p2 = ggml_cont(ctx, ggml_permute(ctx, v2, 0, 2, 1, 3));
+  return ggml_reshape_4d(ctx, p2, W * b, H * b, Cout, 1);
+}
+
+bool IsSupportedDepthToSpaceNode(Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
+    return false;
+  }
+  if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  const TensorMetadata in = getTensorMetadata(inputs[0]);
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return false;
+  }
+  if (in.dims.size() != 4 || out.dims.size() != 4) return false;
+  if (!shapeIsFullyStatic(in.dims) || !shapeIsFullyStatic(out.dims)) return false;
+
+  const auto blocksize = readNodeAttribute<int64_t>(node, "blocksize");
+  if (!blocksize.has_value() || *blocksize < 1) return false;
+  const int64_t b = *blocksize;
+  if (in.dims[1] % (b * b) != 0) return false;
+
+  const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("DCR");
+  if (mode != "DCR" && mode != "CRD") return false;
+
+  return true;
+}
+
+void CompileDepthToSpaceAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  NodeDesc::DepthToSpaceAttrs attrs;
+  attrs.blocksize = static_cast<int>(*readNodeAttribute<int64_t>(node, "blocksize"));
+  const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("DCR");
+  attrs.crd = (mode == "CRD");
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitDepthToSpaceNode(ggml_context* ctx,
+                                const NodeDesc& node,
+                                const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::DepthToSpaceAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled DepthToSpace node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled DepthToSpace node missing GGML input");
+
+  const int b = attrs->blocksize;
+  const int64_t W = x->ne[0];
+  const int64_t H = x->ne[1];
+  const int64_t C = x->ne[2];
+  const int64_t N = x->ne[3];
+  GGONNX_ASSERT(C % (b * b) == 0, "DepthToSpace: C not divisible by blocksize^2");
+  const int64_t Cout = C / (b * b);
+
+  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+
+  if (N == 1) {
+    return EmitOutputs{EmitDepthToSpaceShuffleBatch1(ctx, src, b, attrs->crd)};
+  }
+
+  // N > 1: permute ONNX NCHW -> CNHW so N sits next to H in memory, then collapse
+  // (N, H) into one axis and run the N==1 shuffle on the fat height. In ggml C is
+  // at ne[2] and N at ne[3], so the permute swaps axes 2 and 3.
+  ggml_tensor* cnhw = ggml_cont(ctx, ggml_permute(ctx, src, 0, 1, 3, 2));
+  // ne=[W, H, N, C] contiguous -> ne=[W, N*H, C, 1]. N and H are adjacent with H
+  // inner (stride W) and N outer (stride W*H), so the collapsed axis indexes as
+  // n*H + h, which is exactly what the shuffle will later invert.
+  ggml_tensor* folded = ggml_reshape_4d(ctx, cnhw, W, N * H, C, 1);
+
+  ggml_tensor* shuffled = EmitDepthToSpaceShuffleBatch1(ctx, folded, b, attrs->crd);
+  // shuffled ne=[W*b, N*H*b, Cout, 1]. The expanded height encodes n*H*b + h*b + r
+  // = n*(H*b) + (h*b + r), so splitting it as (H*b inner, N outer) is a pure view.
+  // The resulting ne=[W*b, H*b, N, Cout] means ONNX [Cout, N, H*b, W*b] — one more
+  // permute (swap N <-> Cout) lands us at the expected ONNX [N, Cout, H*b, W*b].
+  ggml_tensor* split = ggml_reshape_4d(ctx, shuffled, W * b, H * b, N, Cout);
+  return EmitOutputs{ggml_cont(ctx, ggml_permute(ctx, split, 0, 1, 3, 2))};
+}
+
+// Synthetic op: fused Reshape->Transpose(perm=[0,1,3,2,4,5])->Reshape triple.
+// Lifts the rank-6 intermediate outside of GGML's rank-4 cap by viewing the
+// input as 4D ne=[d4*d5, d3, d2, d0*d1] (a pure reshape since memory is
+// contiguous), swapping ggml axes 2 and 3 (= ONNX axes 2 and 3 in reversed
+// layout), and reshaping to the final ONNX dims. One cont is required —
+// unavoidable, since the middle two axes of the 6D view must be transposed.
+EmitResult EmitWindowShuffleNode(ggml_context* ctx,
+                                 const NodeDesc& node,
+                                 const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::WindowShuffleAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled __WindowShuffle node missing attributes");
+  GGONNX_ASSERT(node.inputs.size() == 1 && node.outputs.size() == 1,
+                "compiled __WindowShuffle node has invalid arity");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled __WindowShuffle node missing GGML input");
+
+  const int64_t d0 = attrs->onnx_rank6_dims[0];
+  const int64_t d1 = attrs->onnx_rank6_dims[1];
+  const int64_t d2 = attrs->onnx_rank6_dims[2];
+  const int64_t d3 = attrs->onnx_rank6_dims[3];
+  const int64_t d4 = attrs->onnx_rank6_dims[4];
+  const int64_t d5 = attrs->onnx_rank6_dims[5];
+  GGONNX_ASSERT(d0 > 0 && d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0 && d5 > 0,
+                "WindowShuffle dims must be positive");
+
+  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+  ggml_tensor* view = ggml_reshape_4d(ctx, src, d4 * d5, d3, d2, d0 * d1);
+  ggml_tensor* permuted = ggml_permute(ctx, view, 0, 2, 1, 3);
+  ggml_tensor* cont = ggml_cont(ctx, permuted);
+
+  const std::array<int64_t, GGML_MAX_DIMS> target =
+      ToPaddedGGMLDims(attrs->output_onnx_dims);
+  ggml_tensor* out =
+      ggml_reshape_4d(ctx, cont, target[0], target[1], target[2], target[3]);
+  return EmitOutputs{out};
+}
+
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type) {
 
   struct PairHash {
@@ -2908,6 +3091,12 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
        {IsSupportedReduceMeanNode, CompileReduceMeanAttributes, EmitReduceMeanNode}},
       {{"", "BatchNormalization"},
        {IsSupportedBatchNormNode, CompileBatchNormAttributes, EmitBatchNormNode}},
+      {{"", "DepthToSpace"},
+       {IsSupportedDepthToSpaceNode, CompileDepthToSpaceAttributes, EmitDepthToSpaceNode}},
+      // Synthetic op injected by FusionPlan. `support` and `compile_attrs` are
+      // null because the fusion machinery builds the NodeDesc directly and the
+      // per-node support check is never called on __WindowShuffle.
+      {{"", "__WindowShuffle"}, {nullptr, nullptr, EmitWindowShuffleNode}},
   };
 
   auto it = ops_table.find({domain, op_type});

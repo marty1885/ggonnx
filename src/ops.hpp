@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -174,6 +175,21 @@ struct NodeDesc {
     int ggml_axis{0};
     std::vector<int64_t> lengths;  // per-output length along ggml_axis
   };
+  struct DepthToSpaceAttrs {
+    int blocksize{1};
+    bool crd{false};  // false = DCR (ONNX default), true = CRD
+  };
+  struct WindowShuffleAttrs {
+    // Rank-6 intermediate ONNX dims (d0..d5) for a Reshape->Transpose(
+    // perm=[0,1,3,2,4,5])->Reshape triple. The transpose swaps ONNX dims 2
+    // and 3; in ggml's reversed layout this becomes a swap of ggml axes 2
+    // and 3 on the rank-4 view [d4*d5, d3, d2, d0*d1], which stays within
+    // GGML_MAX_DIMS=4 so the fusion avoids the rank-6 intermediate that
+    // blocks the individual Reshape/Transpose nodes.
+    std::array<int64_t, 6> onnx_rank6_dims{};
+    // Output ONNX dims (from the trailing Reshape's output).
+    std::vector<int64_t> output_onnx_dims;
+  };
   struct ReduceAttrs {
     // Reduce a contiguous suffix of the ONNX dims. Stored as the count of
     // trailing ONNX axes to reduce; emit collapses them into a single ggml
@@ -201,7 +217,9 @@ struct NodeDesc {
                              SplitAttrs,
                              ReduceAttrs,
                              ConvTransposeAttrs,
-                             ExpandAttrs>;
+                             ExpandAttrs,
+                             DepthToSpaceAttrs,
+                             WindowShuffleAttrs>;
 
   std::string op_type;
   std::string domain;
@@ -242,3 +260,19 @@ struct OpDefinition {
 };
 
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type);
+
+// Graph-level fusion plan. Populated in AnalyzeCompileTimeConstants.
+struct FusionPlan {
+  // Anchor node key (output-or-name of the Transpose) -> fused attrs.
+  std::unordered_map<std::string, NodeDesc::WindowShuffleAttrs> window_shuffle_anchors;
+  // Keyed by anchor node key; the value names to wire as synthetic input/output.
+  struct AnchorIO {
+    std::string input_value;   // first input of the leading Reshape
+    std::string output_value;  // output of the trailing Reshape
+    std::string anchor_node_name;  // for the synthetic NodeDesc.name
+  };
+  std::unordered_map<std::string, AnchorIO> anchor_io;
+  // Node keys of the two Reshape nodes consumed by the fusion (skipped entirely
+  // during partition compile — their rank-6 outputs never become ggml values).
+  std::unordered_set<std::string> consumed_nodes;
+};
