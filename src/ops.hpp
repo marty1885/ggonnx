@@ -38,14 +38,6 @@ TensorMetadata getTensorMetadata(Ort::ConstValue value);
 // make GetTensorTypeAndShapeInfo() invalid — any support-check path that
 // forwards a value info into getTensorMetadata must gate on this first.
 bool isTensorTyped(Ort::ConstValueInfo value_info);
-void SetActiveCompileTimeConstants(const ConstantValueMap* constants);
-const ConstantValueMap* GetActiveCompileTimeConstants();
-
-// When set, MatMul emitters tag their output with GGML_PREC_F32 so backends
-// that default to fp16 accumulation (e.g. Vulkan on fp16-capable GPUs) use
-// fp32 instead. Driven by the `ep.ggonnx.matmul_precision` provider option.
-void SetForceMatMulF32Precision(bool force);
-bool GetForceMatMulF32Precision();
 
 inline bool shapeIsFullyStatic(const TensorMetadata& tensor) {
   return std::all_of(tensor.dims.begin(), tensor.dims.end(), [](int64_t dim) { return dim >= 0; });
@@ -237,6 +229,12 @@ struct NodeDesc {
     int trailing_count{0};
     bool keepdims{true};
   };
+  struct MatMulAttrs {
+    // When true, tag the ggml_mul_mat output with GGML_PREC_F32 so backends
+    // that default to fp16 accumulation (e.g. Vulkan) use fp32 instead.
+    // Driven by the `ep.ggonnx.matmul_precision` provider option.
+    bool force_f32{false};
+  };
 
   using Attrs = std::variant<NoAttrs,
                              GRUAttrs,
@@ -261,7 +259,8 @@ struct NodeDesc {
                              ExpandAttrs,
                              DepthToSpaceAttrs,
                              WindowShuffleAttrs,
-                             QKVSplitAttrs>;
+                             QKVSplitAttrs,
+                             MatMulAttrs>;
 
   std::string op_type;
   std::string domain;
@@ -276,7 +275,7 @@ using EmitResult = std::optional<EmitOutputs>;
 using EmitNodeFn = EmitResult (*)(ggml_context* ctx,
                                   const NodeDesc& node,
                                   const std::vector<ggml_tensor*>& values);
-using CompileAttrsFn = void (*)(Ort::ConstNode node, NodeDesc* compiled_node);
+using CompileAttrsFn = void (*)(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants);
 
 // Layout hint for constant-initializer inputs materialized at compile time.
 // AS_IS: ggml ne = reversed ONNX dims, data byte-identical.
@@ -295,7 +294,7 @@ enum class ConstantLayout {
 using ConstantLayoutFn = ConstantLayout (*)(const NodeDesc& node, size_t input_idx);
 
 struct OpDefinition {
-  bool (*support)(Ort::ConstNode node);
+  bool (*support)(Ort::ConstNode node, const ConstantValueMap* constants);
   CompileAttrsFn compile_attrs;
   EmitNodeFn emit;
   ConstantLayoutFn constant_layout;

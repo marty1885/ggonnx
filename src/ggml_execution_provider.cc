@@ -441,7 +441,7 @@ std::vector<int64_t> inferBroadcastOutputDims(const std::vector<int64_t>& lhs_di
   return output_dims;
 }
 
-bool isNodeSupported(Ort::ConstNode node) {
+bool isNodeSupported(Ort::ConstNode node, const ConstantValueMap& constants) {
   const Ort::ConstGraph graph = node.GetGraph();
   if (graph.GetParentNode() != nullptr) {
     for (Ort::ConstValueInfo output : node.GetOutputs()) {
@@ -478,7 +478,7 @@ bool isNodeSupported(Ort::ConstNode node) {
   const std::string op_type = node.GetOperatorType();
   const std::string domain = node.GetDomain();
   const OpDefinition* op = FindOpDefinition(domain, op_type);
-  return op != nullptr && op->support(node);
+  return op != nullptr && op->support(node, &constants);
 }
 
 size_t elementCount(const std::vector<int64_t>& dims) {
@@ -533,13 +533,21 @@ void MaterializeConstantData(const float* src,
   const int64_t N = onnx_dims[onnx_dims.size() - 1];
   int64_t batch = 1;
   for (size_t i = 0; i + 2 < onnx_dims.size(); ++i) batch *= onnx_dims[i];
-  // TODO: Optimize this aweful slow transpose
+  // Optimized tiled transpose for better cache efficiency
+  constexpr int64_t TILE = 32;
   for (int64_t b = 0; b < batch; ++b) {
     const float* src_mat = src + b * K * N;
     float* dst_mat = dst + b * K * N;
-    for (int64_t k = 0; k < K; ++k) {
-      for (int64_t n = 0; n < N; ++n) {
-        dst_mat[n * K + k] = src_mat[k * N + n];
+    for (int64_t k0 = 0; k0 < K; k0 += TILE) {
+      for (int64_t n0 = 0; n0 < N; n0 += TILE) {
+        int64_t k_end = std::min(k0 + TILE, K);
+        int64_t n_end = std::min(n0 + TILE, N);
+        for (int64_t n = n0; n < n_end; ++n) {
+          float* dst_row = dst_mat + n * K;
+          for (int64_t k = k0; k < k_end; ++k) {
+            dst_row[k] = src_mat[k * N + n];
+          }
+        }
       }
     }
   }
@@ -549,15 +557,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
   GGONNX_NOT_NULL(graph, "graph must not be null");
   const Ort::ConstGraph ort_graph{graph};
   MetaAnalysis meta_analysis = AnalyzeCompileTimeConstants(graph);
-  SetActiveCompileTimeConstants(&meta_analysis.constants);
-  SetForceMatMulF32Precision(selection.force_matmul_f32);
   CompiledPartition partition;
-  struct ActiveConstantsGuard {
-    ~ActiveConstantsGuard() {
-      SetActiveCompileTimeConstants(nullptr);
-      SetForceMatMulF32Precision(false);
-    }
-  } active_constants_guard;
 
   GGONNX_ASSERT(!selection.devices.empty(), "BackendSelection must contain at least one device");
   partition.force_matmul_f32_prec = selection.force_matmul_f32;
@@ -760,7 +760,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       partition.nodes.push_back(std::move(compiled_node));
       continue;
     }
-    if (!isNodeSupported(node)) {
+    if (!isNodeSupported(node, meta_analysis.constants)) {
       throw std::runtime_error("GGONNX Compile received an unsupported partition");
     }
 
@@ -774,7 +774,10 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
     const OpDefinition* op = FindOpDefinition(compiled_node.domain, compiled_node.op_type);
     GGONNX_ASSERT(op != nullptr, "compiled partition could not locate supported op definition");
     if (op->compile_attrs != nullptr) {
-      op->compile_attrs(node, &compiled_node);
+      op->compile_attrs(node, &compiled_node, &meta_analysis.constants);
+    }
+    if (compiled_node.op_type == "MatMul") {
+      compiled_node.attrs = NodeDesc::MatMulAttrs{.force_f32 = selection.force_matmul_f32};
     }
 
     // Fold an absorbed zero-Pad into this Conv's padding attributes.
@@ -1183,10 +1186,6 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
   const ShapeKey shape_key = MakeShapeKey(input_metadata);
   if (state.active_graph == nullptr || state.active_graph->key != shape_key) {
     DestroyMaterializedGraph(state.active_graph);
-    SetForceMatMulF32Precision(partition.force_matmul_f32_prec);
-    struct PrecisionGuard {
-      ~PrecisionGuard() { SetForceMatMulF32Precision(false); }
-    } precision_guard;
     state.active_graph = BuildMaterializedGraph(partition, shape_key, input_metadata);
   }
 
@@ -1340,10 +1339,6 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
     GGONNX_NOT_NULL(graph_support_info, "graph support info must not be null");
     const Ort::ConstGraph ort_graph{graph};
     const MetaAnalysis meta_analysis = AnalyzeCompileTimeConstants(graph);
-    SetActiveCompileTimeConstants(&meta_analysis.constants);
-    struct ActiveConstantsGuard {
-      ~ActiveConstantsGuard() { SetActiveCompileTimeConstants(nullptr); }
-    } active_constants_guard;
 
     // Partition by walking nodes in topological order (how ORT yields them) and
     // sealing the current fuse group whenever we hit an unsupported node. Any
@@ -1403,7 +1398,7 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
           meta_analysis.fusions.window_mask_add_anchors.count(key) > 0;
       const bool is_fusion_consumed = meta_analysis.fusions.consumed_nodes.count(key) > 0;
       const bool supported =
-          (isNodeSupported(node) || is_fusion_anchor) && has_visible_output(node);
+          (isNodeSupported(node, meta_analysis.constants) || is_fusion_anchor) && has_visible_output(node);
       if (supported || meta_analysis.folded_nodes.count(key) > 0 || is_fusion_consumed) {
         current_group.push_back(node);
         current_group_has_runtime_node = current_group_has_runtime_node || supported;

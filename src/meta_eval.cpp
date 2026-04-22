@@ -2,10 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
-#include <numeric>
 #include <optional>
 #include <stdexcept>
-#include <type_traits>
 
 #include "inner/helpers.hpp"
 #include "inner/ort_api_helpers.hpp"
@@ -1204,9 +1202,9 @@ std::optional<int64_t> ReadInt64Attr(Ort::ConstNode node, const char* name) {
   return value;
 }
 
-bool IsNodeCompilable(Ort::ConstNode node) {
+bool IsNodeCompilable(Ort::ConstNode node, const ConstantValueMap& constants) {
   const OpDefinition* op = FindOpDefinition(node.GetDomain(), node.GetOperatorType());
-  return op != nullptr && op->support != nullptr && op->support(node);
+  return op != nullptr && op->support != nullptr && op->support(node, &constants);
 }
 
 void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
@@ -1358,7 +1356,7 @@ void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
       if (plan.window_shuffle_anchors.count(key) > 0) continue;
       if (plan.qkv_split_anchors.count(key) > 0) continue;
       if (plan.window_mask_add_anchors.count(key) > 0) continue;
-      if (IsNodeCompilable(nodes[i])) continue;
+      if (IsNodeCompilable(nodes[i], constants)) continue;
       span_ok = false;
       break;
     }
@@ -1514,7 +1512,7 @@ void DetectWindowMaskAddFusions(const Ort::ConstGraph& ort_graph,
         const std::string key = NodeKey(nodes[i]);
         if (member_set.count(key) > 0) continue;
         if (folded_nodes.count(key) > 0) continue;
-        if (IsNodeCompilable(nodes[i])) continue;
+        if (IsNodeCompilable(nodes[i], constants)) continue;
         span_ok = false;
         break;
       }
