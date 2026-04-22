@@ -8,6 +8,7 @@
 namespace {
 
 thread_local const ConstantValueMap* g_active_compile_time_constants = nullptr;
+thread_local bool g_force_matmul_f32_precision = false;
 
 void ComputeErf(ggml_tensor* dst, const ggml_tensor* src, int ith, int nth, void* /*userdata*/) {
   GGONNX_NOT_NULL(dst, "Erf custom op destination must not be null");
@@ -78,6 +79,14 @@ void SetActiveCompileTimeConstants(const ConstantValueMap* constants) {
 
 const ConstantValueMap* GetActiveCompileTimeConstants() {
   return g_active_compile_time_constants;
+}
+
+void SetForceMatMulF32Precision(bool force) {
+  g_force_matmul_f32_precision = force;
+}
+
+bool GetForceMatMulF32Precision() {
+  return g_force_matmul_f32_precision;
 }
 
 TensorMetadata getTensorMetadata(Ort::ConstValue value) {
@@ -1134,7 +1143,11 @@ EmitResult EmitMatMulNode(ggml_context* ctx,
   ggml_tensor* b_eff = (b->ne[0] == a->ne[0])
                            ? b
                            : ggml_cont(ctx, ggml_transpose(ctx, b));
-  return EmitOutputs{ggml_mul_mat(ctx, b_eff, a)};
+  ggml_tensor* out = ggml_mul_mat(ctx, b_eff, a);
+  if (GetForceMatMulF32Precision()) {
+    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+  }
+  return EmitOutputs{out};
 }
 
 // ONNX Conv (2D only for now): X[N,C,H,W] @ W[OC,IC/group,KH,KW] (+ optional B[OC]).

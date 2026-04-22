@@ -3,9 +3,12 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -43,10 +46,30 @@ struct GGMLFactory {
   std::string registered_name{kRegistrationName};
 };
 
+// Backend selection resolved from EP provider options at session create time.
+// Shared (by pointer) between the EP instance and every CompiledPartition it
+// produces, so that the partitions outlive the EP object safely.
+struct BackendSelection {
+  // Ordered list of ggml devices we'll actually execute on. Index 0 is the
+  // "primary" backend — constant buffers land on its buffer type, and it's
+  // used directly (no scheduler) when the list has exactly one entry.
+  std::vector<ggml_backend_dev_t> devices;
+  // Human-readable names, parallel to `devices`, for logging / compatibility
+  // info strings (so EP-context caches don't get shared across device picks).
+  std::vector<std::string> device_names;
+  bool enable_cpu_fallback{true};
+  // When true, all MatMul outputs are tagged with GGML_PREC_F32 so backends
+  // don't silently accumulate in fp16. Default false — matches ggml's usual
+  // behavior where fp16-capable GPU backends pick the faster fp16-accumulation
+  // kernels. Set via `ep.ggonnx.matmul_precision=f32`.
+  bool force_matmul_f32{false};
+};
+
 struct GGMLEp {
   OrtEp iface{};
   const OrtLogger* logger{};
   std::vector<std::string> selected_devices;
+  std::shared_ptr<BackendSelection> selection;
 };
 
 struct ValueDesc {
@@ -70,11 +93,23 @@ struct CompiledPartition {
   // Entries in `constants` are indexed by value_id; nullptr means "not a
   // constant". Constants never appear in graph_inputs — their data is snapshotted
   // at compile time, with per-op layout hints (e.g. MatMul B is pre-transposed).
-  ggml_backend_t backend{nullptr};
+  // backends[0] is the primary backend: constants live on its default buffer
+  // type, and when the list has exactly one entry the partition uses the
+  // direct ggml_backend_graph_compute path (no scheduler). With >1 backends,
+  // `sched` is built over the list and handles per-op backend assignment and
+  // cross-backend tensor copies.
+  std::vector<ggml_backend_t> backends;
+  ggml_backend_sched_t sched{nullptr};
+  // Cached from BackendSelection so the emit path (which runs at graph-build
+  // time, not compile time) can apply the precision hint without threading
+  // the selection all the way through.
+  bool force_matmul_f32_prec{false};
   ggml_context* constant_ctx{nullptr};
   ggml_backend_buffer_t constant_buffer{nullptr};
   std::vector<ggml_tensor*> constants;
   std::vector<std::optional<ConstantTensor>> folded_constants;
+
+  ggml_backend_t primary_backend() const { return backends.empty() ? nullptr : backends.front(); }
 
   CompiledPartition() = default;
   CompiledPartition(const CompiledPartition&) = delete;
@@ -82,27 +117,37 @@ struct CompiledPartition {
   CompiledPartition(CompiledPartition&& other) noexcept { *this = std::move(other); }
   CompiledPartition& operator=(CompiledPartition&& other) noexcept {
     if (this == &other) return *this;
+    // Destroy in reverse-creation order: sched references backends, buffers
+    // reference the backend they were allocated on.
+    if (sched != nullptr) ggml_backend_sched_free(sched);
     if (constant_buffer != nullptr) ggml_backend_buffer_free(constant_buffer);
     if (constant_ctx != nullptr) ggml_free(constant_ctx);
-    if (backend != nullptr) ggml_backend_free(backend);
+    for (ggml_backend_t b : backends) {
+      if (b != nullptr) ggml_backend_free(b);
+    }
     values = std::move(other.values);
     graph_inputs = std::move(other.graph_inputs);
     graph_outputs = std::move(other.graph_outputs);
     kernel_input_to_value = std::move(other.kernel_input_to_value);
     nodes = std::move(other.nodes);
-    backend = other.backend;
+    backends = std::move(other.backends);
+    sched = other.sched;
     constant_ctx = other.constant_ctx;
     constant_buffer = other.constant_buffer;
     constants = std::move(other.constants);
-    other.backend = nullptr;
+    folded_constants = std::move(other.folded_constants);
+    other.sched = nullptr;
     other.constant_ctx = nullptr;
     other.constant_buffer = nullptr;
     return *this;
   }
   ~CompiledPartition() {
+    if (sched != nullptr) ggml_backend_sched_free(sched);
     if (constant_buffer != nullptr) ggml_backend_buffer_free(constant_buffer);
     if (constant_ctx != nullptr) ggml_free(constant_ctx);
-    if (backend != nullptr) ggml_backend_free(backend);
+    for (ggml_backend_t b : backends) {
+      if (b != nullptr) ggml_backend_free(b);
+    }
   }
 };
 
@@ -174,6 +219,185 @@ std::string DescribeHardwareDevice(const OrtHardwareDevice* device) {
 
   return vendor + ":" + std::to_string(static_cast<int>(device_type)) + ":" +
          std::to_string(vendor_id) + ":" + std::to_string(device_id);
+}
+
+// Load every ggml backend the runtime can find (dynamically registered CUDA,
+// Metal, Vulkan, SYCL, RPC, …) exactly once, then enumerate what landed in the
+// registry so the rest of the EP can reason about available devices.
+void EnsureGgmlBackendsLoaded() {
+  static std::once_flag flag;
+  std::call_once(flag, [] {
+    ggml_backend_load_all();
+    const size_t dev_count = ggml_backend_dev_count();
+    std::fprintf(stderr, "[ggonnx] ggml backends available: %zu device(s)\n", dev_count);
+    for (size_t i = 0; i < dev_count; ++i) {
+      ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+      if (dev == nullptr) continue;
+      const char* name = ggml_backend_dev_name(dev);
+      const char* desc = ggml_backend_dev_description(dev);
+      const auto type = ggml_backend_dev_type(dev);
+      const char* type_str = "UNKNOWN";
+      switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:   type_str = "CPU";   break;
+        case GGML_BACKEND_DEVICE_TYPE_GPU:   type_str = "GPU";   break;
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:  type_str = "IGPU";  break;
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL: type_str = "ACCEL"; break;
+      }
+      std::fprintf(stderr, "[ggonnx]   [%zu] %s (%s) — %s\n", i,
+                   name != nullptr ? name : "?",
+                   type_str,
+                   desc != nullptr ? desc : "");
+    }
+  });
+}
+
+// Pick the "best" available ggml device when no explicit selection is given.
+// Ranking: GPU > IGPU > ACCEL > CPU.
+ggml_backend_dev_t AutoSelectPrimaryDevice() {
+  auto rank = [](enum ggml_backend_dev_type t) -> int {
+    switch (t) {
+      case GGML_BACKEND_DEVICE_TYPE_GPU:   return 3;
+      case GGML_BACKEND_DEVICE_TYPE_IGPU:  return 2;
+      case GGML_BACKEND_DEVICE_TYPE_ACCEL: return 1;
+      case GGML_BACKEND_DEVICE_TYPE_CPU:   return 0;
+    }
+    return -1;
+  };
+  ggml_backend_dev_t chosen = nullptr;
+  int best_rank = -1;
+  const size_t dev_count = ggml_backend_dev_count();
+  for (size_t i = 0; i < dev_count; ++i) {
+    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+    if (dev == nullptr) continue;
+    const int r = rank(ggml_backend_dev_type(dev));
+    if (r > best_rank) {
+      best_rank = r;
+      chosen = dev;
+    }
+  }
+  return chosen;
+}
+
+ggml_backend_dev_t GetCpuDevice() {
+  return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+}
+
+// Read a provider option set by the user through SessionOptionsAppendExecutionProvider_V2.
+// ORT stores these as session config entries under `ep.<ep_name>.<key>`.
+std::optional<std::string> LookupSessionConfig(const OrtSessionOptions* session_options,
+                                               const std::string& full_key) {
+  int has = 0;
+  OrtStatus* status = GetOrtApi().HasSessionConfigEntry(session_options, full_key.c_str(), &has);
+  if (status != nullptr) {
+    GetOrtApi().ReleaseStatus(status);
+    return std::nullopt;
+  }
+  if (!has) return std::nullopt;
+  size_t size = 0;
+  status = GetOrtApi().GetSessionConfigEntry(session_options, full_key.c_str(), nullptr, &size);
+  if (status != nullptr) {
+    GetOrtApi().ReleaseStatus(status);
+    return std::nullopt;
+  }
+  std::string value(size, '\0');
+  status = GetOrtApi().GetSessionConfigEntry(session_options, full_key.c_str(), value.data(), &size);
+  if (status != nullptr) {
+    GetOrtApi().ReleaseStatus(status);
+    return std::nullopt;
+  }
+  // `size` is the string length including the trailing null; strip it.
+  if (!value.empty() && value.back() == '\0') value.pop_back();
+  return value;
+}
+
+std::optional<std::string> GetEpOption(const OrtSessionOptions* session_options,
+                                       const char* key) {
+  if (session_options == nullptr || key == nullptr) return std::nullopt;
+  // Per ORT plugin-EP convention, options from SessionOptionsAppendExecutionProvider_V2
+  // land in session config under "ep.<lowercased_ep_name>.<key>".
+  return LookupSessionConfig(session_options, std::string("ep.ggmlexecutionprovider.") + key);
+}
+
+std::vector<std::string> SplitCsv(const std::string& in) {
+  std::vector<std::string> out;
+  std::string token;
+  std::istringstream iss(in);
+  while (std::getline(iss, token, ',')) {
+    // trim whitespace
+    const auto first = token.find_first_not_of(" \t");
+    const auto last = token.find_last_not_of(" \t");
+    if (first == std::string::npos) continue;
+    out.emplace_back(token.substr(first, last - first + 1));
+  }
+  return out;
+}
+
+bool ParseBoolOption(const std::string& value, bool default_value) {
+  if (value.empty()) return default_value;
+  if (value == "1" || value == "true" || value == "True" || value == "TRUE" || value == "on") return true;
+  if (value == "0" || value == "false" || value == "False" || value == "FALSE" || value == "off") return false;
+  return default_value;
+}
+
+// Turn user-provided options into a concrete BackendSelection. Unknown device
+// names are a hard error (typos surface loudly instead of silently downgrading).
+BackendSelection ResolveBackendSelection(const OrtSessionOptions* session_options) {
+  EnsureGgmlBackendsLoaded();
+
+  BackendSelection selection;
+  const auto device_list_opt = GetEpOption(session_options, "ggml_device_list");
+  const auto fallback_opt = GetEpOption(session_options, "enable_cpu_fallback");
+  const auto precision_opt = GetEpOption(session_options, "matmul_precision");
+  selection.enable_cpu_fallback = ParseBoolOption(fallback_opt.value_or(""), /*default=*/true);
+  if (precision_opt.has_value()) {
+    const std::string& p = *precision_opt;
+    if (p == "f32" || p == "fp32" || p == "float32") {
+      selection.force_matmul_f32 = true;
+    } else if (!p.empty() && p != "default") {
+      throw std::runtime_error("ep.ggonnx.matmul_precision: unknown value '" + p +
+                               "' (expected 'default' or 'f32')");
+    }
+  }
+
+  if (device_list_opt.has_value() && !device_list_opt->empty()) {
+    for (const std::string& name : SplitCsv(*device_list_opt)) {
+      ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+      if (dev == nullptr) {
+        throw std::runtime_error("ep.ggonnx.ggml_device_list: unknown ggml device name '" + name + "'");
+      }
+      selection.devices.push_back(dev);
+      selection.device_names.push_back(name);
+    }
+  } else {
+    ggml_backend_dev_t primary = AutoSelectPrimaryDevice();
+    if (primary != nullptr) {
+      selection.devices.push_back(primary);
+      const char* n = ggml_backend_dev_name(primary);
+      selection.device_names.emplace_back(n != nullptr ? n : "");
+    }
+  }
+
+  // Append CPU for fallback if requested and not already present.
+  if (selection.enable_cpu_fallback) {
+    ggml_backend_dev_t cpu = GetCpuDevice();
+    const bool already_have_cpu = cpu != nullptr &&
+        std::find(selection.devices.begin(), selection.devices.end(), cpu) != selection.devices.end();
+    if (cpu != nullptr && !already_have_cpu) {
+      selection.devices.push_back(cpu);
+      const char* n = ggml_backend_dev_name(cpu);
+      selection.device_names.emplace_back(n != nullptr ? n : "CPU");
+    }
+  }
+
+  if (selection.devices.empty()) {
+    // Last-resort: something must run. Force CPU.
+    ggml_backend_dev_t cpu = GetCpuDevice();
+    if (cpu != nullptr) {
+      selection.devices.push_back(cpu);
+      selection.device_names.emplace_back("CPU");
+    }
+  }
+  return selection;
 }
 
 bool IsSupportedHardwareDevice(const OrtHardwareDevice* device) {
@@ -254,17 +478,18 @@ size_t ConstantByteSize(const std::vector<int64_t>& dims) {
   return elementCount(dims) * sizeof(float);
 }
 
-// Copy ONNX float data into a ggml tensor according to `layout`. For AS_IS,
-// bytes are identical to ONNX (ggml col-major reinterpretation already flips
-// the dim order). For MATMUL_WEIGHT_TRANSPOSED, we physically transpose the
-// last two ONNX dims, so the resulting ggml tensor has ne[0]=K and is ready
-// to feed as the first arg of ggml_mul_mat.
+// Produce layout-transformed float bytes for a constant in a host-side buffer
+// so the caller can upload them to a backend via ggml_backend_tensor_set. For
+// AS_IS, bytes are identical to ONNX (ggml col-major reinterpretation already
+// flips the dim order). For MATMUL_WEIGHT_TRANSPOSED, we physically transpose
+// the last two ONNX dims, so the resulting ggml tensor has ne[0]=K and is
+// ready to feed as the first arg of ggml_mul_mat.
 void MaterializeConstantData(const float* src,
                              const std::vector<int64_t>& onnx_dims,
                              ConstantLayout layout,
-                             ggml_tensor* dst) {
+                             float* dst) {
   if (layout == ConstantLayout::AS_IS) {
-    std::memcpy(dst->data, src, ConstantByteSize(onnx_dims));
+    std::memcpy(dst, src, ConstantByteSize(onnx_dims));
     return;
   }
   GGONNX_ASSERT(onnx_dims.size() >= 2,
@@ -276,11 +501,10 @@ void MaterializeConstantData(const float* src,
   const int64_t N = onnx_dims[onnx_dims.size() - 1];
   int64_t batch = 1;
   for (size_t i = 0; i + 2 < onnx_dims.size(); ++i) batch *= onnx_dims[i];
-  float* out = static_cast<float*>(dst->data);
   // TODO: Optimize this aweful slow transpose
   for (int64_t b = 0; b < batch; ++b) {
     const float* src_mat = src + b * K * N;
-    float* dst_mat = out + b * K * N;
+    float* dst_mat = dst + b * K * N;
     for (int64_t k = 0; k < K; ++k) {
       for (int64_t n = 0; n < N; ++n) {
         dst_mat[n * K + k] = src_mat[k * N + n];
@@ -289,18 +513,29 @@ void MaterializeConstantData(const float* src,
   }
 }
 
-CompiledPartition CompilePartition(const OrtGraph* graph) {
+CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection& selection) {
   GGONNX_NOT_NULL(graph, "graph must not be null");
   const Ort::ConstGraph ort_graph{graph};
   MetaAnalysis meta_analysis = AnalyzeCompileTimeConstants(graph);
   SetActiveCompileTimeConstants(&meta_analysis.constants);
+  SetForceMatMulF32Precision(selection.force_matmul_f32);
   CompiledPartition partition;
   struct ActiveConstantsGuard {
-    ~ActiveConstantsGuard() { SetActiveCompileTimeConstants(nullptr); }
+    ~ActiveConstantsGuard() {
+      SetActiveCompileTimeConstants(nullptr);
+      SetForceMatMulF32Precision(false);
+    }
   } active_constants_guard;
 
-  partition.backend = ggml_backend_cpu_init();
-  GGONNX_NOT_NULL(partition.backend, "ggml_backend_cpu_init failed");
+  GGONNX_ASSERT(!selection.devices.empty(), "BackendSelection must contain at least one device");
+  partition.force_matmul_f32_prec = selection.force_matmul_f32;
+  partition.backends.reserve(selection.devices.size());
+  for (ggml_backend_dev_t dev : selection.devices) {
+    ggml_backend_t b = ggml_backend_dev_init(dev, /*params=*/nullptr);
+    GGONNX_NOT_NULL(b, std::string("ggml_backend_dev_init failed for device '") +
+                            (ggml_backend_dev_name(dev) ? ggml_backend_dev_name(dev) : "?") + "'");
+    partition.backends.push_back(b);
+  }
   std::unordered_map<std::string, size_t> value_ids;
   ConstantValueMap constants_by_name = meta_analysis.constants;
   // value_id -> chosen layout. Populated during node walking; first writer wins,
@@ -591,7 +826,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
 
     partition.constant_buffer =
         ggml_backend_alloc_ctx_tensors_from_buft(partition.constant_ctx,
-                                                 ggml_backend_get_default_buffer_type(partition.backend));
+                                                 ggml_backend_get_default_buffer_type(partition.primary_backend()));
     GGONNX_NOT_NULL(partition.constant_buffer, "ggml_backend_alloc_ctx_tensors_from_buft failed for constants");
     ggml_backend_buffer_set_usage(partition.constant_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
@@ -605,10 +840,24 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
                     "GGML constants must be float32");
 
       std::vector<float> materialized(elementCount(value.dims));
-      MaterializeConstantData(reinterpret_cast<const float*>(it->second.data.data()), value.dims, layout, t);
-      std::memcpy(materialized.data(), t->data, materialized.size() * sizeof(float));
+      MaterializeConstantData(reinterpret_cast<const float*>(it->second.data.data()),
+                              value.dims, layout, materialized.data());
       ggml_backend_tensor_set(t, materialized.data(), 0, materialized.size() * sizeof(float));
     }
+  }
+
+  // With >1 backends we need a scheduler to route per-op and to copy tensors
+  // across backends on demand. Single-backend partitions take the lighter
+  // direct path via ggml_backend_graph_compute.
+  if (partition.backends.size() > 1) {
+    const int n_backends = static_cast<int>(partition.backends.size());
+    partition.sched = ggml_backend_sched_new(partition.backends.data(),
+                                             /*bufts=*/nullptr,
+                                             n_backends,
+                                             GGML_DEFAULT_GRAPH_SIZE,
+                                             /*parallel=*/false,
+                                             /*op_offload=*/true);
+    GGONNX_NOT_NULL(partition.sched, "ggml_backend_sched_new failed");
   }
 
   return partition;
@@ -814,11 +1063,19 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
     }
 
     if (has_runtime_output) {
-      graph_state->gallocr =
-          ggml_gallocr_new(ggml_backend_get_default_buffer_type(partition.backend));
-      GGONNX_NOT_NULL(graph_state->gallocr, "ggml_gallocr_new failed");
-      GGONNX_ASSERT(ggml_gallocr_alloc_graph(graph_state->gallocr, graph_state->graph),
-                    "ggml_gallocr_alloc_graph failed");
+      if (partition.sched != nullptr) {
+        // Sched path: reset prior assignments (if any) and allocate compute
+        // buffers across all backends for this graph shape.
+        ggml_backend_sched_reset(partition.sched);
+        GGONNX_ASSERT(ggml_backend_sched_alloc_graph(partition.sched, graph_state->graph),
+                      "ggml_backend_sched_alloc_graph failed");
+      } else {
+        graph_state->gallocr =
+            ggml_gallocr_new(ggml_backend_get_default_buffer_type(partition.primary_backend()));
+        GGONNX_NOT_NULL(graph_state->gallocr, "ggml_gallocr_new failed");
+        GGONNX_ASSERT(ggml_gallocr_alloc_graph(graph_state->gallocr, graph_state->graph),
+                      "ggml_gallocr_alloc_graph failed");
+      }
     }
 
     g_debug_graph_build_count.fetch_add(1, std::memory_order_relaxed);
@@ -870,6 +1127,10 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
   const ShapeKey shape_key = MakeShapeKey(input_metadata);
   if (state.active_graph == nullptr || state.active_graph->key != shape_key) {
     DestroyMaterializedGraph(state.active_graph);
+    SetForceMatMulF32Precision(partition.force_matmul_f32_prec);
+    struct PrecisionGuard {
+      ~PrecisionGuard() { SetForceMatMulF32Precision(false); }
+    } precision_guard;
     state.active_graph = BuildMaterializedGraph(partition, shape_key, input_metadata);
   }
 
@@ -882,9 +1143,13 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
                           state.active_graph->input_tensors[i]);
   }
 
-  if (state.active_graph->graph != nullptr &&
-      ggml_backend_graph_compute(partition.backend, state.active_graph->graph) != GGML_STATUS_SUCCESS) {
-    throw std::runtime_error("ggml_backend_graph_compute failed");
+  if (state.active_graph->graph != nullptr) {
+    const ggml_status status = (partition.sched != nullptr)
+        ? ggml_backend_sched_graph_compute(partition.sched, state.active_graph->graph)
+        : ggml_backend_graph_compute(partition.primary_backend(), state.active_graph->graph);
+    if (status != GGML_STATUS_SUCCESS) {
+      throw std::runtime_error("ggml graph compute failed");
+    }
   }
 
   for (size_t i = 0; i < partition.graph_outputs.size(); ++i) {
@@ -1094,18 +1359,22 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
   });
 }
 
-OrtStatus* EpCompile(OrtEp* /*this_ptr*/,
+OrtStatus* EpCompile(OrtEp* this_ptr,
                      const OrtGraph** graphs,
                      const OrtNode** /*fused_nodes*/,
                      size_t count,
                      OrtNodeComputeInfo** node_compute_infos,
                      OrtNode** /*ep_context_nodes*/) noexcept {
   return WrapStatus([&] {
+    GGONNX_NOT_NULL(this_ptr, "ep must not be null");
     GGONNX_NOT_NULL(graphs, "graphs array must not be null");
     GGONNX_NOT_NULL(node_compute_infos, "node_compute_infos output array must not be null");
+    const GGMLEp* ep = AsEp(this_ptr);
+    GGONNX_NOT_NULL(ep->selection.get(), "ep selection must be populated before Compile");
+    const BackendSelection& selection = *ep->selection;
     for (size_t i = 0; i < count; ++i) {
       GGONNX_NOT_NULL(graphs[i], "graph entry must not be null");
-      auto compute_info = BuildNodeComputeInfo(CompilePartition(graphs[i]));
+      auto compute_info = BuildNodeComputeInfo(CompilePartition(graphs[i], selection));
       node_compute_infos[i] = &compute_info.release()->iface;
     }
   });
@@ -1187,15 +1456,26 @@ const char* EpGetName(const OrtEp* /*this_ptr*/) noexcept {
 
 OrtStatus* FactoryCreateEp(OrtEpFactory* /*this_ptr*/,
                            const OrtHardwareDevice* const* devices,
-                           const OrtKeyValuePairs* const* /*ep_metadata_pairs*/,
+                           const OrtKeyValuePairs* const* ep_metadata_pairs,
                            size_t num_devices,
-                           const OrtSessionOptions* /*session_options*/,
+                           const OrtSessionOptions* session_options,
                            const OrtLogger* logger,
                            OrtEp** ep) noexcept {
   return WrapStatus([&] {
     GGONNX_NOT_NULL(devices, "devices array must not be null");
     GGONNX_NOT_NULL(ep, "ep output must not be null");
+    (void)ep_metadata_pairs;
     auto impl = std::make_unique<GGMLEp>();
+    impl->selection = std::make_shared<BackendSelection>(ResolveBackendSelection(session_options));
+    // Log the resolved device list once per session create so users can see
+    // what ep.ggonnx.ggml_device_list / enable_cpu_fallback actually produced.
+    std::fprintf(stderr, "[ggonnx] session backend selection (cpu_fallback=%s, matmul_precision=%s):\n",
+                 impl->selection->enable_cpu_fallback ? "on" : "off",
+                 impl->selection->force_matmul_f32 ? "f32" : "default");
+    for (size_t i = 0; i < impl->selection->devices.size(); ++i) {
+      const char* n = ggml_backend_dev_name(impl->selection->devices[i]);
+      std::fprintf(stderr, "[ggonnx]   [%zu] %s\n", i, n != nullptr ? n : "?");
+    }
     impl->iface.ort_version_supported = ORT_API_VERSION;
     impl->iface.GetName = EpGetName;
     impl->iface.GetCapability = EpGetCapability;

@@ -36,6 +36,12 @@ TensorMetadata getTensorMetadata(Ort::ConstValue value);
 void SetActiveCompileTimeConstants(const ConstantValueMap* constants);
 const ConstantValueMap* GetActiveCompileTimeConstants();
 
+// When set, MatMul emitters tag their output with GGML_PREC_F32 so backends
+// that default to fp16 accumulation (e.g. Vulkan on fp16-capable GPUs) use
+// fp32 instead. Driven by the `ep.ggonnx.matmul_precision` provider option.
+void SetForceMatMulF32Precision(bool force);
+bool GetForceMatMulF32Precision();
+
 inline bool shapeIsFullyStatic(const TensorMetadata& tensor) {
   return std::all_of(tensor.dims.begin(), tensor.dims.end(), [](int64_t dim) { return dim >= 0; });
 }

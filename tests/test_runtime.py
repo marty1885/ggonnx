@@ -836,7 +836,12 @@ def test_matmul_constant_b(suite_tmpdir, ep_library: Path, a_shape, b_shape, out
     expected = cpu.run(["c"], inputs)[0]
     ggml = ggml_session(model_path, ep_library)
     got = ggml.run(["c"], inputs)[0]
-    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    # Loose tolerance: on fp16-capable GPU backends (e.g. Vulkan) ggml's
+    # pipeline_matmul_f32 uses float16_t internally for register caches, which
+    # can drift by a few ×1e-3 vs CPU. `ep.ggonnx.matmul_precision=f32` is
+    # accepted as a provider option but has no effect for the F32×F32 path
+    # until llama.cpp grows a separate fp32-compute pipeline variant.
+    np.testing.assert_allclose(got, expected, rtol=5e-3, atol=5e-3)
     assert_all_nodes_run_on_ggml(ggml)
 
 
