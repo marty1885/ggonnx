@@ -547,11 +547,10 @@ EmitResult EmitGRUNode(ggml_context* ctx,
 
   EmitOutputs outputs;
   if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
-    outputs.push_back(ggml_is_contiguous(y) ? y : ggml_cont(ctx, y));
+    outputs.push_back(y);
   }
   if (node.outputs.size() > 1 && node.outputs[1] != kOptionalValueAbsent) {
-    ggml_tensor* h_out = ggml_is_contiguous(h_t) ? h_t : ggml_cont(ctx, h_t);
-    outputs.push_back(ggml_reshape_3d(ctx, h_out, hidden_size, batch_size, 1));
+    outputs.push_back(ggml_reshape_3d(ctx, h_t, hidden_size, batch_size, 1));
   }
   return outputs;
 }
@@ -827,15 +826,13 @@ EmitResult EmitLSTMNode(ggml_context* ctx,
 
   EmitOutputs outputs;
   if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
-    outputs.push_back(ggml_is_contiguous(y) ? y : ggml_cont(ctx, y));
+    outputs.push_back(y);
   }
   if (node.outputs.size() > 1 && node.outputs[1] != kOptionalValueAbsent) {
-    ggml_tensor* h_out = ggml_is_contiguous(h_t) ? h_t : ggml_cont(ctx, h_t);
-    outputs.push_back(ggml_reshape_3d(ctx, h_out, hidden_size, batch_size, 1));
+    outputs.push_back(ggml_reshape_3d(ctx, h_t, hidden_size, batch_size, 1));
   }
   if (node.outputs.size() > 2 && node.outputs[2] != kOptionalValueAbsent) {
-    ggml_tensor* c_out = ggml_is_contiguous(c_t) ? c_t : ggml_cont(ctx, c_t);
-    outputs.push_back(ggml_reshape_3d(ctx, c_out, hidden_size, batch_size, 1));
+    outputs.push_back(ggml_reshape_3d(ctx, c_t, hidden_size, batch_size, 1));
   }
   return outputs;
 }
@@ -3055,17 +3052,15 @@ EmitResult EmitReduceMeanNode(ggml_context* ctx,
     int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
     for (int i = 0; i < k; ++i) out_ne[i] = 1;
     for (int i = k; i < GGML_MAX_DIMS; ++i) out_ne[i] = reduced->ne[i - k + 1];
-    ggml_tensor* cont = ggml_cont(ctx, reduced);
     return EmitOutputs{
-        ggml_reshape_4d(ctx, cont, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+        ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
   }
   // keepdims == 0: drop the leading size-1 axis by re-packing kept axes into
   // ggml positions [0..rank-k-1].
   int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
   for (int i = 0; i < GGML_MAX_DIMS - 1; ++i) out_ne[i] = reduced->ne[i + 1];
-  ggml_tensor* cont = ggml_cont(ctx, reduced);
   return EmitOutputs{
-      ggml_reshape_4d(ctx, cont, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+      ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
 }
 
 // ONNX DepthToSpace: [N, C, H, W] -> [N, C/b^2, H*b, W*b]. Two modes:

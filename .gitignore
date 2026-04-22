@@ -3,3 +3,5 @@ __pycache__
 build/
 .cache/
 .pytest_cache
+.claude
+.benchmark
