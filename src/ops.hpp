@@ -131,10 +131,11 @@ struct NodeDesc {
   struct PadAttrs {
     enum class Mode { Reflect, Constant };
     Mode mode{Mode::Reflect};
-    int pad_w_left{0};
-    int pad_w_right{0};
-    int pad_h_top{0};
-    int pad_h_bottom{0};
+    // Pads in ggml axis order (axis 0 = fastest-varying). Entries may be
+    // negative in constant mode (crop). Reflect mode is always non-negative
+    // and bounded by src size per axis.
+    std::array<int, GGML_MAX_DIMS> pad_begin{0, 0, 0, 0};
+    std::array<int, GGML_MAX_DIMS> pad_end{0, 0, 0, 0};
   };
   struct ConvTransposeAttrs {
     int stride{1};
@@ -179,6 +180,17 @@ struct NodeDesc {
     int blocksize{1};
     bool crd{false};  // false = DCR (ONNX default), true = CRD
   };
+  struct QKVSplitAttrs {
+    // Fuses Reshape([B*nw, M*M, 3C] -> [B*nw, M*M, 3, heads, head_dim]) ->
+    // Transpose(perm=[2,0,3,1,4]) -> Split(axis=0, splits=[1,1,1]) ->
+    // 3x Squeeze(axes=[0]). Each output lands at ggml rank-4
+    // ne=[head_dim, num_tokens, num_heads, num_batch] — the canonical attention
+    // Q/K/V layout — without ever materializing the rank-5 intermediates.
+    int64_t num_heads{};
+    int64_t head_dim{};
+    int64_t num_tokens{};
+    int64_t num_batch{};
+  };
   struct WindowShuffleAttrs {
     // Rank-6 intermediate ONNX dims (d0..d5) for a Reshape->Transpose(
     // perm=[0,1,3,2,4,5])->Reshape triple. The transpose swaps ONNX dims 2
@@ -219,7 +231,8 @@ struct NodeDesc {
                              ConvTransposeAttrs,
                              ExpandAttrs,
                              DepthToSpaceAttrs,
-                             WindowShuffleAttrs>;
+                             WindowShuffleAttrs,
+                             QKVSplitAttrs>;
 
   std::string op_type;
   std::string domain;
@@ -265,14 +278,31 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
 struct FusionPlan {
   // Anchor node key (output-or-name of the Transpose) -> fused attrs.
   std::unordered_map<std::string, NodeDesc::WindowShuffleAttrs> window_shuffle_anchors;
-  // Keyed by anchor node key; the value names to wire as synthetic input/output.
+  // Anchor node key (the Split) -> fused QKV split attrs. Produces three
+  // rank-4 outputs from one rank-3 input, bypassing the rank-5 intermediates.
+  std::unordered_map<std::string, NodeDesc::QKVSplitAttrs> qkv_split_anchors;
+  // Anchor node key (the rank-5 Add) -> rank-reduced mask ONNX dims. Fuses
+  // Reshape(rank-4 -> rank-5) -> Add(rank-5, constant mask) -> Reshape(back).
+  // The mask is materialized at its rank-reduced shape — its bytes are
+  // unchanged because only size-1 ONNX axes get dropped.
+  std::unordered_map<std::string, std::vector<int64_t>> window_mask_add_anchors;
+  // Keyed by anchor node key; the value names to wire as synthetic
+  // input(s)/output(s). Both vectors have N entries depending on the fusion
+  // — __WindowShuffle: 1 input, 1 output; __QKVSplit: 1 input, 3 outputs;
+  // __WindowMaskAdd: 2 inputs (X, mask), 1 output.
   struct AnchorIO {
-    std::string input_value;   // first input of the leading Reshape
-    std::string output_value;  // output of the trailing Reshape
+    std::vector<std::string> input_values;
+    std::vector<std::string> output_values;
     std::string anchor_node_name;  // for the synthetic NodeDesc.name
   };
   std::unordered_map<std::string, AnchorIO> anchor_io;
-  // Node keys of the two Reshape nodes consumed by the fusion (skipped entirely
-  // during partition compile — their rank-6 outputs never become ggml values).
+  // Node keys consumed by a fusion (skipped entirely during partition compile —
+  // their high-rank outputs never become ggml values).
   std::unordered_set<std::string> consumed_nodes;
+  // Value-name -> rank-reduced ONNX dims. Used when a constant initializer
+  // that ORT exposes at rank > 4 is actually consumed by a fusion that only
+  // needs the rank-reduced view (e.g. __WindowMaskAdd). The byte layout is
+  // unchanged — only size-1 ONNX axes are dropped — so the existing constant
+  // materializer can copy straight through.
+  std::unordered_map<std::string, std::vector<int64_t>> constant_override_dims;
 };

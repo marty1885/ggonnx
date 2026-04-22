@@ -375,14 +375,6 @@ def test_waifu2x_cunet_matches_cpu(ep_library: Path) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "waifu2x swin_unet still falls back to CPU for Reshape/Transpose/"
-        "Squeeze/Pad/Split/Erf/Add/DepthToSpace and the GGML-partitioned "
-        "result does not yet match CPU"
-    ),
-)
 def test_waifu2x_swin_unet_matches_cpu(ep_library: Path) -> None:
     raw_path = cached_model_path(
         "waifu2x_swin_unet_art_noise0_scale2x.onnx",

@@ -304,7 +304,14 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
 
   auto ensure_value = [&](Ort::ConstValueInfo value_info) -> size_t {
     const std::string name = value_info.GetName();
-    const TensorMetadata metadata = getTensorMetadata(value_info);
+    TensorMetadata metadata = getTensorMetadata(value_info);
+    // Fusion-reduced constants: ORT exposes the original rank but the fusion
+    // only uses the rank-reduced view. Substitute the reduced dims here so
+    // the rank assert passes and downstream bookkeeping agrees.
+    const auto override_it = meta_analysis.fusions.constant_override_dims.find(name);
+    if (override_it != meta_analysis.fusions.constant_override_dims.end()) {
+      metadata.dims = override_it->second;
+    }
     if (metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
       GGONNX_ASSERT(rankSupportedByGGML(metadata),
                     "compiled partition requires tensor rank <= " + std::to_string(GGML_MAX_DIMS) +
@@ -410,12 +417,59 @@ CompiledPartition CompilePartition(const OrtGraph* graph) {
       compiled_node.domain = "";
       compiled_node.name = io.anchor_node_name;
       compiled_node.attrs = attrs;
-      Ort::ConstValueInfo in_vi = find_value_info_for(io.input_value);
-      Ort::ConstValueInfo out_vi = find_value_info_for(io.output_value);
+      GGONNX_ASSERT(io.input_values.size() == 1 && io.output_values.size() == 1,
+                    "window-shuffle fusion must have one input and one output");
+      Ort::ConstValueInfo in_vi = find_value_info_for(io.input_values[0]);
+      Ort::ConstValueInfo out_vi = find_value_info_for(io.output_values[0]);
       GGONNX_ASSERT(in_vi != nullptr && out_vi != nullptr,
                     "window-shuffle fusion input/output value_info not found");
       compiled_node.inputs.push_back(ensure_value(in_vi));
       compiled_node.outputs.push_back(ensure_value(out_vi));
+      partition.nodes.push_back(std::move(compiled_node));
+      continue;
+    }
+    if (meta_analysis.fusions.window_mask_add_anchors.count(node_key) > 0) {
+      const auto& io = meta_analysis.fusions.anchor_io.at(node_key);
+      GGONNX_ASSERT(io.input_values.size() == 2 && io.output_values.size() == 1,
+                    "window-mask-add fusion must have two inputs and one output");
+      Ort::ConstValueInfo x_vi = find_value_info_for(io.input_values[0]);
+      Ort::ConstValueInfo mask_vi = find_value_info_for(io.input_values[1]);
+      Ort::ConstValueInfo out_vi = find_value_info_for(io.output_values[0]);
+      GGONNX_ASSERT(x_vi != nullptr && mask_vi != nullptr && out_vi != nullptr,
+                    "window-mask-add fusion input/output value_info not found");
+      NodeDesc compiled_node;
+      compiled_node.op_type = "Add";
+      compiled_node.domain = "";
+      compiled_node.name = io.anchor_node_name;
+      const size_t x_id = ensure_value(x_vi);
+      const size_t mask_id = ensure_value(mask_vi);
+      const size_t out_id = ensure_value(out_vi);
+      compiled_node.inputs.push_back(x_id);
+      compiled_node.inputs.push_back(mask_id);
+      compiled_node.outputs.push_back(out_id);
+      // Mask is always a compile-time constant for this fusion.
+      record_constant_use(mask_id, ConstantLayout::AS_IS);
+      partition.nodes.push_back(std::move(compiled_node));
+      continue;
+    }
+    if (meta_analysis.fusions.qkv_split_anchors.count(node_key) > 0) {
+      const auto& attrs = meta_analysis.fusions.qkv_split_anchors.at(node_key);
+      const auto& io = meta_analysis.fusions.anchor_io.at(node_key);
+      NodeDesc compiled_node;
+      compiled_node.op_type = "__QKVSplit";
+      compiled_node.domain = "";
+      compiled_node.name = io.anchor_node_name;
+      compiled_node.attrs = attrs;
+      GGONNX_ASSERT(io.input_values.size() == 1 && io.output_values.size() == 3,
+                    "qkv-split fusion must have one input and three outputs");
+      Ort::ConstValueInfo in_vi = find_value_info_for(io.input_values[0]);
+      GGONNX_ASSERT(in_vi != nullptr, "qkv-split fusion input value_info not found");
+      compiled_node.inputs.push_back(ensure_value(in_vi));
+      for (const std::string& name : io.output_values) {
+        Ort::ConstValueInfo out_vi = find_value_info_for(name);
+        GGONNX_ASSERT(out_vi != nullptr, "qkv-split fusion output value_info not found");
+        compiled_node.outputs.push_back(ensure_value(out_vi));
+      }
       partition.nodes.push_back(std::move(compiled_node));
       continue;
     }
@@ -1002,7 +1056,10 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
 
     for (Ort::ConstNode node : ort_graph.GetNodes()) {
       const std::string key = NodeKey(node);
-      const bool is_fusion_anchor = meta_analysis.fusions.window_shuffle_anchors.count(key) > 0;
+      const bool is_fusion_anchor =
+          meta_analysis.fusions.window_shuffle_anchors.count(key) > 0 ||
+          meta_analysis.fusions.qkv_split_anchors.count(key) > 0 ||
+          meta_analysis.fusions.window_mask_add_anchors.count(key) > 0;
       const bool is_fusion_consumed = meta_analysis.fusions.consumed_nodes.count(key) > 0;
       const bool supported =
           (isNodeSupported(node) || is_fusion_anchor) && has_visible_output(node);

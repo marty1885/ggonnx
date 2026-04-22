@@ -1892,36 +1892,30 @@ bool IsSupportedPadNode(Ort::ConstNode node) {
     return false;
   }
 
-  if ((*pads)[0] != 0 || (*pads)[1] != 0 || (*pads)[4] != 0 || (*pads)[5] != 0) {
-    return false;
+  // Per-ONNX-axis validation. Pad can be nonzero on any subset of axes; reflect
+  // mode additionally requires non-negative pads strictly smaller than the src
+  // length along each active axis.
+  const int rank = static_cast<int>(x.dims.size());
+  int active_axes = 0;
+  for (int a = 0; a < rank; ++a) {
+    const int64_t begin = (*pads)[a];
+    const int64_t end = (*pads)[a + rank];
+    if (begin == 0 && end == 0) continue;
+    ++active_axes;
+    if (mode == "reflect" && (begin < 0 || end < 0)) return false;
+    if (x.dims[a] < 0) continue;  // unresolved dim: trust the export
+    if (begin + end + x.dims[a] <= 0) return false;
+    if (mode == "reflect" && (begin >= x.dims[a] || end >= x.dims[a])) return false;
   }
-  if (mode == "reflect" &&
-      ((*pads)[2] < 0 || (*pads)[3] < 0 || (*pads)[6] < 0 || (*pads)[7] < 0)) {
-    return false;
-  }
-  // Negative pads (cropping) are accepted for constant mode, but only as long
-  // as they don't shrink the spatial dim below 1.
-  if (x.dims[2] >= 0 &&
-      static_cast<int64_t>((*pads)[2] + (*pads)[6]) + x.dims[2] <= 0) {
-    return false;
-  }
-  if (x.dims[3] >= 0 &&
-      static_cast<int64_t>((*pads)[3] + (*pads)[7]) + x.dims[3] <= 0) {
-    return false;
-  }
+  // Reflect support is 1D in ggml, so we pad one axis at a time; ≤ 2 active
+  // axes keeps the emitted sequence short. Constant mode uses ggml_pad_ext in
+  // one shot and already tolerates any axis set — keep the same cap for
+  // simplicity.
+  if (active_axes > 2) return false;
 
-  if (mode == "reflect") {
-    // ggml_pad_reflect_1d requires the pad amount to be strictly less than the
-    // source length — anything equal or larger would reflect past the edge.
-    if (x.dims[2] >= 0 && ((*pads)[2] >= x.dims[2] || (*pads)[6] >= x.dims[2])) {
-      return false;
-    }
-    if (x.dims[3] >= 0 && ((*pads)[3] >= x.dims[3] || (*pads)[7] >= x.dims[3])) {
-      return false;
-    }
-  } else {
-    // constant mode: only zero fill is supported. Accept an absent constant
-    // input or one that folds to a single zero float.
+  if (mode == "constant") {
+    // Only zero fill is supported. Accept an absent constant input or one
+    // that folds to a single zero float.
     const auto node_inputs = node.GetInputs();
     if (node_inputs.size() >= 3 && node_inputs[2] != nullptr) {
       const auto v = readConstantInputArray<float>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
@@ -1939,15 +1933,21 @@ void CompilePadAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
   const auto pads = readPadVector(node);
   GGONNX_ASSERT(pads.has_value() && pads->size() == 8,
                 "Pad node must provide 8-element pads");
+  const auto inputs = node.GetInputs();
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const int rank = static_cast<int>(x.dims.size());
   const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("constant");
-  compiled_node->attrs = NodeDesc::PadAttrs{
-      .mode = mode == "reflect" ? NodeDesc::PadAttrs::Mode::Reflect
-                                : NodeDesc::PadAttrs::Mode::Constant,
-      .pad_w_left = static_cast<int>((*pads)[3]),
-      .pad_w_right = static_cast<int>((*pads)[7]),
-      .pad_h_top = static_cast<int>((*pads)[2]),
-      .pad_h_bottom = static_cast<int>((*pads)[6]),
-  };
+
+  NodeDesc::PadAttrs attrs;
+  attrs.mode = mode == "reflect" ? NodeDesc::PadAttrs::Mode::Reflect
+                                 : NodeDesc::PadAttrs::Mode::Constant;
+  // ONNX axis a maps to ggml axis (rank-1-a).
+  for (int a = 0; a < rank; ++a) {
+    const int ggml_axis = rank - 1 - a;
+    attrs.pad_begin[ggml_axis] = static_cast<int>((*pads)[a]);
+    attrs.pad_end[ggml_axis] = static_cast<int>((*pads)[a + rank]);
+  }
+  compiled_node->attrs = attrs;
 }
 
 EmitResult EmitPadNode(ggml_context* ctx,
@@ -1964,40 +1964,65 @@ EmitResult EmitPadNode(ggml_context* ctx,
 
   ggml_tensor* out = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
   if (attrs->mode == NodeDesc::PadAttrs::Mode::Constant) {
-    const int crop_w_left = std::max(0, -attrs->pad_w_left);
-    const int crop_w_right = std::max(0, -attrs->pad_w_right);
-    const int crop_h_top = std::max(0, -attrs->pad_h_top);
-    const int crop_h_bottom = std::max(0, -attrs->pad_h_bottom);
-    if (crop_w_left || crop_w_right || crop_h_top || crop_h_bottom) {
-      const int64_t new_w = out->ne[0] - crop_w_left - crop_w_right;
-      const int64_t new_h = out->ne[1] - crop_h_top - crop_h_bottom;
-      GGONNX_ASSERT(new_w > 0 && new_h > 0, "Pad crop produced non-positive size");
+    // Crop phase (negative pads) via a 4D view + cont.
+    std::array<int, GGML_MAX_DIMS> crop_begin{};
+    std::array<int, GGML_MAX_DIMS> crop_end{};
+    bool any_crop = false;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+      crop_begin[i] = std::max(0, -attrs->pad_begin[i]);
+      crop_end[i] = std::max(0, -attrs->pad_end[i]);
+      any_crop = any_crop || crop_begin[i] || crop_end[i];
+    }
+    if (any_crop) {
+      std::array<int64_t, GGML_MAX_DIMS> new_ne{};
+      for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        new_ne[i] = out->ne[i] - crop_begin[i] - crop_end[i];
+        GGONNX_ASSERT(new_ne[i] > 0, "Pad crop produced non-positive size");
+      }
+      size_t offset = 0;
+      for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        offset += static_cast<size_t>(crop_begin[i]) * out->nb[i];
+      }
       ggml_tensor* cropped = ggml_view_4d(
-          ctx, out, new_w, new_h, out->ne[2], out->ne[3],
-          out->nb[1], out->nb[2], out->nb[3],
-          static_cast<size_t>(crop_w_left) * out->nb[0] +
-              static_cast<size_t>(crop_h_top) * out->nb[1]);
+          ctx, out, new_ne[0], new_ne[1], new_ne[2], new_ne[3],
+          out->nb[1], out->nb[2], out->nb[3], offset);
       out = ggml_cont(ctx, cropped);
     }
-    const int pad_w_left = std::max(0, attrs->pad_w_left);
-    const int pad_w_right = std::max(0, attrs->pad_w_right);
-    const int pad_h_top = std::max(0, attrs->pad_h_top);
-    const int pad_h_bottom = std::max(0, attrs->pad_h_bottom);
-    if (pad_w_left || pad_w_right || pad_h_top || pad_h_bottom) {
+    // Positive-pad phase: ggml_pad_ext fills with zeros on any axis set.
+    std::array<int, GGML_MAX_DIMS> pos_begin{};
+    std::array<int, GGML_MAX_DIMS> pos_end{};
+    bool any_pad = false;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+      pos_begin[i] = std::max(0, attrs->pad_begin[i]);
+      pos_end[i] = std::max(0, attrs->pad_end[i]);
+      any_pad = any_pad || pos_begin[i] || pos_end[i];
+    }
+    if (any_pad) {
       out = ggml_pad_ext(ctx, out,
-                         pad_w_left, pad_w_right,
-                         pad_h_top, pad_h_bottom,
-                         0, 0, 0, 0);
+                         pos_begin[0], pos_end[0],
+                         pos_begin[1], pos_end[1],
+                         pos_begin[2], pos_end[2],
+                         pos_begin[3], pos_end[3]);
     }
     return EmitOutputs{out};
   }
-  if (attrs->pad_w_left != 0 || attrs->pad_w_right != 0) {
-    out = ggml_pad_reflect_1d(ctx, out, attrs->pad_w_left, attrs->pad_w_right);
-  }
-  if (attrs->pad_h_top != 0 || attrs->pad_h_bottom != 0) {
-    ggml_tensor* swapped = ggml_cont(ctx, ggml_permute(ctx, out, 1, 0, 2, 3));
-    swapped = ggml_pad_reflect_1d(ctx, swapped, attrs->pad_h_top, attrs->pad_h_bottom);
-    out = ggml_cont(ctx, ggml_permute(ctx, swapped, 1, 0, 2, 3));
+  // Reflect mode: ggml_pad_reflect_1d works on ggml axis 0 only. For any other
+  // active axis, rotate it into axis 0 with ggml_permute + ggml_cont, pad,
+  // and rotate back.
+  for (int axis = 0; axis < GGML_MAX_DIMS; ++axis) {
+    const int begin = attrs->pad_begin[axis];
+    const int end = attrs->pad_end[axis];
+    if (begin == 0 && end == 0) continue;
+    if (axis == 0) {
+      out = ggml_pad_reflect_1d(ctx, out, begin, end);
+      continue;
+    }
+    std::array<int, GGML_MAX_DIMS> perm{0, 1, 2, 3};
+    std::swap(perm[0], perm[axis]);
+    ggml_tensor* rotated =
+        ggml_cont(ctx, ggml_permute(ctx, out, perm[0], perm[1], perm[2], perm[3]));
+    rotated = ggml_pad_reflect_1d(ctx, rotated, begin, end);
+    out = ggml_cont(ctx, ggml_permute(ctx, rotated, perm[0], perm[1], perm[2], perm[3]));
   }
 
   return EmitOutputs{out};
@@ -3033,6 +3058,60 @@ EmitResult EmitWindowShuffleNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
+// Synthetic op: fused Reshape([B, M*M, 3C]->[B, M*M, 3, H, D]) ->
+// Transpose(perm=[2,0,3,1,4]) -> Split(axis=0) -> 3x Squeeze(axes=[0]).
+// The rank-5 intermediates never materialize: we reinterpret the packed input
+// as rank-4 ne=[D, 3H, M*M, B], take Q/K/V as strided views at offsets
+// {0, H*D, 2*H*D} scalars into that buffer, and swap the heads/tokens axes
+// to land at the canonical attention layout ne=[D, M*M, H, B]. The final cont
+// matches what a downstream ggml_mul_mat would already pay for.
+EmitResult EmitQKVSplitNode(ggml_context* ctx,
+                            const NodeDesc& node,
+                            const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::QKVSplitAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled __QKVSplit node missing attributes");
+  GGONNX_ASSERT(node.inputs.size() == 1 && node.outputs.size() == 3,
+                "compiled __QKVSplit node has invalid arity");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled __QKVSplit node missing GGML input");
+
+  const int64_t H = attrs->num_heads;
+  const int64_t D = attrs->num_heads > 0 ? attrs->head_dim : 0;
+  const int64_t T = attrs->num_tokens;
+  const int64_t B = attrs->num_batch;
+  GGONNX_ASSERT(H > 0 && D > 0 && T > 0 && B > 0,
+                "QKVSplit dims must be positive");
+
+  // Collapse the input to a contiguous rank-4 view [D, 3H, T, B]. The input is
+  // produced by a Gemm/MatMul so it's normally contiguous; the cont guards
+  // against a non-standard producer.
+  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+  ggml_tensor* packed = ggml_reshape_4d(ctx, src, D, 3 * H, T, B);
+
+  const size_t type_size = ggml_type_size(packed->type);
+  const size_t nb1 = static_cast<size_t>(packed->nb[1]);
+  const size_t nb2 = static_cast<size_t>(packed->nb[2]);
+  const size_t nb3 = static_cast<size_t>(packed->nb[3]);
+  // Q/K/V slice offsets along the packed `3H` axis.
+  const std::array<size_t, 3> offsets{
+      0,
+      static_cast<size_t>(H) * D * type_size,
+      2 * static_cast<size_t>(H) * D * type_size,
+  };
+
+  EmitOutputs out;
+  out.reserve(3);
+  for (size_t i = 0; i < 3; ++i) {
+    // View of shape [D, H, T, B] starting at the i-th QKV chunk.
+    ggml_tensor* view = ggml_view_4d(ctx, packed, D, H, T, B, nb1, nb2, nb3, offsets[i]);
+    // Swap heads <-> tokens so the output is [D, T, H, B].
+    ggml_tensor* permuted = ggml_permute(ctx, view, 0, 2, 1, 3);
+    out.push_back(ggml_cont(ctx, permuted));
+  }
+  return out;
+}
+
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type) {
 
   struct PairHash {
@@ -3097,6 +3176,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       // null because the fusion machinery builds the NodeDesc directly and the
       // per-node support check is never called on __WindowShuffle.
       {{"", "__WindowShuffle"}, {nullptr, nullptr, EmitWindowShuffleNode}},
+      {{"", "__QKVSplit"}, {nullptr, nullptr, EmitQKVSplitNode}},
   };
 
   auto it = ops_table.find({domain, op_type});

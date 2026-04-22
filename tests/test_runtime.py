@@ -604,8 +604,14 @@ def test_single_global_pool(suite_tmpdir, ep_library: Path, op_type, x_shape, y_
 @pytest.mark.parametrize(
     "x_shape,y_shape,pads",
     [
+        # NCHW spatial pads (axes 2,3)
         ((1, 1, 4, 5), (1, 1, 6, 7), [0, 0, 1, 1, 0, 0, 1, 1]),
         ((1, 2, 6, 6), (1, 2, 14, 14), [0, 0, 4, 4, 0, 0, 4, 4]),
+        # NHWC-style: pads on axes 1,2 — exercises the axis-agnostic path added
+        # for waifu2x swin_unet. Reflect requires pads < source dim per axis.
+        ((1, 5, 6, 3), (1, 7, 8, 3), [0, 1, 1, 0, 0, 1, 1, 0]),
+        # Single non-innermost axis only — exercises the permute+cont rotation.
+        ((2, 3, 4, 5), (2, 5, 4, 5), [0, 1, 0, 0, 0, 1, 0, 0]),
     ],
 )
 def test_single_pad_reflect(suite_tmpdir, ep_library: Path, variant, x_shape, y_shape, pads) -> None:
@@ -631,6 +637,14 @@ def test_single_pad_reflect(suite_tmpdir, ep_library: Path, variant, x_shape, y_
         ((1, 3, 16, 16), (1, 3, 8, 8), [0, 0, -4, -4, 0, 0, -4, -4]),
         # mixed pad + crop per spatial dim
         ((1, 2, 6, 6), (1, 2, 5, 8), [0, 0, -1, 1, 0, 0, 0, 1]),
+        # NHWC-style: pads on ONNX axes 1,2 (H,W) with axes 0,3 (B,C) untouched.
+        # This is the waifu2x swin_unet window-partition pad pattern and drives
+        # the axis-agnostic Pad support.
+        ((1, 4, 4, 3), (1, 6, 5, 3), [0, 1, 1, 0, 0, 1, 0, 0]),
+        # NHWC with end-only pads (no begin-side pad anywhere).
+        ((2, 7, 7, 5), (2, 9, 9, 5), [0, 0, 0, 0, 0, 2, 2, 0]),
+        # Single non-spatial axis pad — axis 0.
+        ((1, 2, 3, 3), (3, 2, 3, 3), [1, 0, 0, 0, 1, 0, 0, 0]),
     ],
 )
 def test_single_pad_constant(suite_tmpdir, ep_library: Path, x_shape, y_shape, pads) -> None:
@@ -1414,4 +1428,142 @@ def test_single_gru_matches_cpu(suite_tmpdir, ep_library: Path) -> None:
     ggml_y, ggml_y_h = ggml.run(["y", "y_h"], inputs)
     np.testing.assert_allclose(ggml_y, cpu_y, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(ggml_y_h, cpu_y_h, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+# ----------------------------------------------------------------------------
+# Fusion tests: patterns that individually contain rank-5 intermediates
+# unsupported by ggml. The fact that these run at all (no ORT CPU fallback)
+# proves the fusion detector found + rewired them. `assert_all_nodes_run_on_ggml`
+# pins that property down.
+# ----------------------------------------------------------------------------
+
+
+def build_qkv_split_model(tmpdir: Path, batch: int, tokens: int, heads: int, head_dim: int) -> Path:
+    # Packed QKV: [B, T, 3*H*D] -> Reshape [B, T, 3, H, D]
+    #   -> Transpose(perm=[2,0,3,1,4])
+    #   -> 3x Gather(axis=0, scalar index) -> [B, H, T, D] per Q/K/V.
+    # Each Gather output is squared and summed into `y` so the test exercises
+    # real use of the three tensors.
+    x_shape = [batch, tokens, 3 * heads * head_dim]
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, x_shape)
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [batch, heads, tokens, head_dim])
+
+    rshape = helper.make_tensor(
+        "rshape", TensorProto.INT64, [5], [batch, tokens, 3, heads, head_dim]
+    )
+    idx0 = helper.make_tensor("idx0", TensorProto.INT64, [], [0])
+    idx1 = helper.make_tensor("idx1", TensorProto.INT64, [], [1])
+    idx2 = helper.make_tensor("idx2", TensorProto.INT64, [], [2])
+
+    nodes = [
+        helper.make_node("Reshape", ["x", "rshape"], ["r_out"], name="r"),
+        helper.make_node("Transpose", ["r_out"], ["t_out"], name="t", perm=[2, 0, 3, 1, 4]),
+        helper.make_node("Gather", ["t_out", "idx0"], ["q"], name="gq", axis=0),
+        helper.make_node("Gather", ["t_out", "idx1"], ["k"], name="gk", axis=0),
+        helper.make_node("Gather", ["t_out", "idx2"], ["v"], name="gv", axis=0),
+        # Combine to force all three to be used.
+        helper.make_node("Mul", ["q", "q"], ["q2"], name="mq"),
+        helper.make_node("Mul", ["k", "k"], ["k2"], name="mk"),
+        helper.make_node("Mul", ["v", "v"], ["v2"], name="mv"),
+        helper.make_node("Add", ["q2", "k2"], ["qk"], name="aqk"),
+        helper.make_node("Add", ["qk", "v2"], ["y"], name="ayv"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "qkv_split_fusion",
+        [x],
+        [y],
+        initializer=[rshape, idx0, idx1, idx2],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "batch,tokens,heads,head_dim",
+    [
+        (2, 9, 4, 8),
+        (1, 16, 6, 16),
+    ],
+)
+def test_qkv_split_fusion_matches_cpu(
+    suite_tmpdir, ep_library: Path, batch: int, tokens: int, heads: int, head_dim: int
+) -> None:
+    model_path = build_qkv_split_model(suite_tmpdir, batch, tokens, heads, head_dim)
+    rng = np.random.default_rng(7)
+    inputs = {
+        "x": rng.standard_normal((batch, tokens, 3 * heads * head_dim)).astype(np.float32)
+    }
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+    # Without the fusion the rank-5 Transpose output would force ORT to bounce
+    # to CPU — this assertion pins the fusion behaviour.
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_window_mask_add_model(
+    tmpdir: Path, batch: int, num_windows: int, heads: int, tokens: int
+) -> Path:
+    # Score tensor: [B*nw, H, T, T].
+    # Fuse:
+    #   Reshape -> [B, nw, H, T, T]   (rank 5, unsupported by ggml alone)
+    #   Add with mask [1, nw, 1, T, T]
+    #   Reshape back -> [B*nw, H, T, T]
+    # The detector drops the leading size-1 ONNX axis of the mask, leaving
+    # [nw, 1, T, T] which broadcasts into [B*nw, H, T, T] natively.
+    bnw = batch * num_windows
+    x_shape = [bnw, heads, tokens, tokens]
+    y_shape = x_shape
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, x_shape)
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, y_shape)
+
+    split_shape = helper.make_tensor(
+        "split_shape", TensorProto.INT64, [5], [batch, num_windows, heads, tokens, tokens]
+    )
+    merge_shape = helper.make_tensor("merge_shape", TensorProto.INT64, [4], y_shape)
+    rng = np.random.default_rng(123)
+    mask_np = rng.standard_normal((1, num_windows, 1, tokens, tokens)).astype(np.float32)
+    mask_init = helper.make_tensor(
+        "mask", TensorProto.FLOAT, list(mask_np.shape), mask_np.flatten().tolist()
+    )
+
+    nodes = [
+        helper.make_node("Reshape", ["x", "split_shape"], ["x5"], name="r1"),
+        helper.make_node("Add", ["x5", "mask"], ["x5m"], name="a"),
+        helper.make_node("Reshape", ["x5m", "merge_shape"], ["y"], name="r2"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "window_mask_add_fusion",
+        [x],
+        [y],
+        initializer=[split_shape, merge_shape, mask_init],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "batch,num_windows,heads,tokens",
+    [
+        (2, 5, 3, 4),
+        (3, 7, 6, 6),
+    ],
+)
+def test_window_mask_add_fusion_matches_cpu(
+    suite_tmpdir, ep_library: Path, batch: int, num_windows: int, heads: int, tokens: int
+) -> None:
+    model_path = build_window_mask_add_model(suite_tmpdir, batch, num_windows, heads, tokens)
+    rng = np.random.default_rng(11)
+    inputs = {
+        "x": rng.standard_normal((batch * num_windows, heads, tokens, tokens)).astype(np.float32)
+    }
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
     assert_all_nodes_run_on_ggml(ggml)

@@ -16,6 +16,11 @@ using ggonnx::ort_internal::GetOrtApi;
 using ggonnx::ort_internal::THROW_ON_ERROR;
 
 constexpr size_t kMaxFoldedElements = 256;
+// Raw initializers live on disk/in ORT memory already; loading them into the
+// constants map is a bounded duplication, not an unbounded compute. The
+// tighter kMaxFoldedElements still guards derived folds (Tile/Expand/etc.)
+// so they can't synthesize huge tensors.
+constexpr size_t kMaxInitializerElements = 1 << 20;  // 1M elements (~4 MB f32)
 
 size_t ByteWidth(ONNXTensorElementDataType element_type) {
   switch (element_type) {
@@ -46,6 +51,10 @@ bool IsFoldableDType(ONNXTensorElementDataType element_type) {
 
 bool FitsFoldLimit(const std::vector<int64_t>& dims) {
   return ElementCount(dims) <= kMaxFoldedElements;
+}
+
+bool FitsInitializerLimit(const std::vector<int64_t>& dims) {
+  return ElementCount(dims) <= kMaxInitializerElements;
 }
 
 template <typename T>
@@ -79,7 +88,7 @@ ConstantTensor LoadInitializer(Ort::ConstValue value) {
   const TensorMetadata meta = getTensorMetadata(value);
   GGONNX_ASSERT(IsFoldableDType(meta.element_type),
                 "unsupported initializer dtype for compile-time folding");
-  GGONNX_ASSERT(FitsFoldLimit(meta.dims),
+  GGONNX_ASSERT(FitsInitializerLimit(meta.dims),
                 "initializer too large for compile-time folding");
   const size_t bytes = ElementCount(meta.dims) * ByteWidth(meta.element_type);
   const void* src = nullptr;
@@ -1171,14 +1180,357 @@ void DetectWindowShuffleFusions(const Ort::ConstGraph& ort_graph,
     attrs.output_onnx_dims = *r2_resolved;
 
     FusionPlan::AnchorIO io;
-    io.input_value = std::string(r1_inputs[0].GetName());
-    io.output_value = std::string(r2_outputs[0].GetName());
+    io.input_values.push_back(std::string(r1_inputs[0].GetName()));
+    io.output_values.push_back(std::string(r2_outputs[0].GetName()));
     io.anchor_node_name = std::string(trans.GetName());
 
     plan.window_shuffle_anchors.emplace(anchor_key, std::move(attrs));
     plan.anchor_io.emplace(anchor_key, std::move(io));
     plan.consumed_nodes.insert(r1_key);
     plan.consumed_nodes.insert(r2_key);
+  }
+}
+
+std::optional<int64_t> ReadInt64Attr(Ort::ConstNode node, const char* name) {
+  Ort::ConstOpAttr attr{nullptr};
+  const Ort::Status status = node.GetAttributeByName(name, attr);
+  if (!status.IsOK() || attr == nullptr) return std::nullopt;
+  int64_t value{};
+  Ort::ThrowOnError(attr.GetValue(value));
+  return value;
+}
+
+bool IsNodeCompilable(Ort::ConstNode node) {
+  const OpDefinition* op = FindOpDefinition(node.GetDomain(), node.GetOperatorType());
+  return op != nullptr && op->support != nullptr && op->support(node);
+}
+
+void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
+                           const ConstantValueMap& constants,
+                           const std::unordered_set<std::string>& folded_nodes,
+                           FusionPlan& plan) {
+  // Matches the pre-L2 attention QKV split that ORT's CPU EP would later fuse
+  // into a Split kernel. Our EP sees the raw form:
+  //   Reshape(x=[..., 3C] -> [B*nw, M*M, 3, heads, head_dim]) ->
+  //     Transpose(perm=[2,0,3,1,4]) ->
+  //     3x Gather(axis=0, scalar index in {0,1,2})
+  // Every rank-5 intermediate has exactly one consumer, so the fusion is safe
+  // to discard them. Emits three rank-4 ne=[head_dim, M*M, heads, B*nw].
+  std::unordered_map<std::string, Ort::ConstNode> producer;
+  std::unordered_map<std::string, int> consumer_count;
+  const auto nodes = ort_graph.GetNodes();
+  for (Ort::ConstNode n : nodes) {
+    for (Ort::ConstValueInfo out : n.GetOutputs()) {
+      if (out != nullptr) producer[std::string(out.GetName())] = n;
+    }
+    for (Ort::ConstValueInfo in : n.GetInputs()) {
+      if (in != nullptr) consumer_count[std::string(in.GetName())]++;
+    }
+  }
+  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
+    if (out != nullptr) consumer_count[std::string(out.GetName())]++;
+  }
+
+  // Topological index per node key — used to verify the fusion span has no
+  // intervening unsupported node that would force ORT to split the partition.
+  std::unordered_map<std::string, size_t> index_by_key;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    index_by_key.emplace(NodeKey(nodes[i]), i);
+  }
+
+  std::unordered_set<std::string> claimed;
+  auto claim = [&](const std::string& key) { return claimed.insert(key).second; };
+
+  for (Ort::ConstNode trans : nodes) {
+    if (trans.GetOperatorType() != "Transpose") continue;
+    const auto perm = ReadTransposePerm(trans);
+    const std::vector<int64_t> expected_perm = {2, 0, 3, 1, 4};
+    if (!perm || *perm != expected_perm) continue;
+
+    const auto trans_inputs = trans.GetInputs();
+    const auto trans_outputs = trans.GetOutputs();
+    if (trans_inputs.size() != 1 || trans_outputs.size() != 1) continue;
+    if (trans_inputs[0] == nullptr || trans_outputs[0] == nullptr) continue;
+
+    // Upstream Reshape producing the rank-5 [B*nw, M*M, 3, heads, head_dim].
+    const std::string r_out_name = std::string(trans_inputs[0].GetName());
+    if (consumer_count[r_out_name] != 1) continue;
+    auto r_it = producer.find(r_out_name);
+    if (r_it == producer.end()) continue;
+    Ort::ConstNode reshape = r_it->second;
+    if (reshape.GetOperatorType() != "Reshape") continue;
+
+    const auto r_inputs = reshape.GetInputs();
+    const auto r_outputs = reshape.GetOutputs();
+    if (r_inputs.size() != 2 || r_outputs.size() != 1) continue;
+    if (r_inputs[0] == nullptr || r_outputs[0] == nullptr) continue;
+
+    const TensorMetadata r_in_meta = getTensorMetadata(r_inputs[0]);
+    if (!shapeIsFullyStatic(r_in_meta)) continue;
+
+    std::vector<int64_t> r_target_dims;
+    if (auto r_target = ReadConstantInt64Input(constants, reshape, 1)) {
+      auto resolved = ResolveReshapeTarget(*r_target, r_in_meta.dims);
+      if (!resolved) continue;
+      r_target_dims = *resolved;
+    } else {
+      const TensorMetadata r_out_meta = getTensorMetadata(r_outputs[0]);
+      if (!shapeIsFullyStatic(r_out_meta)) continue;
+      r_target_dims = r_out_meta.dims;
+    }
+    if (r_target_dims.size() != 5) continue;
+    for (int64_t d : r_target_dims) {
+      if (d <= 0) { r_target_dims.clear(); break; }
+    }
+    if (r_target_dims.empty()) continue;
+    if (r_target_dims[2] != 3) continue;
+
+    // Downstream: exactly three consumers of the Transpose output, each a
+    // Gather(axis=0) with a scalar int64 index in {0,1,2} — one per Q/K/V.
+    const std::string trans_out_name = std::string(trans_outputs[0].GetName());
+    if (consumer_count[trans_out_name] != 3) continue;
+
+    std::array<Ort::ConstNode, 3> gathers{Ort::ConstNode{nullptr}, Ort::ConstNode{nullptr},
+                                          Ort::ConstNode{nullptr}};
+    bool seen[3] = {false, false, false};
+    bool ok = true;
+    for (Ort::ConstNode n : nodes) {
+      bool consumes = false;
+      for (Ort::ConstValueInfo in : n.GetInputs()) {
+        if (in != nullptr && std::string(in.GetName()) == trans_out_name) {
+          consumes = true;
+          break;
+        }
+      }
+      if (!consumes) continue;
+      if (n.GetOperatorType() != "Gather") { ok = false; break; }
+      const int64_t gaxis = ReadInt64Attr(n, "axis").value_or(0);
+      if (gaxis != 0) { ok = false; break; }
+      const auto g_inputs = n.GetInputs();
+      const auto g_outputs = n.GetOutputs();
+      if (g_inputs.size() != 2 || g_outputs.size() != 1) { ok = false; break; }
+      const auto idx = ReadConstantInt64Input(constants, n, 1);
+      if (!idx || idx->size() != 1) { ok = false; break; }
+      const int64_t which = (*idx)[0];
+      if (which < 0 || which > 2 || seen[which]) { ok = false; break; }
+      seen[which] = true;
+      gathers[static_cast<size_t>(which)] = n;
+    }
+    if (!ok || !seen[0] || !seen[1] || !seen[2]) continue;
+
+    const std::string r_key = NodeKey(reshape);
+    const std::string t_key = NodeKey(trans);
+    const std::string g0_key = NodeKey(gathers[0]);
+    const std::string g1_key = NodeKey(gathers[1]);
+    const std::string g2_key = NodeKey(gathers[2]);
+
+    // Partition safety: the fusion members (R, T, G0, G1, G2) must end up in
+    // the same fused partition. ORT's grouping is topological, so the span
+    // from min to max index must contain only nodes that ggml will keep in
+    // the partition — i.e. compilable (supported), folded at compile time, or
+    // already in the fusion itself. An unsupported node (e.g. a Softmax we
+    // haven't implemented) sitting between G0 and G2 would split the
+    // partition and leave the rank-5 Transpose_2 output exposed as a cross-
+    // partition boundary, which ensure_value then rejects.
+    const std::array<std::string, 5> member_keys{r_key, t_key, g0_key, g1_key, g2_key};
+    std::unordered_set<std::string> member_set(member_keys.begin(), member_keys.end());
+    size_t lo = std::numeric_limits<size_t>::max();
+    size_t hi = 0;
+    for (const std::string& k : member_keys) {
+      const auto it = index_by_key.find(k);
+      if (it == index_by_key.end()) { lo = 1; hi = 0; break; }
+      lo = std::min(lo, it->second);
+      hi = std::max(hi, it->second);
+    }
+    if (lo > hi) continue;
+    bool span_ok = true;
+    for (size_t i = lo; i <= hi; ++i) {
+      const std::string key = NodeKey(nodes[i]);
+      if (member_set.count(key) > 0) continue;
+      if (folded_nodes.count(key) > 0) continue;
+      // Nodes claimed by an earlier fusion (anchors or consumed) stay in the
+      // partition just like compilable ones.
+      if (plan.consumed_nodes.count(key) > 0) continue;
+      if (plan.window_shuffle_anchors.count(key) > 0) continue;
+      if (plan.qkv_split_anchors.count(key) > 0) continue;
+      if (plan.window_mask_add_anchors.count(key) > 0) continue;
+      if (IsNodeCompilable(nodes[i])) continue;
+      span_ok = false;
+      break;
+    }
+    if (!span_ok) continue;
+
+    if (!claim(r_key) || !claim(t_key) || !claim(g0_key) || !claim(g1_key) || !claim(g2_key)) {
+      continue;
+    }
+
+    NodeDesc::QKVSplitAttrs attrs;
+    attrs.num_batch = r_target_dims[0];
+    attrs.num_tokens = r_target_dims[1];
+    attrs.num_heads = r_target_dims[3];
+    attrs.head_dim = r_target_dims[4];
+
+    // Anchor on the Transpose — it's the unique node in the pattern (the
+    // Gathers don't share keys). Synthesizing outputs in Q/K/V order requires
+    // indexing the `gathers` array by the scalar index value.
+    const std::string anchor_key = t_key;
+
+    FusionPlan::AnchorIO io;
+    io.input_values.push_back(std::string(r_inputs[0].GetName()));
+    for (size_t i = 0; i < 3; ++i) {
+      io.output_values.push_back(std::string(gathers[i].GetOutputs()[0].GetName()));
+    }
+    io.anchor_node_name = std::string(trans.GetName());
+
+    plan.qkv_split_anchors.emplace(anchor_key, std::move(attrs));
+    plan.anchor_io.emplace(anchor_key, std::move(io));
+    plan.consumed_nodes.insert(r_key);
+    plan.consumed_nodes.insert(g0_key);
+    plan.consumed_nodes.insert(g1_key);
+    plan.consumed_nodes.insert(g2_key);
+  }
+}
+
+void DetectWindowMaskAddFusions(const Ort::ConstGraph& ort_graph,
+                                const ConstantValueMap& constants,
+                                const std::unordered_set<std::string>& folded_nodes,
+                                FusionPlan& plan) {
+  // Matches the SW-MSA mask-apply round-trip:
+  //   Reshape(X: rank<=4 -> rank>4) -> Add(X', constant_mask) -> Reshape(back)
+  // where the trailing Reshape's output shape equals the leading Reshape's
+  // input shape. Because the mask is a compile-time constant, we can drop its
+  // leading size-1 ONNX axes to rank-reduce it to <=4 without moving any
+  // bytes; the Add then becomes a plain rank-4 broadcast add directly on X.
+  std::unordered_map<std::string, Ort::ConstNode> producer;
+  std::unordered_map<std::string, int> consumer_count;
+  const auto nodes = ort_graph.GetNodes();
+  for (Ort::ConstNode n : nodes) {
+    for (Ort::ConstValueInfo out : n.GetOutputs()) {
+      if (out != nullptr) producer[std::string(out.GetName())] = n;
+    }
+    for (Ort::ConstValueInfo in : n.GetInputs()) {
+      if (in != nullptr) consumer_count[std::string(in.GetName())]++;
+    }
+  }
+  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
+    if (out != nullptr) consumer_count[std::string(out.GetName())]++;
+  }
+
+  std::unordered_map<std::string, size_t> index_by_key;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    index_by_key.emplace(NodeKey(nodes[i]), i);
+  }
+
+  std::unordered_set<std::string> claimed;
+  auto claim = [&](const std::string& key) { return claimed.insert(key).second; };
+
+  for (Ort::ConstNode add : nodes) {
+    if (add.GetOperatorType() != "Add") continue;
+    const auto add_inputs = add.GetInputs();
+    const auto add_outputs = add.GetOutputs();
+    if (add_inputs.size() != 2 || add_outputs.size() != 1) continue;
+    if (add_inputs[0] == nullptr || add_inputs[1] == nullptr || add_outputs[0] == nullptr) continue;
+
+    // One side must be the rank-5 Reshape output, the other a constant mask.
+    // The mask can be in either slot — probe both orderings.
+    for (size_t score_slot = 0; score_slot < 2; ++score_slot) {
+      const size_t mask_slot = 1 - score_slot;
+      Ort::ConstValueInfo score_vi = add_inputs[score_slot];
+      Ort::ConstValueInfo mask_vi = add_inputs[mask_slot];
+
+      // Mask must be a tracked compile-time constant.
+      const std::string mask_name = std::string(mask_vi.GetName());
+      auto mask_it = constants.find(mask_name);
+      if (mask_it == constants.end()) continue;
+      if (mask_it->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) continue;
+      std::vector<int64_t> mask_dims = mask_it->second.dims;
+
+      // Leading Reshape must produce the score side.
+      const std::string lead_out_name = std::string(score_vi.GetName());
+      if (consumer_count[lead_out_name] != 1) continue;
+      auto prod_it = producer.find(lead_out_name);
+      if (prod_it == producer.end()) continue;
+      Ort::ConstNode lead = prod_it->second;
+      if (lead.GetOperatorType() != "Reshape") continue;
+      const auto lead_inputs = lead.GetInputs();
+      if (lead_inputs.size() < 1 || lead_inputs[0] == nullptr) continue;
+
+      const TensorMetadata lead_in_meta = getTensorMetadata(lead_inputs[0]);
+      if (!shapeIsFullyStatic(lead_in_meta)) continue;
+      if (!rankSupportedByGGML(lead_in_meta)) continue;  // X must already fit in ggml
+
+      const TensorMetadata lead_out_meta = getTensorMetadata(score_vi);
+      if (!shapeIsFullyStatic(lead_out_meta)) continue;
+      if (rankSupportedByGGML(lead_out_meta)) continue;  // fusion only pays off at rank>4
+
+      // Trailing Reshape must be the single consumer of the Add's output and
+      // must land back at X's shape.
+      const std::string add_out_name = std::string(add_outputs[0].GetName());
+      if (consumer_count[add_out_name] != 1) continue;
+      Ort::ConstNode trail{nullptr};
+      for (Ort::ConstNode n : nodes) {
+        for (Ort::ConstValueInfo in : n.GetInputs()) {
+          if (in != nullptr && std::string(in.GetName()) == add_out_name) { trail = n; break; }
+        }
+        if (trail != nullptr) break;
+      }
+      if (trail == nullptr || trail.GetOperatorType() != "Reshape") continue;
+      const auto trail_outputs = trail.GetOutputs();
+      if (trail_outputs.size() != 1 || trail_outputs[0] == nullptr) continue;
+      const TensorMetadata trail_out_meta = getTensorMetadata(trail_outputs[0]);
+      if (!shapeIsFullyStatic(trail_out_meta)) continue;
+      if (trail_out_meta.dims != lead_in_meta.dims) continue;
+
+      // Rank-reduce the mask by dropping leading size-1 ONNX axes (these are
+      // pure broadcast axes — dropping them preserves element ordering).
+      std::vector<int64_t> reduced = mask_dims;
+      while (reduced.size() > 4 && !reduced.empty() && reduced.front() == 1) {
+        reduced.erase(reduced.begin());
+      }
+      if (reduced.size() > 4) continue;
+      if (!broadcastSupportedByGGML(reduced, lead_in_meta.dims)) continue;
+
+      // Partition-safety span check: only members, compilable nodes, and
+      // folded nodes may sit between the three members in topological order.
+      const std::string lead_key = NodeKey(lead);
+      const std::string anchor_key = NodeKey(add);
+      const std::string trail_key = NodeKey(trail);
+      std::unordered_set<std::string> member_set{lead_key, anchor_key, trail_key};
+      size_t lo = std::numeric_limits<size_t>::max(), hi = 0;
+      bool ok_keys = true;
+      for (const std::string& k : member_set) {
+        auto it = index_by_key.find(k);
+        if (it == index_by_key.end()) { ok_keys = false; break; }
+        lo = std::min(lo, it->second);
+        hi = std::max(hi, it->second);
+      }
+      if (!ok_keys) continue;
+      bool span_ok = true;
+      for (size_t i = lo; i <= hi; ++i) {
+        const std::string key = NodeKey(nodes[i]);
+        if (member_set.count(key) > 0) continue;
+        if (folded_nodes.count(key) > 0) continue;
+        if (IsNodeCompilable(nodes[i])) continue;
+        span_ok = false;
+        break;
+      }
+      if (!span_ok) continue;
+
+      if (!claim(lead_key) || !claim(anchor_key) || !claim(trail_key)) continue;
+
+      FusionPlan::AnchorIO io;
+      io.input_values.push_back(std::string(lead_inputs[0].GetName()));
+      io.input_values.push_back(mask_name);
+      io.output_values.push_back(std::string(trail_outputs[0].GetName()));
+      io.anchor_node_name = std::string(add.GetName());
+
+      plan.constant_override_dims.emplace(mask_name, reduced);
+      plan.window_mask_add_anchors.emplace(anchor_key, std::move(reduced));
+      plan.anchor_io.emplace(anchor_key, std::move(io));
+      plan.consumed_nodes.insert(lead_key);
+      plan.consumed_nodes.insert(trail_key);
+      break;  // don't probe the swapped ordering once we've fused
+    }
   }
 }
 
@@ -1195,7 +1547,7 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
     Ort::ThrowOnError(input.GetInitializer(value));
     if (value == nullptr) continue;
     const TensorMetadata meta = getTensorMetadata(value);
-    if (!IsFoldableDType(meta.element_type) || !FitsFoldLimit(meta.dims)) continue;
+    if (!IsFoldableDType(meta.element_type) || !FitsInitializerLimit(meta.dims)) continue;
     analysis.constants.emplace(input.GetName(), LoadInitializer(value));
   }
 
@@ -1205,7 +1557,7 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
     Ort::ThrowOnError(init.GetInitializer(value));
     if (value == nullptr) continue;
     const TensorMetadata meta = getTensorMetadata(value);
-    if (!IsFoldableDType(meta.element_type) || !FitsFoldLimit(meta.dims)) continue;
+    if (!IsFoldableDType(meta.element_type) || !FitsInitializerLimit(meta.dims)) continue;
     analysis.constants.emplace(init.GetName(), LoadInitializer(value));
   }
 
@@ -1238,5 +1590,11 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
     }
   }
   DetectWindowShuffleFusions(ort_graph, analysis.constants, analysis.fusions);
+  // WindowMaskAdd runs before QKVSplit: the mask-apply rank-5 bubble sits
+  // between the QKV Gathers in topological order, so fusing it out first
+  // lets QKVSplit's span check clear the (now much shorter) span.
+  DetectWindowMaskAddFusions(ort_graph, analysis.constants, analysis.folded_nodes,
+                             analysis.fusions);
+  DetectQKVSplitFusions(ort_graph, analysis.constants, analysis.folded_nodes, analysis.fusions);
   return analysis;
 }
