@@ -33,6 +33,11 @@ using ConstantValueMap = std::unordered_map<std::string, ConstantTensor>;
 
 TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info);
 TensorMetadata getTensorMetadata(Ort::ConstValue value);
+
+// True only for plain tensor-typed value infos. Sequence/Optional/Map types
+// make GetTensorTypeAndShapeInfo() invalid — any support-check path that
+// forwards a value info into getTensorMetadata must gate on this first.
+bool isTensorTyped(Ort::ConstValueInfo value_info);
 void SetActiveCompileTimeConstants(const ConstantValueMap* constants);
 const ConstantValueMap* GetActiveCompileTimeConstants();
 
@@ -128,7 +133,19 @@ struct NodeDesc {
     bool trans_b{false};
   };
   struct ReshapeAttrs {
-    std::vector<int64_t> onnx_dims;  // fully static target shape
+    std::vector<int64_t> onnx_dims;  // fully static target shape (Reshape/Flatten)
+  };
+  // Squeeze/Unsqueeze: when axes are known at compile time we store them so
+  // EmitSqueezeNode can derive the correct output shape from the actual runtime
+  // input (handles If-branch nodes where ORT's static shape inference may be
+  // wrong). When axes are only available as a runtime input we fall back to the
+  // baked output dims from ORT's inference, which is always correct for the
+  // main graph.
+  struct SqueezeAttrs {
+    std::vector<int64_t> onnx_axes;        // set when axes are a compile-time constant
+    std::vector<int64_t> baked_onnx_dims;  // fallback: ORT-inferred output shape
+    std::vector<int64_t> input_onnx_dims;  // compile-time input shape (preserves ONNX rank)
+    bool is_unsqueeze{false};
   };
   struct Pool2DAttrs {
     ggml_op_pool op{GGML_OP_POOL_MAX};
@@ -230,6 +247,7 @@ struct NodeDesc {
                              ClipAttrs,
                              GemmAttrs,
                              ReshapeAttrs,
+                             SqueezeAttrs,
                              Pool2DAttrs,
                              PadAttrs,
                              InstanceNormAttrs,

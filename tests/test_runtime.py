@@ -8,6 +8,7 @@ from onnx import TensorProto, helper
 
 from test_support import (
     assert_all_nodes_run_on_ggml,
+    assert_provider_does_not_run_ops,
     cpu_session,
     ggml_session,
     ensure_model,
@@ -970,6 +971,15 @@ def build_squeeze_model(tmpdir: Path, x_shape, y_shape, axes, *, variant="input_
     raise ValueError(f"unsupported Squeeze variant: {variant}")
 
 
+def build_unknown_rank_unsqueeze_model(tmpdir: Path, axes) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, None)
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, None)
+    axes_init = helper.make_tensor("axes", TensorProto.INT64, [len(axes)], list(axes))
+    node = helper.make_node("Unsqueeze", ["x", "axes"], ["y"], name="unsqueeze_0")
+    graph = helper.make_graph([node], "unknown_rank_unsqueeze", [x], [y], initializer=[axes_init])
+    return ensure_model_with_opset(tmpdir, graph, 13)
+
+
 @pytest.mark.parametrize(
     "in_shape,out_shape",
     [
@@ -1013,6 +1023,21 @@ def test_single_squeeze(
     got = ggml.run(["y"], inputs)[0]
     np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
     assert_all_nodes_run_on_ggml(ggml)
+
+
+def test_unsqueeze_with_unknown_input_rank_falls_back_gracefully(
+    suite_tmpdir, ep_library: Path
+) -> None:
+    model_path = build_unknown_rank_unsqueeze_model(suite_tmpdir, [1])
+    inputs = {"x": np.arange(128, dtype=np.float32)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_provider_does_not_run_ops(
+        ggml, "GGMLExecutionProvider", {"Unsqueeze"}
+    )
 
 
 def build_window_shuffle_model(tmpdir: Path, in_shape, mid_shape, out_shape) -> Path:

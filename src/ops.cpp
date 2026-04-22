@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -71,6 +72,15 @@ TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info) {
   result.element_type = tensor_info.GetElementType();
   result.dims = tensor_info.GetShape();
   return result;
+}
+
+bool isTensorTyped(Ort::ConstValueInfo value_info) {
+  if (value_info == nullptr) return false;
+  try {
+    return value_info.TypeInfo().GetONNXType() == ONNX_TYPE_TENSOR;
+  } catch (const Ort::Exception&) {
+    return false;
+  }
 }
 
 void SetActiveCompileTimeConstants(const ConstantValueMap* constants) {
@@ -478,22 +488,26 @@ EmitResult EmitGRUNode(ggml_context* ctx,
     rb = vector_slice(b, hidden_size * 3, hidden_size * 3);
   }
 
-  ggml_tensor* h_t = nullptr;
-  if (initial_h != nullptr) {
-    GGONNX_ASSERT(initial_h->ne[0] == hidden_size && initial_h->ne[1] == batch_size && initial_h->ne[2] == 1,
-                  "compiled GRU initial_h tensor shape mismatch");
-    h_t = ggml_view_2d(ctx, initial_h, initial_h->ne[0], initial_h->ne[1], initial_h->nb[1], 0);
-  } else {
-    h_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, batch_size);
-    std::memset(h_t->data, 0, ggml_nbytes(h_t));
-  }
-
   ggml_tensor* y = nullptr;
   if (!node.outputs.empty() && node.outputs[0] != kOptionalValueAbsent) {
     y = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hidden_size, batch_size, 1, seq_length);
   }
 
   ggml_tensor* w_z = matrix_slice_rows(w, 0, hidden_size);
+
+  ggml_tensor* h_t = nullptr;
+  if (initial_h != nullptr) {
+    GGONNX_ASSERT(initial_h->ne[0] == hidden_size && initial_h->ne[1] == batch_size && initial_h->ne[2] == 1,
+                  "compiled GRU initial_h tensor shape mismatch");
+    h_t = ggml_view_2d(ctx, initial_h, initial_h->ne[0], initial_h->ne[1], initial_h->nb[1], 0);
+  } else {
+    // Graph build runs with ggml_init(no_alloc=true), so ggml_new_tensor_2d
+    // returns a descriptor with data=nullptr until the backend allocator
+    // runs later — we can't memset it. Derive the zero tensor from a matmul
+    // against a scaled-to-zero timestep slice so ggml handles storage and
+    // the output has the right [hidden_size, batch_size] shape.
+    h_t = ggml_scale(ctx, ggml_mul_mat(ctx, w_z, timestep_slice(x, 0)), 0.0f);
+  }
   ggml_tensor* w_r = matrix_slice_rows(w, hidden_size, hidden_size);
   ggml_tensor* w_h = matrix_slice_rows(w, hidden_size * 2, hidden_size);
   ggml_tensor* r_z = matrix_slice_rows(r, 0, hidden_size);
@@ -748,6 +762,14 @@ EmitResult EmitLSTMNode(ggml_context* ctx,
     rb = vector_slice(b, hidden_size * 4, hidden_size * 4);
   }
 
+  // Shared zero tensor for the absent initial_h / initial_c cases. Graph build
+  // runs with no_alloc=true, so ggml_new_tensor_2d returns data=nullptr and
+  // memset would dereference null — derive zeros via a scaled matmul instead.
+  auto make_zero_hb = [&]() -> ggml_tensor* {
+    ggml_tensor* w_i_slice = matrix_slice_rows(w, 0, hidden_size);
+    return ggml_scale(ctx, ggml_mul_mat(ctx, w_i_slice, timestep_slice(x, 0)), 0.0f);
+  };
+
   ggml_tensor* h_t = nullptr;
   if (initial_h != nullptr) {
     GGONNX_ASSERT(initial_h->ne[0] == hidden_size && initial_h->ne[1] == batch_size &&
@@ -755,8 +777,7 @@ EmitResult EmitLSTMNode(ggml_context* ctx,
                   "compiled LSTM initial_h tensor shape mismatch");
     h_t = ggml_view_2d(ctx, initial_h, initial_h->ne[0], initial_h->ne[1], initial_h->nb[1], 0);
   } else {
-    h_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, batch_size);
-    std::memset(h_t->data, 0, ggml_nbytes(h_t));
+    h_t = make_zero_hb();
   }
 
   ggml_tensor* c_t = nullptr;
@@ -766,8 +787,7 @@ EmitResult EmitLSTMNode(ggml_context* ctx,
                   "compiled LSTM initial_c tensor shape mismatch");
     c_t = ggml_view_2d(ctx, initial_c, initial_c->ne[0], initial_c->ne[1], initial_c->nb[1], 0);
   } else {
-    c_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, batch_size);
-    std::memset(c_t->data, 0, ggml_nbytes(c_t));
+    c_t = make_zero_hb();
   }
 
   ggml_tensor* y = nullptr;
@@ -1778,6 +1798,16 @@ EmitResult EmitReshapeNode(ggml_context* ctx,
   GGONNX_NOT_NULL(data, "compiled Reshape node missing GGML data input");
 
   const std::array<int64_t, GGML_MAX_DIMS> target = ToPaddedGGMLDims(attrs->onnx_dims);
+  // Guard: ggml_reshape_4d aborts if element count changes. This can happen for
+  // nodes inside If/Loop branches where ORT's static shape inference at compile
+  // time disagrees with the actual runtime input shape. Throw here so the error
+  // surfaces as a catchable ORT status rather than a process abort.
+  if (ggml_nelements(data) != target[0] * target[1] * target[2] * target[3]) {
+    throw std::runtime_error(
+        "reshape element count mismatch: input has " + std::to_string(ggml_nelements(data)) +
+        " elements but target shape has " +
+        std::to_string(target[0] * target[1] * target[2] * target[3]));
+  }
   ggml_tensor* src = ggml_is_contiguous(data) ? data : ggml_cont(ctx, data);
   ggml_tensor* out = ggml_reshape_4d(ctx, src, target[0], target[1], target[2], target[3]);
   return EmitOutputs{out};
@@ -1810,9 +1840,10 @@ bool IsSupportedFlattenNode(Ort::ConstNode node) {
   return true;
 }
 
-// ONNX Squeeze: removes axes of length 1. Like Reshape/Flatten, once shape
-// inference has run the runtime axes input is redundant, so we only require the
-// output shape to be fully static and lower to a ggml reshape.
+// ONNX Squeeze/Unsqueeze: remove or insert size-1 axes. We store the axes and
+// derive the actual output shape from the runtime input tensor in EmitSqueezeNode,
+// so the emit is correct even when ORT's static shape inference for If-branch
+// subgraphs is inconsistent with the actual runtime input shape.
 bool IsSupportedSqueezeNode(Ort::ConstNode node) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -1832,7 +1863,20 @@ bool IsSupportedSqueezeNode(Ort::ConstNode node) {
   if (!rankSupportedByGGML(in) || !rankSupportedByGGML(out)) {
     return false;
   }
-  if (!shapeIsFullyStatic(out.dims)) {
+  // Some ORT If-subgraph values arrive with no static rank at all. GGML can
+  // still represent the runtime tensor, but Squeeze/Unsqueeze axis semantics
+  // become ambiguous enough to mis-lower those nodes. Leave them on CPU rather
+  // than speculating and risking a native crash or wrong shape.
+  if (in.dims.empty()) {
+    return false;
+  }
+  // If axes are a runtime input (not a constant) we fall back to baked output
+  // dims from ORT's inference — those must be fully static.
+  const bool has_const_axes =
+      (inputs.size() == 2 && inputs[1] != nullptr &&
+       readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64).has_value()) ||
+      readNodeAttribute<std::vector<int64_t>>(node, "axes").has_value();
+  if (!has_const_axes && !shapeIsFullyStatic(out.dims)) {
     return false;
   }
   return true;
@@ -1840,11 +1884,109 @@ bool IsSupportedSqueezeNode(Ort::ConstNode node) {
 
 void CompileSqueezeAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto inputs = node.GetInputs();
+  const bool is_unsqueeze = std::string_view(node.GetOperatorType()) == "Unsqueeze";
+  const TensorMetadata in = getTensorMetadata(inputs[0]);
+  const int64_t in_rank = static_cast<int64_t>(in.dims.size());
+
+  NodeDesc::SqueezeAttrs attrs;
+  attrs.is_unsqueeze = is_unsqueeze;
+  attrs.input_onnx_dims = in.dims;
+
+  // Axes: opset 13+ passes them as the second input (a constant int64 tensor).
+  // Older opsets encode them as an attribute. When axes are a runtime input
+  // (e.g. fed from outside the graph) readConstantInputArray returns nullopt and
+  // we fall back to baked_onnx_dims from ORT's static inference, which is always
+  // correct for the main graph (unlike If-branch subgraphs).
+  if (inputs.size() == 2 && inputs[1] != nullptr) {
+    const auto v = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    if (v) attrs.onnx_axes = *v;
+  } else if (const auto a = readNodeAttribute<std::vector<int64_t>>(node, "axes")) {
+    attrs.onnx_axes = *a;
+  }
+  // Normalize negative axes.
+  if (!attrs.onnx_axes.empty()) {
+    const int64_t ref_rank = is_unsqueeze
+        ? in_rank + static_cast<int64_t>(attrs.onnx_axes.size())
+        : in_rank;
+    for (auto& ax : attrs.onnx_axes) {
+      if (ax < 0) ax += ref_rank;
+    }
+  }
+  // Always bake the ORT-inferred output shape as a fallback for cases where axes
+  // are not a compile-time constant.
   const auto outputs = node.GetOutputs();
-  GGONNX_ASSERT(outputs.size() == 1 && outputs[0] != nullptr,
-                "Squeeze must have a single output");
-  const TensorMetadata out = getTensorMetadata(outputs[0]);
-  compiled_node->attrs = NodeDesc::ReshapeAttrs{.onnx_dims = out.dims};
+  if (outputs.size() == 1 && outputs[0] != nullptr) {
+    attrs.baked_onnx_dims = getTensorMetadata(outputs[0]).dims;
+  }
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitSqueezeNode(ggml_context* ctx,
+                           const NodeDesc& node,
+                           const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::SqueezeAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Squeeze/Unsqueeze node missing attributes");
+  ggml_tensor* data = values[node.inputs[0]];
+  GGONNX_NOT_NULL(data, "compiled Squeeze/Unsqueeze node missing GGML data input");
+
+  std::vector<int64_t> out_dims;
+  if (!attrs->onnx_axes.empty()) {
+    std::vector<int64_t> in_dims;
+    if (!attrs->input_onnx_dims.empty()) {
+      // Use compile-time rank to preserve leading ONNX size-1 dims that GGML's
+      // runtime rank view drops (e.g. ONNX [1,3,1,5] becomes GGML ne={5,1,3,1}
+      // and ggml_n_dims=3, so ToOnnxDims() would incorrectly report [3,1,5]).
+      const int in_onnx_rank = static_cast<int>(attrs->input_onnx_dims.size());
+      in_dims.resize(static_cast<size_t>(in_onnx_rank));
+      for (int i = 0; i < in_onnx_rank; ++i) {
+        in_dims[i] = data->ne[in_onnx_rank - 1 - i];
+      }
+    } else {
+      // Some nested If-subgraph values in ORT lose their static rank metadata.
+      // Fall back to the runtime tensor rank and validate axes explicitly so a
+      // bad model raises a clear ORT runtime error instead of segfaulting.
+      in_dims = ToOnnxDims(data);
+    }
+    if (attrs->is_unsqueeze) {
+      out_dims = in_dims;
+      std::vector<int64_t> sorted = attrs->onnx_axes;
+      std::sort(sorted.begin(), sorted.end());
+      for (int64_t ax : sorted) {
+        GGONNX_ASSERT(ax >= 0 && ax <= static_cast<int64_t>(out_dims.size()),
+                      "Unsqueeze axis " + std::to_string(ax) +
+                          " is out of bounds for input rank " +
+                          std::to_string(in_dims.size()));
+        out_dims.insert(out_dims.begin() + ax, 1);
+      }
+    } else {
+      std::unordered_set<int64_t> ax_set(attrs->onnx_axes.begin(), attrs->onnx_axes.end());
+      for (int64_t ax : attrs->onnx_axes) {
+        GGONNX_ASSERT(ax >= 0 && ax < static_cast<int64_t>(in_dims.size()),
+                      "Squeeze axis " + std::to_string(ax) +
+                          " is out of bounds for input rank " +
+                          std::to_string(in_dims.size()));
+      }
+      for (int64_t i = 0; i < static_cast<int64_t>(in_dims.size()); ++i) {
+        if (!ax_set.count(i)) out_dims.push_back(in_dims[i]);
+      }
+    }
+  } else {
+    // Axes are a runtime input: fall back to ORT's baked output shape (correct
+    // for main-graph nodes where shape inference is reliable).
+    out_dims = attrs->baked_onnx_dims;
+  }
+  GGONNX_ASSERT(out_dims.size() <= GGML_MAX_DIMS,
+                "Squeeze/Unsqueeze output rank exceeds GGML_MAX_DIMS");
+  GGONNX_ASSERT(ggml_nelements(data) == static_cast<int64_t>(elementCount(out_dims)),
+                "Squeeze/Unsqueeze element count mismatch: input has " +
+                    std::to_string(ggml_nelements(data)) + " elements but output shape " +
+                    FormatDims(out_dims) + " has " + std::to_string(elementCount(out_dims)));
+
+  const std::array<int64_t, GGML_MAX_DIMS> target = ToPaddedGGMLDims(out_dims);
+  ggml_tensor* src = ggml_is_contiguous(data) ? data : ggml_cont(ctx, data);
+  return EmitOutputs{ggml_reshape_4d(ctx, src, target[0], target[1], target[2], target[3])};
 }
 
 void CompileFlattenAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
@@ -1926,10 +2068,17 @@ bool IsSupportedPool2DNode(Ort::ConstNode node) {
   }
 
   if (node.GetOperatorType() == "AveragePool") {
-    const bool has_padding = pads[0] != 0 || pads[1] != 0;
+    // GGML's AveragePool divides by the full kernel area regardless of how many
+    // in-bounds samples were summed — i.e. count_include_pad=1 semantics. If
+    // ONNX wants count_include_pad=0 and the op will actually pad, reject so
+    // ORT falls back to CPU. SAME_UPPER/SAME_LOWER imply padding whenever the
+    // kernel is larger than the stride, so treat them as padded.
+    const bool has_explicit_padding = pads[0] != 0 || pads[1] != 0;
+    const bool has_auto_padding =
+        (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER");
     const int64_t count_include_pad =
         readNodeAttribute<int64_t>(node, "count_include_pad").value_or(0);
-    if (has_padding && count_include_pad != 1) {
+    if ((has_explicit_padding || has_auto_padding) && count_include_pad != 1) {
       return false;
     }
   }
@@ -2431,6 +2580,12 @@ bool IsSupportedIdentityNode(Ort::ConstNode node) {
     return false;
   }
   if (inputs[0] == nullptr || outputs[0] == nullptr) {
+    return false;
+  }
+  // Identity is polymorphic in ONNX — it also accepts sequence/optional
+  // types. Feeding one of those into getTensorMetadata() crashes because
+  // GetTensorTypeAndShapeInfo() is only valid for tensor-typed TypeInfos.
+  if (!isTensorTyped(inputs[0]) || !isTensorTyped(outputs[0])) {
     return false;
   }
   const TensorMetadata in = getTensorMetadata(inputs[0]);
@@ -3063,6 +3218,40 @@ EmitResult EmitReduceMeanNode(ggml_context* ctx,
       ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
 }
 
+// ONNX ReduceSum: identical structure to ReduceMean; swap ggml_mean -> ggml_sum_rows.
+EmitResult EmitReduceSumNode(ggml_context* ctx,
+                             const NodeDesc& node,
+                             const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::ReduceAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled ReduceSum node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled ReduceSum node missing GGML input");
+
+  const int k = attrs->trailing_count;
+  int64_t collapsed = 1;
+  for (int i = 0; i < k; ++i) collapsed *= x->ne[i];
+  int64_t keep[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  keep[0] = collapsed;
+  for (int i = k; i < GGML_MAX_DIMS; ++i) keep[i - k + 1] = x->ne[i];
+
+  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+  ggml_tensor* flat = ggml_reshape_4d(ctx, src, keep[0], keep[1], keep[2], keep[3]);
+  ggml_tensor* reduced = ggml_sum_rows(ctx, flat);  // ne[0] becomes 1
+
+  if (attrs->keepdims) {
+    int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+    for (int i = 0; i < k; ++i) out_ne[i] = 1;
+    for (int i = k; i < GGML_MAX_DIMS; ++i) out_ne[i] = reduced->ne[i - k + 1];
+    return EmitOutputs{
+        ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+  }
+  int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  for (int i = 0; i < GGML_MAX_DIMS - 1; ++i) out_ne[i] = reduced->ne[i + 1];
+  return EmitOutputs{
+      ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+}
+
 // ONNX DepthToSpace: [N, C, H, W] -> [N, C/b^2, H*b, W*b]. Two modes:
 //   DCR (default) reshapes C as [b, b, C/b^2] (row-block outer, col-block middle).
 //   CRD            reshapes C as [C/b^2, b, b] (channel outer, then row, col).
@@ -3339,7 +3528,8 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Gemm"},     {IsSupportedGemmNode, CompileGemmAttributes, EmitGemmNode, GemmConstantLayout}},
       {{"", "Reshape"},  {IsSupportedReshapeNode, CompileReshapeAttributes, EmitReshapeNode}},
       {{"", "Flatten"},  {IsSupportedFlattenNode, CompileFlattenAttributes, EmitReshapeNode}},
-      {{"", "Squeeze"},  {IsSupportedSqueezeNode, CompileSqueezeAttributes, EmitReshapeNode}},
+      {{"", "Squeeze"},   {IsSupportedSqueezeNode, CompileSqueezeAttributes, EmitSqueezeNode}},
+      {{"", "Unsqueeze"}, {IsSupportedSqueezeNode, CompileSqueezeAttributes, EmitSqueezeNode}},
       {{"", "MaxPool"},       {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
       {{"", "AveragePool"},   {IsSupportedPool2DNode, CompilePool2DAttributes, EmitPool2DNode}},
       {{"", "GlobalMaxPool"}, {IsSupportedGlobalPoolNode, CompileGlobalPoolAttributes, EmitPool2DNode}},
@@ -3356,6 +3546,8 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Split"}, {IsSupportedSplitNode, CompileSplitAttributes, EmitSplitNode}},
       {{"", "ReduceMean"},
        {IsSupportedReduceMeanNode, CompileReduceMeanAttributes, EmitReduceMeanNode}},
+      {{"", "ReduceSum"},
+       {IsSupportedReduceMeanNode, CompileReduceMeanAttributes, EmitReduceSumNode}},
       {{"", "BatchNormalization"},
        {IsSupportedBatchNormNode, CompileBatchNormAttributes, EmitBatchNormNode}},
       {{"", "DepthToSpace"},

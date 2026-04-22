@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
+import atexit
 import ctypes
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import urllib.request
@@ -136,18 +138,28 @@ def cpu_session(model_path: Path) -> ort.InferenceSession:
     return ort.InferenceSession(str(model_path), sess_options=so)
 
 
+_PROFILE_DIR = Path(tempfile.mkdtemp(prefix="ggonnx_profile_"))
+_PROFILE_COUNTER = 0
+atexit.register(shutil.rmtree, _PROFILE_DIR, ignore_errors=True)
+
+
 def ggml_session(model_path: Path, ep_library: Path) -> ort.InferenceSession:
+    # ORT names profile files `{prefix}_{timestamp}.json` with second-
+    # granularity timestamps, so sessions created in the same second share a
+    # file. A per-session counter in the prefix keeps the paths distinct,
+    # which matters when many tests run back-to-back and each inspects its
+    # own profile to check fallback behavior.
+    global _PROFILE_COUNTER
+    _PROFILE_COUNTER += 1
     so = ort.SessionOptions()
     so.enable_profiling = True
-    so.profile_file_prefix = str(Path(tempfile.gettempdir()) / "ggonnx_profile")
+    so.profile_file_prefix = str(_PROFILE_DIR / f"session_{_PROFILE_COUNTER:06d}")
     so.add_provider_for_devices(ggml_devices(ep_library), {})
     return ort.InferenceSession(str(model_path), sess_options=so)
 
 
 def assert_all_nodes_run_on_ggml(session: ort.InferenceSession) -> None:
-    profile_path = Path(session.end_profiling())
-    with profile_path.open() as f:
-        profile = json.load(f)
+    profile = end_profiling_profile(session)
 
     node_events = [event for event in profile if event.get("cat") == "Node"]
     assert node_events, "expected at least one profiled node event"
@@ -218,5 +230,8 @@ def assert_provider_runs_any_node(
 
 def end_profiling_profile(session: ort.InferenceSession) -> list[dict]:
     profile_path = Path(session.end_profiling())
-    with profile_path.open() as f:
-        return json.load(f)
+    try:
+        with profile_path.open() as f:
+            return json.load(f)
+    finally:
+        profile_path.unlink(missing_ok=True)

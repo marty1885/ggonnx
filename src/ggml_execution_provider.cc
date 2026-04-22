@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include "inner/helpers.hpp"
@@ -63,6 +64,7 @@ struct BackendSelection {
   // behavior where fp16-capable GPU backends pick the faster fp16-accumulation
   // kernels. Set via `ep.ggonnx.matmul_precision=f32`.
   bool force_matmul_f32{false};
+  int n_threads{0};
 };
 
 struct GGMLEp {
@@ -348,7 +350,15 @@ BackendSelection ResolveBackendSelection(const OrtSessionOptions* session_option
   const auto device_list_opt = GetEpOption(session_options, "ggml_device_list");
   const auto fallback_opt = GetEpOption(session_options, "enable_cpu_fallback");
   const auto precision_opt = GetEpOption(session_options, "matmul_precision");
+  const auto threads_opt = GetEpOption(session_options, "n_threads");
   selection.enable_cpu_fallback = ParseBoolOption(fallback_opt.value_or(""), /*default=*/true);
+  if (threads_opt.has_value() && !threads_opt->empty()) {
+    selection.n_threads = std::stoi(*threads_opt);
+  } else {
+    // Default to half of available hardware threads.
+    const unsigned int hw = std::thread::hardware_concurrency();
+    selection.n_threads = std::max(1u, hw / 2);
+  }
   if (precision_opt.has_value()) {
     const std::string& p = *precision_opt;
     if (p == "f32" || p == "fp32" || p == "float32") {
@@ -436,12 +446,34 @@ bool isNodeSupported(Ort::ConstNode node) {
   if (graph.GetParentNode() != nullptr) {
     for (Ort::ConstValueInfo output : node.GetOutputs()) {
       if (output == nullptr) continue;
+      // Sequence/Optional outputs don't have a tensor shape — skip them so
+      // getTensorMetadata doesn't crash on GetTensorTypeAndShapeInfo.
+      if (!isTensorTyped(output)) {
+        return false;
+      }
       const TensorMetadata meta = getTensorMetadata(output);
       if (meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
           meta.dims.empty()) {
         return false;
       }
     }
+  }
+  // Empty tensors (any dim == 0) aren't something the ggml allocator or
+  // kernels handle cleanly — fall back to ORT's CPU kernels rather than
+  // risk a crash on the backend.
+  auto has_zero_dim = [](Ort::ConstValueInfo vi) {
+    if (vi == nullptr || !isTensorTyped(vi)) return false;
+    const TensorMetadata meta = getTensorMetadata(vi);
+    for (int64_t d : meta.dims) {
+      if (d == 0) return true;
+    }
+    return false;
+  };
+  for (Ort::ConstValueInfo input : node.GetInputs()) {
+    if (has_zero_dim(input)) return false;
+  }
+  for (Ort::ConstValueInfo output : node.GetOutputs()) {
+    if (has_zero_dim(output)) return false;
   }
   const std::string op_type = node.GetOperatorType();
   const std::string domain = node.GetDomain();
@@ -530,10 +562,14 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
   GGONNX_ASSERT(!selection.devices.empty(), "BackendSelection must contain at least one device");
   partition.force_matmul_f32_prec = selection.force_matmul_f32;
   partition.backends.reserve(selection.devices.size());
-  for (ggml_backend_dev_t dev : selection.devices) {
+  for (size_t i = 0; i < selection.devices.size(); ++i) {
+    ggml_backend_dev_t dev = selection.devices[i];
     ggml_backend_t b = ggml_backend_dev_init(dev, /*params=*/nullptr);
     GGONNX_NOT_NULL(b, std::string("ggml_backend_dev_init failed for device '") +
                             (ggml_backend_dev_name(dev) ? ggml_backend_dev_name(dev) : "?") + "'");
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && selection.n_threads > 0) {
+      ggml_backend_cpu_set_n_threads(b, selection.n_threads);
+    }
     partition.backends.push_back(b);
   }
   std::unordered_map<std::string, size_t> value_ids;
@@ -1469,9 +1505,10 @@ OrtStatus* FactoryCreateEp(OrtEpFactory* /*this_ptr*/,
     impl->selection = std::make_shared<BackendSelection>(ResolveBackendSelection(session_options));
     // Log the resolved device list once per session create so users can see
     // what ep.ggonnx.ggml_device_list / enable_cpu_fallback actually produced.
-    std::fprintf(stderr, "[ggonnx] session backend selection (cpu_fallback=%s, matmul_precision=%s):\n",
+    std::fprintf(stderr, "[ggonnx] session backend selection (cpu_fallback=%s, matmul_precision=%s, n_threads=%d):\n",
                  impl->selection->enable_cpu_fallback ? "on" : "off",
-                 impl->selection->force_matmul_f32 ? "f32" : "default");
+                 impl->selection->force_matmul_f32 ? "f32" : "default",
+                 impl->selection->n_threads);
     for (size_t i = 0; i < impl->selection->devices.size(); ++i) {
       const char* n = ggml_backend_dev_name(impl->selection->devices[i]);
       std::fprintf(stderr, "[ggonnx]   [%zu] %s\n", i, n != nullptr ? n : "?");
