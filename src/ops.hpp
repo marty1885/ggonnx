@@ -211,25 +211,20 @@ struct NodeDesc {
     int64_t num_tokens{};
     int64_t num_batch{};
   };
-  struct WindowShuffleAttrs {
-    // Rank-6 intermediate ONNX dims (d0..d5) for a Reshape->Transpose(
-    // perm=[0,1,3,2,4,5])->Reshape triple. The transpose swaps ONNX dims 2
-    // and 3; in ggml's reversed layout this becomes a swap of ggml axes 2
-    // and 3 on the rank-4 view [d4*d5, d3, d2, d0*d1], which stays within
-    // GGML_MAX_DIMS=4 so the fusion avoids the rank-6 intermediate that
-    // blocks the individual Reshape/Transpose nodes.
-    std::array<int64_t, 6> onnx_rank6_dims{};
-    // Output ONNX dims (from the trailing Reshape's output).
-    std::vector<int64_t> output_onnx_dims;
-  };
-  struct ChannelShuffleAttrs {
-    // Rank-5 intermediate ONNX dims [N, g, k, H, W] for a
-    // Reshape(4D->5D)->Transpose(perm=[0,2,1,3,4])->Reshape(5D->4D) triple.
-    // The transpose swaps ONNX dims 1 and 2 (group/channel axes); in ggml's
-    // reversed layout we fold spatial into one axis and permute within rank-4,
-    // avoiding the rank-5 intermediate that blocks the individual nodes.
-    std::array<int64_t, 5> onnx_rank5_dims{};
-    // Output ONNX dims (from the trailing Reshape's output).
+  struct GenericShuffleAttrs {
+    // General fused Reshape(4D->XD)->Transpose->Reshape(XD->4D) triple where
+    // X > GGML_MAX_DIMS. The permutation is coalesced into ≤4 axis groups by
+    // merging consecutive ONNX axes that remain adjacent post-transpose (i.e.
+    // inv_perm[i+1] == inv_perm[i]+1). Each group's axes are flattened into a
+    // single dimension and the inter-group permutation is expressed as a rank-4
+    // GGML permute, avoiding the rank-X intermediate entirely.
+    //
+    // grouped_ggml_dims: product-of-group sizes in GGML axis order (reversed
+    //   from ONNX, padded to GGML_MAX_DIMS with 1s).
+    // ggml_perm: the inter-group permutation in GGML axis order.
+    // output_onnx_dims: dims of the trailing Reshape's output (rank 1..4).
+    std::array<int64_t, GGML_MAX_DIMS> grouped_ggml_dims{1, 1, 1, 1};
+    std::array<int, GGML_MAX_DIMS> ggml_perm{0, 1, 2, 3};
     std::vector<int64_t> output_onnx_dims;
   };
   struct ReduceAttrs {
@@ -268,8 +263,7 @@ struct NodeDesc {
                              ConvTransposeAttrs,
                              ExpandAttrs,
                              DepthToSpaceAttrs,
-                             WindowShuffleAttrs,
-                             ChannelShuffleAttrs,
+                             GenericShuffleAttrs,
                              QKVSplitAttrs,
                              MatMulAttrs>;
 
@@ -315,11 +309,10 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
 
 // Graph-level fusion plan. Populated in AnalyzeCompileTimeConstants.
 struct FusionPlan {
-  // Anchor node key (output-or-name of the Transpose) -> fused attrs.
-  std::unordered_map<std::string, NodeDesc::WindowShuffleAttrs> window_shuffle_anchors;
-  // Anchor node key (the Transpose) -> fused attrs for ShuffleNet-style
-  // Reshape(4D->5D)->Transpose(perm=[0,2,1,3,4])->Reshape(5D->4D) triples.
-  std::unordered_map<std::string, NodeDesc::ChannelShuffleAttrs> channel_shuffle_anchors;
+  // Anchor node key (the Transpose) -> fused attrs for any
+  // Reshape(4D->XD)->Transpose->Reshape(XD->4D) triple where X > GGML_MAX_DIMS
+  // and the permutation coalesces to ≤4 axis groups.
+  std::unordered_map<std::string, NodeDesc::GenericShuffleAttrs> generic_shuffle_anchors;
   // Anchor node key (the Split) -> fused QKV split attrs. Produces three
   // rank-4 outputs from one rank-3 input, bypassing the rank-5 intermediates.
   std::unordered_map<std::string, NodeDesc::QKVSplitAttrs> qkv_split_anchors;

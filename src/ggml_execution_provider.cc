@@ -704,42 +704,23 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
     if (meta_analysis.fusions.consumed_nodes.count(node_key) > 0) {
       continue;
     }
-    // Fusion anchor (the Transpose): emit a synthetic __WindowShuffle NodeDesc
-    // bypassing the usual support/compile_attrs path. Inputs/outputs cross the
-    // whole triple so we never materialize the rank-6 intermediates.
-    if (meta_analysis.fusions.window_shuffle_anchors.count(node_key) > 0) {
-      const auto& attrs = meta_analysis.fusions.window_shuffle_anchors.at(node_key);
+    // Fusion anchor (the Transpose): emit a __GenericShuffle NodeDesc that
+    // computes the Reshape->Transpose->Reshape triple within rank-4 by merging
+    // co-moving ONNX axes into single GGML dims.
+    if (meta_analysis.fusions.generic_shuffle_anchors.count(node_key) > 0) {
+      const auto& attrs = meta_analysis.fusions.generic_shuffle_anchors.at(node_key);
       const auto& io = meta_analysis.fusions.anchor_io.at(node_key);
       NodeDesc compiled_node;
-      compiled_node.op_type = "__WindowShuffle";
+      compiled_node.op_type = "__GenericShuffle";
       compiled_node.domain = "";
       compiled_node.name = io.anchor_node_name;
       compiled_node.attrs = attrs;
       GGONNX_ASSERT(io.input_values.size() == 1 && io.output_values.size() == 1,
-                    "window-shuffle fusion must have one input and one output");
+                    "generic-shuffle fusion must have one input and one output");
       Ort::ConstValueInfo in_vi = find_value_info_for(io.input_values[0]);
       Ort::ConstValueInfo out_vi = find_value_info_for(io.output_values[0]);
       GGONNX_ASSERT(in_vi != nullptr && out_vi != nullptr,
-                    "window-shuffle fusion input/output value_info not found");
-      compiled_node.inputs.push_back(ensure_value(in_vi));
-      compiled_node.outputs.push_back(ensure_value(out_vi));
-      partition.nodes.push_back(std::move(compiled_node));
-      continue;
-    }
-    if (meta_analysis.fusions.channel_shuffle_anchors.count(node_key) > 0) {
-      const auto& attrs = meta_analysis.fusions.channel_shuffle_anchors.at(node_key);
-      const auto& io = meta_analysis.fusions.anchor_io.at(node_key);
-      NodeDesc compiled_node;
-      compiled_node.op_type = "__ChannelShuffle";
-      compiled_node.domain = "";
-      compiled_node.name = io.anchor_node_name;
-      compiled_node.attrs = attrs;
-      GGONNX_ASSERT(io.input_values.size() == 1 && io.output_values.size() == 1,
-                    "channel-shuffle fusion must have one input and one output");
-      Ort::ConstValueInfo in_vi = find_value_info_for(io.input_values[0]);
-      Ort::ConstValueInfo out_vi = find_value_info_for(io.output_values[0]);
-      GGONNX_ASSERT(in_vi != nullptr && out_vi != nullptr,
-                    "channel-shuffle fusion input/output value_info not found");
+                    "generic-shuffle fusion input/output value_info not found");
       compiled_node.inputs.push_back(ensure_value(in_vi));
       compiled_node.outputs.push_back(ensure_value(out_vi));
       partition.nodes.push_back(std::move(compiled_node));
@@ -1431,8 +1412,7 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
     for (Ort::ConstNode node : ort_graph.GetNodes()) {
       const std::string key = NodeKey(node);
       const bool is_fusion_anchor =
-          meta_analysis.fusions.window_shuffle_anchors.count(key) > 0 ||
-          meta_analysis.fusions.channel_shuffle_anchors.count(key) > 0 ||
+          meta_analysis.fusions.generic_shuffle_anchors.count(key) > 0 ||
           meta_analysis.fusions.qkv_split_anchors.count(key) > 0 ||
           meta_analysis.fusions.window_mask_add_anchors.count(key) > 0;
       const bool is_fusion_consumed = meta_analysis.fusions.consumed_nodes.count(key) > 0;

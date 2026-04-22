@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 
@@ -1057,148 +1058,22 @@ std::optional<std::vector<int64_t>> ResolveReshapeTarget(const std::vector<int64
   return out;
 }
 
-void DetectWindowShuffleFusions(const Ort::ConstGraph& ort_graph,
+// Detects any Reshape(4D->XD)->Transpose->Reshape(XD->4D) triple where X >
+// GGML_MAX_DIMS and the permutation coalesces to ≤GGML_MAX_DIMS axis groups.
+//
+// Coalescing rule: consecutive ONNX input axes i and i+1 can be merged into
+// one group when they remain adjacent in the output with the same order, i.e.
+// inv_perm[i+1] == inv_perm[i]+1. We greedily merge maximal such runs, giving
+// N_groups groups. If N_groups ≤ GGML_MAX_DIMS each group is flattened to one
+// dim and the inter-group reorder becomes a plain rank-4 ggml_permute.
+//
+// The GGML permutation formula (for GGML axis j, fastest-varying first):
+//   ONNX output group out_g = N_groups-1-j
+//   ONNX input group  in_g  = coalesced_perm[out_g]
+//   ggml_perm[j] = N_groups-1 - coalesced_perm[N_groups-1-j]
+void DetectShuffleTripleFusions(const Ort::ConstGraph& ort_graph,
                                 const ConstantValueMap& constants,
                                 FusionPlan& plan) {
-  // Producer map (output value name -> node) and consumer counts (value name ->
-  // number of consumers across this graph). We only fuse when the Reshape1
-  // output and Transpose output are each consumed by exactly one downstream
-  // node, so their rank-6 tensors can be discarded safely.
-  std::unordered_map<std::string, Ort::ConstNode> producer;
-  std::unordered_map<std::string, int> consumer_count;
-  const auto nodes = ort_graph.GetNodes();
-  for (Ort::ConstNode n : nodes) {
-    for (Ort::ConstValueInfo out : n.GetOutputs()) {
-      if (out != nullptr) producer[std::string(out.GetName())] = n;
-    }
-    for (Ort::ConstValueInfo in : n.GetInputs()) {
-      if (in != nullptr) consumer_count[std::string(in.GetName())]++;
-    }
-  }
-  // Graph outputs count as external consumers — a fusion-internal value named
-  // as a graph output must stay materialized.
-  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
-    if (out != nullptr) consumer_count[std::string(out.GetName())]++;
-  }
-
-  std::unordered_set<std::string> claimed;
-  auto claim = [&](const std::string& key) {
-    return claimed.insert(key).second;
-  };
-
-  for (Ort::ConstNode trans : nodes) {
-    if (trans.GetOperatorType() != "Transpose") continue;
-    const auto perm = ReadTransposePerm(trans);
-    if (!perm || perm->size() != 6) continue;
-    const std::vector<int64_t> expected = {0, 1, 3, 2, 4, 5};
-    if (*perm != expected) continue;
-
-    const auto trans_inputs = trans.GetInputs();
-    const auto trans_outputs = trans.GetOutputs();
-    if (trans_inputs.size() != 1 || trans_outputs.size() != 1) continue;
-    if (trans_inputs[0] == nullptr || trans_outputs[0] == nullptr) continue;
-
-    const std::string r1_out = std::string(trans_inputs[0].GetName());
-    auto prod_it = producer.find(r1_out);
-    if (prod_it == producer.end()) continue;
-    Ort::ConstNode r1 = prod_it->second;
-    if (r1.GetOperatorType() != "Reshape") continue;
-    if (consumer_count[r1_out] != 1) continue;  // the Transpose must be the only consumer
-
-    const std::string trans_out_name = std::string(trans_outputs[0].GetName());
-    if (consumer_count[trans_out_name] != 1) continue;
-
-    // There must be exactly one downstream consumer, and it must be a Reshape.
-    Ort::ConstNode r2{nullptr};
-    for (Ort::ConstNode n : nodes) {
-      for (Ort::ConstValueInfo in : n.GetInputs()) {
-        if (in != nullptr && std::string(in.GetName()) == trans_out_name) {
-          r2 = n;
-          break;
-        }
-      }
-      if (r2 != nullptr) break;
-    }
-    if (r2 == nullptr) continue;
-    if (r2.GetOperatorType() != "Reshape") continue;
-
-    const auto r1_inputs = r1.GetInputs();
-    const auto r2_inputs = r2.GetInputs();
-    const auto r2_outputs = r2.GetOutputs();
-    if (r1_inputs.size() != 2 || r2_inputs.size() != 2 || r2_outputs.size() != 1) continue;
-    if (r1_inputs[0] == nullptr || r1_inputs[1] == nullptr ||
-        r2_inputs[0] == nullptr || r2_inputs[1] == nullptr || r2_outputs[0] == nullptr) {
-      continue;
-    }
-
-    // Fully-static input shape feeding Reshape1 (needed to resolve 0/-1 in
-    // the target shape and to validate element-count).
-    const TensorMetadata r1_in_meta = getTensorMetadata(r1_inputs[0]);
-    if (!shapeIsFullyStatic(r1_in_meta)) continue;
-
-    auto r1_target = ReadConstantInt64Input(constants, r1, 1);
-    if (!r1_target || r1_target->size() != 6) continue;
-    auto r1_resolved = ResolveReshapeTarget(*r1_target, r1_in_meta.dims);
-    if (!r1_resolved || r1_resolved->size() != 6) continue;
-    for (int64_t d : *r1_resolved) {
-      if (d <= 0) { r1_resolved.reset(); break; }
-    }
-    if (!r1_resolved) continue;
-
-    // Reshape2's intermediate input shape is the Transpose output: swap dims
-    // 2 and 3 of the rank-6 tensor.
-    std::vector<int64_t> r2_input_dims = *r1_resolved;
-    std::swap(r2_input_dims[2], r2_input_dims[3]);
-
-    auto r2_target = ReadConstantInt64Input(constants, r2, 1);
-    std::optional<std::vector<int64_t>> r2_resolved;
-    if (r2_target) {
-      r2_resolved = ResolveReshapeTarget(*r2_target, r2_input_dims);
-    } else {
-      // Fall back to ORT's shape inference on the output value.
-      const TensorMetadata r2_out_meta = getTensorMetadata(r2_outputs[0]);
-      if (shapeIsFullyStatic(r2_out_meta)) r2_resolved = r2_out_meta.dims;
-    }
-    if (!r2_resolved || r2_resolved->empty()) continue;
-    for (int64_t d : *r2_resolved) {
-      if (d <= 0) { r2_resolved.reset(); break; }
-    }
-    if (!r2_resolved) continue;
-
-    // Element count must be conserved across the triple.
-    auto prod = [](const std::vector<int64_t>& v) {
-      int64_t p = 1; for (int64_t d : v) p *= d; return p;
-    };
-    if (prod(*r1_resolved) != prod(r1_in_meta.dims) ||
-        prod(*r2_resolved) != prod(*r1_resolved)) {
-      continue;
-    }
-
-    const std::string r1_key = NodeKey(r1);
-    const std::string r2_key = NodeKey(r2);
-    const std::string anchor_key = NodeKey(trans);
-    if (!claim(r1_key) || !claim(r2_key) || !claim(anchor_key)) continue;
-
-    NodeDesc::WindowShuffleAttrs attrs;
-    for (size_t i = 0; i < 6; ++i) attrs.onnx_rank6_dims[i] = (*r1_resolved)[i];
-    attrs.output_onnx_dims = *r2_resolved;
-
-    FusionPlan::AnchorIO io;
-    io.input_values.push_back(std::string(r1_inputs[0].GetName()));
-    io.output_values.push_back(std::string(r2_outputs[0].GetName()));
-    io.anchor_node_name = std::string(trans.GetName());
-
-    plan.window_shuffle_anchors.emplace(anchor_key, std::move(attrs));
-    plan.anchor_io.emplace(anchor_key, std::move(io));
-    plan.consumed_nodes.insert(r1_key);
-    plan.consumed_nodes.insert(r2_key);
-  }
-}
-
-void DetectChannelShuffleFusions(const Ort::ConstGraph& ort_graph,
-                                 const ConstantValueMap& constants,
-                                 FusionPlan& plan) {
-  // Build producer map and per-value consumer counts.
   std::unordered_map<std::string, Ort::ConstNode> producer;
   std::unordered_map<std::string, int> consumer_count;
   const auto nodes = ort_graph.GetNodes();
@@ -1219,13 +1094,13 @@ void DetectChannelShuffleFusions(const Ort::ConstGraph& ort_graph,
     return claimed.insert(key).second;
   };
 
-  // Detect: Reshape(4D->5D) -> Transpose(perm=[0,2,1,3,4]) -> Reshape(5D->4D).
   for (Ort::ConstNode trans : nodes) {
     if (trans.GetOperatorType() != "Transpose") continue;
-    const auto perm = ReadTransposePerm(trans);
-    if (!perm || perm->size() != 5) continue;
-    const std::vector<int64_t> expected = {0, 2, 1, 3, 4};
-    if (*perm != expected) continue;
+    const auto perm_opt = ReadTransposePerm(trans);
+    if (!perm_opt) continue;
+    const std::vector<int64_t>& perm = *perm_opt;
+    const int X = static_cast<int>(perm.size());
+    if (X <= GGML_MAX_DIMS) continue;  // individual ops already handle rank ≤4
 
     const auto trans_inputs = trans.GetInputs();
     const auto trans_outputs = trans.GetOutputs();
@@ -1242,7 +1117,6 @@ void DetectChannelShuffleFusions(const Ort::ConstGraph& ort_graph,
     const std::string trans_out_name = std::string(trans_outputs[0].GetName());
     if (consumer_count[trans_out_name] != 1) continue;
 
-    // Find the single downstream consumer — must be a Reshape.
     Ort::ConstNode r2{nullptr};
     for (Ort::ConstNode n : nodes) {
       for (Ort::ConstValueInfo in : n.GetInputs()) {
@@ -1253,8 +1127,7 @@ void DetectChannelShuffleFusions(const Ort::ConstGraph& ort_graph,
       }
       if (r2 != nullptr) break;
     }
-    if (r2 == nullptr) continue;
-    if (r2.GetOperatorType() != "Reshape") continue;
+    if (r2 == nullptr || r2.GetOperatorType() != "Reshape") continue;
 
     const auto r1_inputs = r1.GetInputs();
     const auto r2_inputs = r2.GetInputs();
@@ -1265,44 +1138,97 @@ void DetectChannelShuffleFusions(const Ort::ConstGraph& ort_graph,
       continue;
     }
 
-    // r1 input must be fully static rank-4.
+    // r1 input must be fully static with rank ≤ GGML_MAX_DIMS.
     const TensorMetadata r1_in_meta = getTensorMetadata(r1_inputs[0]);
-    if (!shapeIsFullyStatic(r1_in_meta) || r1_in_meta.dims.size() != 4) continue;
+    if (!shapeIsFullyStatic(r1_in_meta) ||
+        r1_in_meta.dims.size() > static_cast<size_t>(GGML_MAX_DIMS)) continue;
 
-    // r1 target must resolve to exactly rank-5.
+    // r1 target must resolve to exactly rank X (the intermediate rank).
     auto r1_target = ReadConstantInt64Input(constants, r1, 1);
-    if (!r1_target || r1_target->size() != 5) continue;
+    if (!r1_target || static_cast<int>(r1_target->size()) != X) continue;
     auto r1_resolved = ResolveReshapeTarget(*r1_target, r1_in_meta.dims);
-    if (!r1_resolved || r1_resolved->size() != 5) continue;
-    for (int64_t d : *r1_resolved) {
-      if (d <= 0) { r1_resolved.reset(); break; }
-    }
-    if (!r1_resolved) continue;
+    if (!r1_resolved || static_cast<int>(r1_resolved->size()) != X) continue;
+    bool any_nonpos = false;
+    for (int64_t d : *r1_resolved) { if (d <= 0) { any_nonpos = true; break; } }
+    if (any_nonpos) continue;
 
-    // r2 output must resolve to rank-4.
-    std::vector<int64_t> r2_input_dims = *r1_resolved;
-    std::swap(r2_input_dims[1], r2_input_dims[2]);  // transpose swaps ONNX dims 1 and 2
+    // Compute inv_perm.
+    std::vector<int> inv_perm(X);
+    for (int j = 0; j < X; ++j) inv_perm[static_cast<int>(perm[j])] = j;
+
+    // Greedily merge consecutive input axes that remain adjacent post-transpose.
+    // Each group is a contiguous run [start..end) of input axes.
+    struct Group { int start; int end; };
+    std::vector<Group> groups;
+    groups.push_back({0, 1});
+    for (int i = 1; i < X; ++i) {
+      if (inv_perm[i] == inv_perm[i - 1] + 1) {
+        groups.back().end = i + 1;
+      } else {
+        groups.push_back({i, i + 1});
+      }
+    }
+    const int N_groups = static_cast<int>(groups.size());
+    if (N_groups > GGML_MAX_DIMS) continue;
+
+    // Compute group product dims (ONNX order, slowest first).
+    std::vector<int64_t> group_onnx_dims(N_groups);
+    for (int g = 0; g < N_groups; ++g) {
+      int64_t prod = 1;
+      for (int ax = groups[g].start; ax < groups[g].end; ++ax)
+        prod *= (*r1_resolved)[ax];
+      group_onnx_dims[g] = prod;
+    }
+
+    // Determine where each input group lands in the output.
+    // The first axis of group g goes to output position inv_perm[groups[g].start].
+    // Sort groups by that position to get the coalesced ONNX perm:
+    //   coalesced_perm[out_g] = in_g (input group that produces output group out_g).
+    std::vector<int> group_out_pos(N_groups);
+    for (int g = 0; g < N_groups; ++g) group_out_pos[g] = inv_perm[groups[g].start];
+    std::vector<int> order(N_groups);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](int a, int b) { return group_out_pos[a] < group_out_pos[b]; });
+    // order[out_g] = in_g
+    std::vector<int> coalesced_perm(N_groups);
+    for (int out_g = 0; out_g < N_groups; ++out_g) coalesced_perm[out_g] = order[out_g];
+
+    // Convert to GGML axis order (reversed from ONNX, padded to GGML_MAX_DIMS).
+    // ggml_perm[j] = N_groups-1 - coalesced_perm[N_groups-1-j]
+    NodeDesc::GenericShuffleAttrs attrs;
+    attrs.grouped_ggml_dims.fill(1);
+    attrs.ggml_perm = {0, 1, 2, 3};
+    for (int g = 0; g < N_groups; ++g) {
+      int ggml_axis = N_groups - 1 - g;  // ONNX group g → GGML axis (N-1-g)
+      attrs.grouped_ggml_dims[ggml_axis] = group_onnx_dims[g];
+    }
+    for (int j = 0; j < N_groups; ++j) {
+      attrs.ggml_perm[j] = N_groups - 1 - coalesced_perm[N_groups - 1 - j];
+    }
+
+    // Compute r2's input dims from the transposed intermediate shape.
+    std::vector<int64_t> r2_in_dims(X);
+    for (int j = 0; j < X; ++j) r2_in_dims[j] = (*r1_resolved)[static_cast<int>(perm[j])];
 
     auto r2_target = ReadConstantInt64Input(constants, r2, 1);
     std::optional<std::vector<int64_t>> r2_resolved;
     if (r2_target) {
-      r2_resolved = ResolveReshapeTarget(*r2_target, r2_input_dims);
+      r2_resolved = ResolveReshapeTarget(*r2_target, r2_in_dims);
     } else {
       const TensorMetadata r2_out_meta = getTensorMetadata(r2_outputs[0]);
       if (shapeIsFullyStatic(r2_out_meta)) r2_resolved = r2_out_meta.dims;
     }
-    if (!r2_resolved || r2_resolved->size() != 4) continue;
-    for (int64_t d : *r2_resolved) {
-      if (d <= 0) { r2_resolved.reset(); break; }
-    }
+    if (!r2_resolved || r2_resolved->empty() ||
+        r2_resolved->size() > static_cast<size_t>(GGML_MAX_DIMS)) continue;
+    for (int64_t d : *r2_resolved) { if (d <= 0) { r2_resolved.reset(); break; } }
     if (!r2_resolved) continue;
 
-    // Element count must be conserved.
-    auto prod = [](const std::vector<int64_t>& v) {
+    auto prod_fn = [](const std::vector<int64_t>& v) {
       int64_t p = 1; for (int64_t d : v) p *= d; return p;
     };
-    if (prod(*r1_resolved) != prod(r1_in_meta.dims) ||
-        prod(*r2_resolved) != prod(*r1_resolved)) {
+    if (prod_fn(*r1_resolved) != prod_fn(r1_in_meta.dims) ||
+        prod_fn(*r2_resolved) != prod_fn(*r1_resolved)) {
       continue;
     }
 
@@ -1311,8 +1237,6 @@ void DetectChannelShuffleFusions(const Ort::ConstGraph& ort_graph,
     const std::string anchor_key = NodeKey(trans);
     if (!claim(r1_key) || !claim(r2_key) || !claim(anchor_key)) continue;
 
-    NodeDesc::ChannelShuffleAttrs attrs;
-    for (size_t i = 0; i < 5; ++i) attrs.onnx_rank5_dims[i] = (*r1_resolved)[i];
     attrs.output_onnx_dims = *r2_resolved;
 
     FusionPlan::AnchorIO io;
@@ -1320,7 +1244,7 @@ void DetectChannelShuffleFusions(const Ort::ConstGraph& ort_graph,
     io.output_values.push_back(std::string(r2_outputs[0].GetName()));
     io.anchor_node_name = std::string(trans.GetName());
 
-    plan.channel_shuffle_anchors.emplace(anchor_key, std::move(attrs));
+    plan.generic_shuffle_anchors.emplace(anchor_key, std::move(attrs));
     plan.anchor_io.emplace(anchor_key, std::move(io));
     plan.consumed_nodes.insert(r1_key);
     plan.consumed_nodes.insert(r2_key);
@@ -1487,7 +1411,7 @@ void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
       // Nodes claimed by an earlier fusion (anchors or consumed) stay in the
       // partition just like compilable ones.
       if (plan.consumed_nodes.count(key) > 0) continue;
-      if (plan.window_shuffle_anchors.count(key) > 0) continue;
+      if (plan.generic_shuffle_anchors.count(key) > 0) continue;
       if (plan.qkv_split_anchors.count(key) > 0) continue;
       if (plan.window_mask_add_anchors.count(key) > 0) continue;
       if (IsNodeCompilable(nodes[i], constants)) continue;
@@ -1857,8 +1781,7 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
       continue;
     }
   }
-  DetectWindowShuffleFusions(ort_graph, analysis.constants, analysis.fusions);
-  DetectChannelShuffleFusions(ort_graph, analysis.constants, analysis.fusions);
+  DetectShuffleTripleFusions(ort_graph, analysis.constants, analysis.fusions);
   // WindowMaskAdd runs before QKVSplit: the mask-apply rank-5 bubble sits
   // between the QKV Gathers in topological order, so fusing it out first
   // lets QKVSplit's span check clear the (now much shorter) span.

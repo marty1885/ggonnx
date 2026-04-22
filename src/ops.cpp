@@ -3411,79 +3411,32 @@ EmitResult EmitDepthToSpaceNode(ggml_context* ctx,
   return EmitOutputs{ggml_cont(ctx, ggml_permute(ctx, split, 0, 1, 3, 2))};
 }
 
-// Synthetic op: fused Reshape->Transpose(perm=[0,1,3,2,4,5])->Reshape triple.
-// Lifts the rank-6 intermediate outside of GGML's rank-4 cap by viewing the
-// input as 4D ne=[d4*d5, d3, d2, d0*d1] (a pure reshape since memory is
-// contiguous), swapping ggml axes 2 and 3 (= ONNX axes 2 and 3 in reversed
-// layout), and reshaping to the final ONNX dims. One cont is required —
-// unavoidable, since the middle two axes of the 6D view must be transposed.
-EmitResult EmitWindowShuffleNode(ggml_context* ctx,
-                                 const NodeDesc& node,
-                                 const std::vector<ggml_tensor*>& values) {
-  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
-  const auto* attrs = std::get_if<NodeDesc::WindowShuffleAttrs>(&node.attrs);
-  GGONNX_ASSERT(attrs != nullptr, "compiled __WindowShuffle node missing attributes");
-  GGONNX_ASSERT(node.inputs.size() == 1 && node.outputs.size() == 1,
-                "compiled __WindowShuffle node has invalid arity");
-  ggml_tensor* x = values[node.inputs[0]];
-  GGONNX_NOT_NULL(x, "compiled __WindowShuffle node missing GGML input");
-
-  const int64_t d0 = attrs->onnx_rank6_dims[0];
-  const int64_t d1 = attrs->onnx_rank6_dims[1];
-  const int64_t d2 = attrs->onnx_rank6_dims[2];
-  const int64_t d3 = attrs->onnx_rank6_dims[3];
-  const int64_t d4 = attrs->onnx_rank6_dims[4];
-  const int64_t d5 = attrs->onnx_rank6_dims[5];
-  GGONNX_ASSERT(d0 > 0 && d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0 && d5 > 0,
-                "WindowShuffle dims must be positive");
-
-  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
-  ggml_tensor* view = ggml_reshape_4d(ctx, src, d4 * d5, d3, d2, d0 * d1);
-  ggml_tensor* permuted = ggml_permute(ctx, view, 0, 2, 1, 3);
-  ggml_tensor* cont = ggml_cont(ctx, permuted);
-
-  const std::array<int64_t, GGML_MAX_DIMS> target =
-      ToPaddedGGMLDims(attrs->output_onnx_dims);
-  ggml_tensor* out =
-      ggml_reshape_4d(ctx, cont, target[0], target[1], target[2], target[3]);
-  return EmitOutputs{out};
-}
-
-// Synthetic op: fused Reshape([N,C,H,W]->[N,g,k,H,W]) ->
-// Transpose(perm=[0,2,1,3,4]) -> Reshape([N,g,k,H,W]->[N,C,H,W]).
-// Used for ShuffleNet-v2 channel shuffle. Avoids materializing the rank-5
-// intermediate by folding spatial dims into one axis and permuting within
-// GGML_MAX_DIMS=4:
-//   flat    = reshape_4d(src, H*W, k, g, N)   -- GGML: [H*W, k, g, N]
-//   swapped = permute(flat, 0, 2, 1, 3)        -- GGML: [H*W, g, k, N]
-//   packed  = cont(swapped)
-//   out     = reshape_4d(packed, W, H, C, N)   -- back to 4D
-EmitResult EmitChannelShuffleNode(ggml_context* ctx,
+// Synthetic op: general fused Reshape(4D->XD)->Transpose->Reshape(XD->4D)
+// where X > GGML_MAX_DIMS. Consecutive ONNX axes that travel together through
+// the transpose are merged into single GGML axes (stored in grouped_ggml_dims),
+// and the inter-group permutation is a plain rank-4 ggml_permute. This handles
+// any such triple that coalesces to ≤4 groups — including Swin window-shuffle
+// (rank-6, perm=[0,1,3,2,4,5]) and ShuffleNet channel-shuffle (rank-5,
+// perm=[0,2,1,3,4]) as special cases.
+EmitResult EmitGenericShuffleNode(ggml_context* ctx,
                                   const NodeDesc& node,
                                   const std::vector<ggml_tensor*>& values) {
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
-  const auto* attrs = std::get_if<NodeDesc::ChannelShuffleAttrs>(&node.attrs);
-  GGONNX_ASSERT(attrs != nullptr, "compiled __ChannelShuffle node missing attributes");
+  const auto* attrs = std::get_if<NodeDesc::GenericShuffleAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled __GenericShuffle node missing attributes");
   GGONNX_ASSERT(node.inputs.size() == 1 && node.outputs.size() == 1,
-                "compiled __ChannelShuffle node has invalid arity");
+                "compiled __GenericShuffle node has invalid arity");
   ggml_tensor* x = values[node.inputs[0]];
-  GGONNX_NOT_NULL(x, "compiled __ChannelShuffle node missing GGML input");
+  GGONNX_NOT_NULL(x, "compiled __GenericShuffle node missing GGML input");
 
-  // onnx_rank5_dims = [N, g, k, H, W]
-  const int64_t N = attrs->onnx_rank5_dims[0];
-  const int64_t g = attrs->onnx_rank5_dims[1];
-  const int64_t k = attrs->onnx_rank5_dims[2];
-  const int64_t H = attrs->onnx_rank5_dims[3];
-  const int64_t W = attrs->onnx_rank5_dims[4];
-  GGONNX_ASSERT(N > 0 && g > 0 && k > 0 && H > 0 && W > 0,
-                "ChannelShuffle dims must be positive");
+  const auto& gd = attrs->grouped_ggml_dims;
+  const auto& p = attrs->ggml_perm;
+  for (int64_t d : gd) GGONNX_ASSERT(d > 0, "__GenericShuffle grouped dims must be positive");
 
   ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
-  // GGML input is [W, H, g*k, N]; flatten spatial into axis 0.
-  ggml_tensor* flat = ggml_reshape_4d(ctx, src, H * W, k, g, N);
-  // Swap group (axis 2) and channel (axis 1) within the rank-4 view.
-  ggml_tensor* swapped = ggml_permute(ctx, flat, 0, 2, 1, 3);
-  ggml_tensor* packed = ggml_cont(ctx, swapped);
+  ggml_tensor* grouped = ggml_reshape_4d(ctx, src, gd[0], gd[1], gd[2], gd[3]);
+  ggml_tensor* permuted = ggml_permute(ctx, grouped, p[0], p[1], p[2], p[3]);
+  ggml_tensor* packed = ggml_cont(ctx, permuted);
 
   const std::array<int64_t, GGML_MAX_DIMS> target =
       ToPaddedGGMLDims(attrs->output_onnx_dims);
@@ -3612,8 +3565,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       // Synthetic op injected by FusionPlan. `support` and `compile_attrs` are
       // null because the fusion machinery builds the NodeDesc directly and the
       // per-node support check is never called on __WindowShuffle.
-      {{"", "__WindowShuffle"}, {nullptr, nullptr, EmitWindowShuffleNode}},
-      {{"", "__ChannelShuffle"}, {nullptr, nullptr, EmitChannelShuffleNode}},
+      {{"", "__GenericShuffle"}, {nullptr, nullptr, EmitGenericShuffleNode}},
       {{"", "__QKVSplit"}, {nullptr, nullptr, EmitQKVSplitNode}},
   };
 
