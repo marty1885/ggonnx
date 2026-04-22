@@ -107,6 +107,8 @@ struct NodeDesc {
     int s0{1}, s1{1};
     int p0{0}, p1{0};
     int d0{1}, d1{1};
+    int crop0_begin{0}, crop1_begin{0};
+    int out_w{0}, out_h{0};
     bool is_depthwise{false};
   };
   struct ClipAttrs {
@@ -128,6 +130,8 @@ struct NodeDesc {
     int k0{1}, k1{1};
     int s0{1}, s1{1};
     int p0{0}, p1{0};
+    int crop0_begin{0}, crop1_begin{0};
+    int out_w{0}, out_h{0};
   };
   struct PadAttrs {
     enum class Mode { Reflect, Constant };

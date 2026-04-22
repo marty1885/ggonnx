@@ -1140,7 +1140,66 @@ EmitResult EmitMatMulNode(ggml_context* ctx,
 // ONNX Conv (2D only for now): X[N,C,H,W] @ W[OC,IC/group,KH,KW] (+ optional B[OC]).
 // GGML's reverse-dim convention lines up with ggml_conv_2d_direct's expected layouts:
 // X -> ne=[W,H,C,N] and W -> ne=[KW,KH,IC,OC]. No transposes needed.
-// Limitations: group=1, symmetric pads only, auto_pad in {NOTSET, VALID}, rank-4 only.
+// Limitations: group=1 for regular conv; auto_pad is lowered via direct padding
+// when symmetric, or symmetric-overpad + output crop for one-sided SAME_*.
+namespace {
+
+struct AutoPadAxis {
+  int begin{0};
+  int end{0};
+  int symmetric{0};
+  int crop_begin{0};
+  int output{0};
+};
+
+AutoPadAxis ResolveAutoPadAxis(int64_t input,
+                               int64_t kernel,
+                               int64_t stride,
+                               int64_t dilation,
+                               int64_t output,
+                               bool same_upper) {
+  GGONNX_ASSERT(input > 0 && kernel > 0 && stride > 0 && dilation > 0 && output > 0,
+                "auto_pad requires positive concrete dims");
+  const int64_t effective_kernel = dilation * (kernel - 1) + 1;
+  const int64_t total_pad =
+      std::max<int64_t>(0, (output - 1) * stride + effective_kernel - input);
+  const int64_t begin = same_upper ? (total_pad / 2) : ((total_pad + 1) / 2);
+  const int64_t end = total_pad - begin;
+  const int64_t symmetric = std::max(begin, end);
+  const int64_t crop_begin = symmetric - begin;
+  return AutoPadAxis{
+      .begin = static_cast<int>(begin),
+      .end = static_cast<int>(end),
+      .symmetric = static_cast<int>(symmetric),
+      .crop_begin = static_cast<int>(crop_begin),
+      .output = static_cast<int>(output),
+  };
+}
+
+ggml_tensor* CropSpatialOutputIfNeeded(ggml_context* ctx,
+                                       ggml_tensor* x,
+                                       int crop0_begin,
+                                       int crop1_begin,
+                                       int out_w,
+                                       int out_h) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_NOT_NULL(x, "crop source tensor must not be null");
+  GGONNX_ASSERT(out_w > 0 && out_h > 0, "crop target shape must be positive");
+  if (crop0_begin == 0 && crop1_begin == 0 &&
+      x->ne[0] == out_w && x->ne[1] == out_h) {
+    return x;
+  }
+  GGONNX_ASSERT(crop0_begin >= 0 && crop1_begin >= 0, "crop offset must be non-negative");
+  GGONNX_ASSERT(crop0_begin + out_w <= x->ne[0] && crop1_begin + out_h <= x->ne[1],
+                "crop exceeds spatial output bounds");
+  ggml_tensor* cropped = ggml_view_4d(
+      ctx, x, out_w, out_h, x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3],
+      crop1_begin * x->nb[1] + crop0_begin * x->nb[0]);
+  return ggml_cont(ctx, cropped);
+}
+
+}  // namespace
+
 bool IsSupportedConvNode(Ort::ConstNode node) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -1186,8 +1245,17 @@ bool IsSupportedConvNode(Ort::ConstNode node) {
   }
 
   const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
-  if (auto_pad != "NOTSET" && auto_pad != "VALID") {
+  if (auto_pad != "NOTSET" && auto_pad != "VALID" &&
+      auto_pad != "SAME_UPPER" && auto_pad != "SAME_LOWER") {
     return false;
+  }
+  const bool same_auto_pad = auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER";
+  if (same_auto_pad) {
+    if (spatial_rank == 1) return false;
+    if (x.dims[2] < 0 || x.dims[3] < 0 || y.dims[2] < 0 || y.dims[3] < 0 ||
+        w.dims[2] < 0 || w.dims[3] < 0) {
+      return false;
+    }
   }
 
   if (const auto pads = readNodeAttribute<std::vector<int64_t>>(node, "pads")) {
@@ -1270,6 +1338,22 @@ void CompileConvAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
         attrs.p1 = static_cast<int>((*pads)[0]);
       }
     }
+  } else if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
+    const TensorMetadata x = getTensorMetadata(inputs[0]);
+    const TensorMetadata y = getTensorMetadata(node.GetOutputs()[0]);
+    const bool same_upper = auto_pad == "SAME_UPPER";
+    const int kw = static_cast<int>(w.dims[3]);
+    const int kh = static_cast<int>(w.dims[2]);
+    const AutoPadAxis w_axis = ResolveAutoPadAxis(
+        x.dims[3], kw, attrs.s0, attrs.d0, y.dims[3], same_upper);
+    const AutoPadAxis h_axis = ResolveAutoPadAxis(
+        x.dims[2], kh, attrs.s1, attrs.d1, y.dims[2], same_upper);
+    attrs.p0 = w_axis.symmetric;
+    attrs.p1 = h_axis.symmetric;
+    attrs.crop0_begin = w_axis.crop_begin;
+    attrs.crop1_begin = h_axis.crop_begin;
+    attrs.out_w = w_axis.output;
+    attrs.out_h = h_axis.output;
   }
   // VALID => pads remain 0.
 
@@ -1334,6 +1418,11 @@ EmitResult EmitConvNode(ggml_context* ctx,
       ggml_tensor* bias_4d = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
       out = ggml_add(ctx, out, bias_4d);
     }
+  }
+
+  if (attrs->spatial_rank == 2 && attrs->out_w > 0 && attrs->out_h > 0) {
+    out = CropSpatialOutputIfNeeded(
+        ctx, out, attrs->crop0_begin, attrs->crop1_begin, attrs->out_w, attrs->out_h);
   }
 
   return EmitOutputs{out};
@@ -1809,7 +1898,12 @@ bool IsSupportedPool2DNode(Ort::ConstNode node) {
   }
 
   const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
-  if (auto_pad != "NOTSET" && auto_pad != "VALID") {
+  if (auto_pad != "NOTSET" && auto_pad != "VALID" &&
+      auto_pad != "SAME_UPPER" && auto_pad != "SAME_LOWER") {
+    return false;
+  }
+  if ((auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") &&
+      (x.dims[2] < 0 || x.dims[3] < 0 || y.dims[2] < 0 || y.dims[3] < 0)) {
     return false;
   }
 
@@ -1858,6 +1952,20 @@ void CompilePool2DAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
       attrs.p0 = static_cast<int>((*pads)[1]);
       attrs.p1 = static_cast<int>((*pads)[0]);
     }
+  } else if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
+    const TensorMetadata x = getTensorMetadata(node.GetInputs()[0]);
+    const TensorMetadata y = getTensorMetadata(node.GetOutputs()[0]);
+    const bool same_upper = auto_pad == "SAME_UPPER";
+    const AutoPadAxis w_axis = ResolveAutoPadAxis(
+        x.dims[3], (*kernel_shape)[1], attrs.s0, 1, y.dims[3], same_upper);
+    const AutoPadAxis h_axis = ResolveAutoPadAxis(
+        x.dims[2], (*kernel_shape)[0], attrs.s1, 1, y.dims[2], same_upper);
+    attrs.p0 = w_axis.symmetric;
+    attrs.p1 = h_axis.symmetric;
+    attrs.crop0_begin = w_axis.crop_begin;
+    attrs.crop1_begin = h_axis.crop_begin;
+    attrs.out_w = w_axis.output;
+    attrs.out_h = h_axis.output;
   }
   compiled_node->attrs = attrs;
 }
@@ -1924,6 +2032,10 @@ EmitResult EmitPool2DNode(ggml_context* ctx,
 
   ggml_tensor* out = ggml_pool_2d(ctx, x, attrs->op, k0, k1, s0, s1,
                                   static_cast<float>(p0), static_cast<float>(p1));
+  if (!attrs->is_global && attrs->out_w > 0 && attrs->out_h > 0) {
+    out = CropSpatialOutputIfNeeded(
+        ctx, out, attrs->crop0_begin, attrs->crop1_begin, attrs->out_w, attrs->out_h);
+  }
   return EmitOutputs{out};
 }
 

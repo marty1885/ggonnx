@@ -30,6 +30,11 @@ _TINY_YOLOV3_MODEL_URL = (
     "validated/vision/object_detection_segmentation/tiny-yolov3/model/"
     "tiny-yolov3-11.onnx"
 )
+_TINY_YOLOV2_MODEL_URL = (
+    "https://github.com/onnx/models/raw/refs/heads/main/"
+    "validated/vision/object_detection_segmentation/tiny-yolov2/model/"
+    "tinyyolov2-8.onnx"
+)
 _OPENWAKEWORD_ALEXA_URL = (
     "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/alexa_v0.1.onnx"
 )
@@ -50,6 +55,21 @@ _MOBILENETV2_MODEL_URL = (
     "https://github.com/onnx/models/raw/"
     "c32b9776d06d2ebc7888d705e3a558f62b20e7a8/"
     "validated/vision/classification/mobilenet/model/mobilenetv2-12.onnx"
+)
+_SUBPIXEL_SR_MODEL_URL = (
+    "https://github.com/onnx/models/raw/"
+    "c32b9776d06d2ebc7888d705e3a558f62b20e7a8/"
+    "validated/vision/super_resolution/sub_pixel_cnn_2016/model/"
+    "super-resolution-10.onnx"
+)
+_ULTRAFACE_MODEL_URL = (
+    "https://github.com/onnx/models/raw/refs/heads/main/"
+    "validated/vision/body_analysis/ultraface/models/version-RFB-640.onnx"
+)
+_EMOTION_FERPLUS_MODEL_URL = (
+    "https://github.com/onnx/models/raw/refs/heads/main/"
+    "validated/vision/body_analysis/emotion_ferplus/model/"
+    "emotion-ferplus-8.onnx"
 )
 _SHUFFLENETV2_MODEL_URL = (
     "https://huggingface.co/onnxmodelzoo/shufflenet-v2-10/resolve/main/"
@@ -150,6 +170,194 @@ def _silero_vad_chunks() -> list[np.ndarray]:
     ]
 
 
+def _static_input_shape(graph_input) -> list[int]:
+    return [
+        d if isinstance(d, int) and d > 0 else 1
+        for d in graph_input.shape
+    ]
+
+
+def _subpixel_sr_cases(shape: list[int]) -> list[np.ndarray]:
+    assert len(shape) == 4, f"expected NCHW input for subpixel SR, got {shape}"
+    n, c, h, w = shape
+    assert n == 1, f"expected batch size 1 for subpixel SR, got {shape}"
+    assert c == 1, f"expected single-channel input for subpixel SR, got {shape}"
+
+    ys, xs = np.meshgrid(
+        np.linspace(0.0, 1.0, h, dtype=np.float32),
+        np.linspace(0.0, 1.0, w, dtype=np.float32),
+        indexing="ij",
+    )
+    gradient = (0.15 + 0.70 * (0.65 * xs + 0.35 * ys)).astype(np.float32)
+
+    checker = (
+        0.20 + 0.60 * ((np.indices((h, w)).sum(axis=0) % 2).astype(np.float32))
+    ).astype(np.float32)
+
+    rng = np.random.default_rng(11)
+    textured = np.clip(
+        0.10
+        + 0.35 * xs
+        + 0.25 * ys
+        + 0.20 * np.sin(2.0 * np.pi * xs * 3.0)
+        + 0.15 * np.cos(2.0 * np.pi * ys * 5.0)
+        + 0.03 * rng.standard_normal((h, w), dtype=np.float32),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+
+    return [
+        gradient[None, None, :, :],
+        checker[None, None, :, :],
+        textured[None, None, :, :],
+    ]
+
+
+def _ultraface_cases(shape: list[int]) -> list[np.ndarray]:
+    assert len(shape) == 4, f"expected NCHW input for UltraFace, got {shape}"
+    n, c, h, w = shape
+    assert n == 1, f"expected batch size 1 for UltraFace, got {shape}"
+    assert c == 3, f"expected 3-channel input for UltraFace, got {shape}"
+
+    ys, xs = np.meshgrid(
+        np.linspace(0.0, 1.0, h, dtype=np.float32),
+        np.linspace(0.0, 1.0, w, dtype=np.float32),
+        indexing="ij",
+    )
+    base = np.stack(
+        [
+            0.10 + 0.70 * xs,
+            0.15 + 0.65 * ys,
+            0.05 + 0.55 * (0.6 * xs + 0.4 * ys),
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    stripes = np.stack(
+        [
+            0.25 + 0.25 * np.sin(2.0 * np.pi * xs * 6.0),
+            0.30 + 0.20 * np.cos(2.0 * np.pi * ys * 4.0),
+            0.20 + 0.25 * np.sin(2.0 * np.pi * (xs + ys) * 3.0),
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    rng = np.random.default_rng(23)
+    textured = np.clip(
+        base
+        + stripes
+        + 0.03 * rng.standard_normal((c, h, w), dtype=np.float32),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+
+    checker = np.indices((h, w)).sum(axis=0) % 2
+    checker_rgb = np.stack(
+        [
+            0.20 + 0.50 * checker,
+            0.15 + 0.45 * (1.0 - checker),
+            0.10 + 0.40 * checker,
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    return [
+        base[None, :, :, :],
+        checker_rgb[None, :, :, :],
+        textured[None, :, :, :],
+    ]
+
+
+def _tiny_yolov2_cases(shape: list[int]) -> list[np.ndarray]:
+    assert len(shape) == 4, f"expected NCHW input for tiny YOLOv2, got {shape}"
+    n, c, h, w = shape
+    assert n == 1, f"expected batch size 1 for tiny YOLOv2, got {shape}"
+    assert c == 3, f"expected 3-channel input for tiny YOLOv2, got {shape}"
+
+    ys, xs = np.meshgrid(
+        np.linspace(0.0, 1.0, h, dtype=np.float32),
+        np.linspace(0.0, 1.0, w, dtype=np.float32),
+        indexing="ij",
+    )
+    gradient = np.stack(
+        [
+            0.05 + 0.85 * xs,
+            0.10 + 0.75 * ys,
+            0.08 + 0.70 * (0.5 * xs + 0.5 * ys),
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    checker = (np.indices((h, w)).sum(axis=0) % 2).astype(np.float32)
+    checker_rgb = np.stack(
+        [
+            0.15 + 0.60 * checker,
+            0.20 + 0.55 * (1.0 - checker),
+            0.10 + 0.50 * checker,
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    rng = np.random.default_rng(31)
+    textured = np.clip(
+        gradient
+        + np.stack(
+            [
+                0.18 * np.sin(2.0 * np.pi * xs * 5.0),
+                0.16 * np.cos(2.0 * np.pi * ys * 4.0),
+                0.14 * np.sin(2.0 * np.pi * (xs + ys) * 2.0),
+            ],
+            axis=0,
+        ).astype(np.float32)
+        + 0.025 * rng.standard_normal((c, h, w), dtype=np.float32),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+
+    return [
+        gradient[None, :, :, :],
+        checker_rgb[None, :, :, :],
+        textured[None, :, :, :],
+    ]
+
+
+def _emotion_ferplus_cases(shape: list[int]) -> list[np.ndarray]:
+    assert len(shape) == 4, f"expected NCHW input for emotion-ferplus, got {shape}"
+    n, c, h, w = shape
+    assert n == 1, f"expected batch size 1 for emotion-ferplus, got {shape}"
+    assert c == 1, f"expected single-channel input for emotion-ferplus, got {shape}"
+
+    ys, xs = np.meshgrid(
+        np.linspace(-1.0, 1.0, h, dtype=np.float32),
+        np.linspace(-1.0, 1.0, w, dtype=np.float32),
+        indexing="ij",
+    )
+    radial = np.sqrt(xs * xs + ys * ys)
+
+    smooth = np.clip(0.80 - 0.45 * radial + 0.10 * xs - 0.05 * ys, 0.0, 1.0)
+
+    checker = (
+        0.25 + 0.50 * ((np.indices((h, w)).sum(axis=0) % 2).astype(np.float32))
+    ).astype(np.float32)
+
+    rng = np.random.default_rng(41)
+    textured = np.clip(
+        0.55
+        - 0.30 * radial
+        + 0.18 * np.sin(np.pi * xs * 3.0)
+        + 0.12 * np.cos(np.pi * ys * 4.0)
+        + 0.03 * rng.standard_normal((h, w), dtype=np.float32),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+
+    return [
+        smooth[None, None, :, :].astype(np.float32),
+        checker[None, None, :, :].astype(np.float32),
+        textured[None, None, :, :].astype(np.float32),
+    ]
+
+
 @pytest.mark.integration
 def test_mnist_model_matches_cpu(ep_library: Path) -> None:
     model_path = cached_model_path("mnist-8.onnx", _MNIST_MODEL_URL)
@@ -206,6 +414,50 @@ def test_tiny_yolov3_model_matches_cpu(ep_library: Path) -> None:
     np.testing.assert_allclose(ggml_out[0], cpu_out[0], rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(ggml_out[1], cpu_out[1], rtol=1e-3, atol=1e-3)
     np.testing.assert_array_equal(ggml_out[2], cpu_out[2])
+
+
+@pytest.mark.integration
+def test_tiny_yolov2_matches_cpu_and_is_numerically_stable(ep_library: Path) -> None:
+    model_path = cached_model_path("tinyyolov2-8.onnx", _TINY_YOLOV2_MODEL_URL)
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    input_info = cpu.get_inputs()[0]
+    input_name = input_info.name
+    output_names = [out.name for out in cpu.get_outputs()]
+
+    worst_abs = 0.0
+    worst_rel = 0.0
+    for case in _tiny_yolov2_cases(_static_input_shape(input_info)):
+        inputs = {input_name: case}
+        cpu_out = cpu.run(output_names, inputs)
+        ggml_out = ggml.run(output_names, inputs)
+
+        for got, expected in zip(ggml_out, cpu_out):
+            diff = np.abs(got - expected)
+            worst_abs = max(worst_abs, float(diff.max(initial=0.0)))
+            worst_rel = max(
+                worst_rel,
+                float(
+                    (
+                        diff
+                        / np.maximum(np.abs(expected), np.float32(1e-6))
+                    ).max(initial=0.0)
+                ),
+            )
+            np.testing.assert_allclose(
+                got,
+                expected,
+                rtol=2e-3,
+                atol=2e-4,
+                err_msg=(
+                    f"tiny YOLOv2 drift exceeded tolerance; "
+                    f"worst_abs={worst_abs:.3e}, worst_rel={worst_rel:.3e}"
+                ),
+            )
+
+    assert_all_nodes_run_on_ggml(ggml)
 
 
 @pytest.mark.integration
@@ -288,6 +540,177 @@ def test_mobilenetv2_matches_cpu(ep_library: Path) -> None:
 
     for got, expected in zip(ggml_out, cpu_out):
         np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.integration
+def test_subpixel_sr_matches_cpu_and_is_numerically_stable(ep_library: Path) -> None:
+    model_path = cached_model_path("super-resolution-10.onnx", _SUBPIXEL_SR_MODEL_URL)
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    input_info = cpu.get_inputs()[0]
+    input_name = input_info.name
+    output_names = [out.name for out in cpu.get_outputs()]
+
+    worst_abs = 0.0
+    worst_rel = 0.0
+    for case in _subpixel_sr_cases(_static_input_shape(input_info)):
+        inputs = {input_name: case}
+        cpu_out = cpu.run(output_names, inputs)
+        ggml_out = ggml.run(output_names, inputs)
+
+        for got, expected in zip(ggml_out, cpu_out):
+            diff = np.abs(got - expected)
+            worst_abs = max(worst_abs, float(diff.max(initial=0.0)))
+            worst_rel = max(
+                worst_rel,
+                float(
+                    (
+                        diff
+                        / np.maximum(np.abs(expected), np.float32(1e-6))
+                    ).max(initial=0.0)
+                ),
+            )
+            np.testing.assert_allclose(
+                got,
+                expected,
+                rtol=1e-3,
+                atol=1e-4,
+                err_msg=(
+                    f"subpixel SR drift exceeded tolerance; "
+                    f"worst_abs={worst_abs:.3e}, worst_rel={worst_rel:.3e}"
+                ),
+            )
+
+    profile = end_profiling_profile(ggml)
+    ggml_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
+    ]
+    assert ggml_events, "expected at least one GGML node event in subpixel SR profile"
+
+    cpu_non_shape_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and event.get("args", {}).get("op_name") not in {"Reshape", "Transpose"}
+    ]
+    assert not cpu_non_shape_events, (
+        "expected only shape shuffles on CPU in subpixel SR profile, "
+        f"found: {cpu_non_shape_events}"
+    )
+
+
+@pytest.mark.integration
+def test_ultraface_matches_cpu_and_is_numerically_stable(ep_library: Path) -> None:
+    model_path = cached_model_path("version-RFB-640.onnx", _ULTRAFACE_MODEL_URL)
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    input_info = cpu.get_inputs()[0]
+    input_name = input_info.name
+    output_names = [out.name for out in cpu.get_outputs()]
+
+    worst_abs = 0.0
+    worst_rel = 0.0
+    for case in _ultraface_cases(_static_input_shape(input_info)):
+        inputs = {input_name: case}
+        cpu_out = cpu.run(output_names, inputs)
+        ggml_out = ggml.run(output_names, inputs)
+
+        for got, expected in zip(ggml_out, cpu_out):
+            diff = np.abs(got - expected)
+            worst_abs = max(worst_abs, float(diff.max(initial=0.0)))
+            worst_rel = max(
+                worst_rel,
+                float(
+                    (
+                        diff
+                        / np.maximum(np.abs(expected), np.float32(1e-6))
+                    ).max(initial=0.0)
+                ),
+            )
+            np.testing.assert_allclose(
+                got,
+                expected,
+                rtol=2e-3,
+                atol=2e-4,
+                err_msg=(
+                    f"UltraFace drift exceeded tolerance; "
+                    f"worst_abs={worst_abs:.3e}, worst_rel={worst_rel:.3e}"
+                ),
+            )
+
+    profile = end_profiling_profile(ggml)
+    ggml_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
+    ]
+    assert ggml_events, "expected at least one GGML node event in UltraFace profile"
+
+    cpu_conv_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and event.get("args", {}).get("op_name") == "Conv"
+    ]
+    assert not cpu_conv_events, (
+        f"found CPU Conv node events in UltraFace profile: {cpu_conv_events}"
+    )
+
+
+@pytest.mark.integration
+def test_emotion_ferplus_matches_cpu_and_is_numerically_stable(
+    ep_library: Path,
+) -> None:
+    model_path = cached_model_path("emotion-ferplus-8.onnx", _EMOTION_FERPLUS_MODEL_URL)
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+
+    input_info = cpu.get_inputs()[0]
+    input_name = input_info.name
+    output_names = [out.name for out in cpu.get_outputs()]
+
+    worst_abs = 0.0
+    worst_rel = 0.0
+    for case in _emotion_ferplus_cases(_static_input_shape(input_info)):
+        inputs = {input_name: case}
+        cpu_out = cpu.run(output_names, inputs)
+        ggml_out = ggml.run(output_names, inputs)
+
+        for got, expected in zip(ggml_out, cpu_out):
+            diff = np.abs(got - expected)
+            worst_abs = max(worst_abs, float(diff.max(initial=0.0)))
+            worst_rel = max(
+                worst_rel,
+                float(
+                    (
+                        diff
+                        / np.maximum(np.abs(expected), np.float32(1e-6))
+                    ).max(initial=0.0)
+                ),
+            )
+            np.testing.assert_allclose(
+                got,
+                expected,
+                rtol=2e-3,
+                atol=2e-4,
+                err_msg=(
+                    f"emotion-ferplus drift exceeded tolerance; "
+                    f"worst_abs={worst_abs:.3e}, worst_rel={worst_rel:.3e}"
+                ),
+            )
+
     assert_all_nodes_run_on_ggml(ggml)
 
 
