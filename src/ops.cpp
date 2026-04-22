@@ -854,8 +854,17 @@ bool IsSupportedUnaryFloatNode(Ort::ConstNode node, const ConstantValueMap* /*co
   }
   const TensorMetadata in = getTensorMetadata(inputs[0]);
   const TensorMetadata out = getTensorMetadata(outputs[0]);
-  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+  const bool in_float = in.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+                        in.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+  const bool out_float = out.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+                         out.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+  if (!in_float || !out_float) {
+    return false;
+  }
+  // Erf uses a custom kernel that casts raw data to float* — not safe for F16.
+  if (node.GetOperatorType() == "Erf" &&
+      (in.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ||
+       out.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)) {
     return false;
   }
   if (!rankSupportedByGGML(in) || !rankSupportedByGGML(out)) {
@@ -882,11 +891,11 @@ EmitResult EmitUnaryFloatNode(ggml_context* ctx,
   GGONNX_NOT_NULL(x, "compiled unary op node missing GGML input");
 
   const std::string_view op(node.op_type);
+  if (op == "Abs")      return EmitOutputs{ggml_abs(ctx, x)};
   if (op == "Relu")     return EmitOutputs{ggml_relu(ctx, x)};
   if (op == "Sigmoid")  return EmitOutputs{ggml_sigmoid(ctx, x)};
   if (op == "Tanh")     return EmitOutputs{ggml_tanh(ctx, x)};
   if (op == "Neg")      return EmitOutputs{ggml_neg(ctx, x)};
-  if (op == "Abs")      return EmitOutputs{ggml_abs(ctx, x)};
   if (op == "Sqrt")     return EmitOutputs{ggml_sqrt(ctx, x)};
   if (op == "Exp")      return EmitOutputs{ggml_exp(ctx, x)};
   if (op == "Log")      return EmitOutputs{ggml_log(ctx, x)};

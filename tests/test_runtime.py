@@ -334,6 +334,22 @@ def test_single_unary_ops(suite_tmpdir, ep_library: Path, op_type: str) -> None:
     assert_model_matches_cpu(model_path, ep_library, "y", inputs)
 
 
+def test_abs_float16(suite_tmpdir, ep_library: Path) -> None:
+    x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT16, [2, 3])
+    y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT16, [2, 3])
+    node = helper.make_node("Abs", ["x"], ["y"], name="abs_f16")
+    graph = helper.make_graph([node], "abs_f16", [x_info], [y_info])
+    model_path = ensure_model(suite_tmpdir, graph)
+
+    x = np.array([[1.0, -2.0, 0.5], [-0.25, 3.0, -1.5]], dtype=np.float16)
+    ggml = ggml_session(model_path, ep_library)
+    (ggml_out,) = ggml.run(["y"], {"x": x})
+
+    np.testing.assert_array_equal(ggml_out, np.abs(x))
+    assert ggml_out.dtype == np.float16
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 @pytest.mark.parametrize("alpha", [0.01, 0.2])
 def test_single_leaky_relu(suite_tmpdir, ep_library: Path, alpha: float) -> None:
     model_path = build_single_unary_model(suite_tmpdir, "LeakyRelu", alpha=alpha)

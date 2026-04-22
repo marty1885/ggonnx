@@ -594,7 +594,8 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
     if (override_it != meta_analysis.fusions.constant_override_dims.end()) {
       metadata.dims = override_it->second;
     }
-    if (metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    if (metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        metadata.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
       GGONNX_ASSERT(rankSupportedByGGML(metadata),
                     "compiled partition requires tensor rank <= " + std::to_string(GGML_MAX_DIMS) +
                         ", got " + std::to_string(metadata.dims.size()) + " for value '" + name + "'");
@@ -628,7 +629,8 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
     // ORT into the subgraph boundary) are consumed at compile time via
     // attributes; they are not ggml runtime values.
     const TensorMetadata meta = getTensorMetadata(input);
-    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+        meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
       partition.kernel_input_to_value.push_back(kOptionalValueAbsent);
       continue;
     }
@@ -809,7 +811,8 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       // Non-float inputs (e.g. Reshape's int64 shape input) are consumed at
       // compile time via attributes/output metadata and have no ggml value.
       const TensorMetadata meta = getTensorMetadata(input);
-      if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+          meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
         compiled_node.inputs.push_back(kOptionalValueAbsent);
         continue;
       }
@@ -933,14 +936,21 @@ ShapeKey MakeShapeKey(const std::vector<TensorMetadata>& input_metadata) {
   return key;
 }
 
-ggml_tensor* CreateTensorForOnnxShape(ggml_context* ctx, const std::vector<int64_t>& dims) {
+static ggml_type OnnxTypeToGGML(ONNXTensorElementDataType t) {
+  if (t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) return GGML_TYPE_F16;
+  return GGML_TYPE_F32;
+}
+
+ggml_tensor* CreateTensorForOnnxShape(ggml_context* ctx, const std::vector<int64_t>& dims,
+                                      ONNXTensorElementDataType element_type) {
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const ggml_type gtype = OnnxTypeToGGML(element_type);
   if (dims.empty()) {
-    return ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    return ggml_new_tensor_1d(ctx, gtype, 1);
   }
 
   const std::array<int64_t, GGML_MAX_DIMS> ggml_dims = ToGGMLDims(dims);
-  return ggml_new_tensor(ctx, GGML_TYPE_F32, static_cast<int>(dims.size()), ggml_dims.data());
+  return ggml_new_tensor(ctx, gtype, static_cast<int>(dims.size()), ggml_dims.data());
 }
 
 void CopyInputDataToTensor(const OrtValue* input_value,
@@ -950,8 +960,9 @@ void CopyInputDataToTensor(const OrtValue* input_value,
   GGONNX_NOT_NULL(input_value, "graph input value must not be null");
   GGONNX_NOT_NULL(tensor, "cached GGML input tensor must not be null");
   const TensorMetadata meta = getTensorMetadata(Ort::ConstValue{input_value});
-  if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    throw std::runtime_error("GGONNX graph input must be float32");
+  if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+      meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+    throw std::runtime_error("GGONNX graph input must be float32 or float16");
   }
 
   const void* input_data = nullptr;
@@ -962,7 +973,7 @@ void CopyInputDataToTensor(const OrtValue* input_value,
                 "runtime input shape mismatch for tensor '" + tensor_name + "': expected " +
                     FormatDims(expected_dims) + ", got " + FormatDims(meta.dims));
   const size_t element_count = elementCount(meta.dims);
-  const size_t bytes = element_count * sizeof(float);
+  const size_t bytes = element_count * ggml_element_size(tensor);
   AssertShapeMatchesGGML(meta.dims, tensor, tensor_name);
   ggml_backend_tensor_set(tensor, input_data, 0, bytes);
 }
@@ -1030,15 +1041,16 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
       const size_t value_id = partition.graph_inputs[i];
       const TensorMetadata& meta = input_metadata[i];
       const ValueDesc& value = partition.values[value_id];
-      GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                    "GGONNX runtime input must be float32");
+      GGONNX_ASSERT(meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+                    meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+                    "GGONNX runtime input must be float32 or float16");
       GGONNX_ASSERT(broadcastSupportedByGGML(value.dims, meta.dims),
                     "runtime input shape mismatch for tensor '" + value.name + "': declared " +
                         FormatDims(value.dims) + ", got " + FormatDims(meta.dims));
       GGONNX_ASSERT(shapeIsFullyStatic(meta.dims),
                     "runtime input shapes must be concrete for tensor '" + value.name + "'");
 
-      ggml_tensor* input_tensor = CreateTensorForOnnxShape(ctx, meta.dims);
+      ggml_tensor* input_tensor = CreateTensorForOnnxShape(ctx, meta.dims, meta.element_type);
       GGONNX_NOT_NULL(input_tensor, "failed to allocate cached GGML input tensor");
       ggml_set_input(input_tensor);
       AssertShapeMatchesGGML(meta.dims, input_tensor, partition.values[value_id].name);
@@ -1238,7 +1250,7 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
                       partition.values[output_id].name + "'");
 
     const size_t bytes = ggml_nbytes(output_tensor);
-    GGONNX_ASSERT(bytes == elementCount(output_dims) * sizeof(float),
+    GGONNX_ASSERT(bytes == elementCount(output_dims) * ggml_element_size(output_tensor),
                   "GGML output byte size mismatch for '" + partition.values[output_id].name + "'");
     ggml_backend_tensor_get(output_tensor, output_data, 0, bytes);
   }
