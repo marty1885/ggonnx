@@ -1538,6 +1538,138 @@ void DetectWindowMaskAddFusions(const Ort::ConstGraph& ort_graph,
   }
 }
 
+// Reads the pads vector from a Pad node (attribute or constant input[1]).
+static std::optional<std::vector<int64_t>> ReadPadNodePads(
+    Ort::ConstNode node, const ConstantValueMap& constants) {
+  // opset 9: pads is an int64 attribute.
+  Ort::ConstOpAttr attr{nullptr};
+  if (node.GetAttributeByName("pads", attr).IsOK() && attr != nullptr) {
+    std::vector<int64_t> v;
+    if (attr.GetValueArray(v).IsOK()) return v;
+  }
+  // opset 11+: pads is input[1].
+  const auto inputs = node.GetInputs();
+  if (inputs.size() >= 2 && inputs[1] != nullptr) {
+    auto it = constants.find(std::string(inputs[1].GetName()));
+    if (it != constants.end() &&
+        it->second.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+      const size_t count = it->second.data.size() / sizeof(int64_t);
+      std::vector<int64_t> v(count);
+      std::memcpy(v.data(), it->second.data.data(), it->second.data.size());
+      return v;
+    }
+  }
+  return std::nullopt;
+}
+
+// Folds zero-constant Pad → Conv pairs: the Pad's H/W padding is added to the
+// Conv's p0/p1 and the Pad node is eliminated. Applies only when the Pad is
+// constant-mode with value 0, pads only H/W symmetrically, and the Conv has
+// no padding of its own and has exactly one consumer of the Pad's output.
+void DetectPadConvFusions(const Ort::ConstGraph& ort_graph,
+                          const ConstantValueMap& constants,
+                          FusionPlan& plan) {
+  // Build value-name → producing node map.
+  std::unordered_map<std::string, Ort::ConstNode> producer;
+  for (Ort::ConstNode n : ort_graph.GetNodes()) {
+    for (Ort::ConstValueInfo out : n.GetOutputs()) {
+      if (out != nullptr) producer.emplace(std::string(out.GetName()), n);
+    }
+  }
+
+  // Build a use-count map for all value names.
+  std::unordered_map<std::string, int> use_count;
+  for (Ort::ConstNode n : ort_graph.GetNodes()) {
+    for (Ort::ConstValueInfo inp : n.GetInputs()) {
+      if (inp != nullptr) ++use_count[std::string(inp.GetName())];
+    }
+  }
+
+  for (Ort::ConstNode conv : ort_graph.GetNodes()) {
+    const std::string op = conv.GetOperatorType();
+    if (op != "Conv") continue;
+    const std::string dom = conv.GetDomain();
+    if (!dom.empty() && dom != "ai.onnx") continue;
+
+    const auto conv_inputs = conv.GetInputs();
+    if (conv_inputs.empty() || conv_inputs[0] == nullptr) continue;
+
+    // Conv must have no explicit padding (VALID or zero pads).
+    const std::string auto_pad =
+        [&]() -> std::string {
+          Ort::ConstOpAttr a{nullptr};
+          if (!conv.GetAttributeByName("auto_pad", a).IsOK() || a == nullptr) return "NOTSET";
+          std::string s;
+          a.GetValue(s);
+          return s;
+        }();
+    if (auto_pad != "NOTSET" && auto_pad != "VALID") continue;
+    bool conv_has_nonzero_pads = false;
+    {
+      Ort::ConstOpAttr a{nullptr};
+      if (conv.GetAttributeByName("pads", a).IsOK() && a != nullptr) {
+        std::vector<int64_t> cp;
+        if (a.GetValueArray(cp).IsOK()) {
+          for (int64_t p : cp) if (p != 0) { conv_has_nonzero_pads = true; break; }
+        }
+      }
+    }
+    if (conv_has_nonzero_pads) continue;
+
+    // Find the Pad node producing the Conv's data input.
+    const std::string data_input_name = conv_inputs[0].GetName();
+    auto pit = producer.find(data_input_name);
+    if (pit == producer.end()) continue;
+    Ort::ConstNode pad = pit->second;
+    if (std::string(pad.GetOperatorType()) != "Pad") continue;
+    const std::string pad_dom = pad.GetDomain();
+    if (!pad_dom.empty() && pad_dom != "ai.onnx") continue;
+
+    // Pad must be constant mode with value 0.
+    std::string mode = "constant";
+    {
+      Ort::ConstOpAttr a{nullptr};
+      if (pad.GetAttributeByName("mode", a).IsOK() && a != nullptr) a.GetValue(mode);
+    }
+    if (mode != "constant") continue;
+
+    const auto pad_inputs = pad.GetInputs();
+    if (pad_inputs.size() >= 3 && pad_inputs[2] != nullptr) {
+      auto it = constants.find(std::string(pad_inputs[2].GetName()));
+      if (it == constants.end()) continue;
+      if (it->second.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        float val = 0.f;
+        std::memcpy(&val, it->second.data.data(), sizeof(float));
+        if (val != 0.f) continue;
+      }
+    }
+
+    // Read the pads vector; must be 4D (8 elements).
+    const auto pads = ReadPadNodePads(pad, constants);
+    if (!pads.has_value() || pads->size() != 8) continue;
+
+    // No N or C padding, symmetric H and W padding only.
+    if ((*pads)[0] != 0 || (*pads)[1] != 0 || (*pads)[4] != 0 || (*pads)[5] != 0) continue;
+    if ((*pads)[2] != (*pads)[6] || (*pads)[3] != (*pads)[7]) continue;
+    const int h_pad = static_cast<int>((*pads)[2]);
+    const int w_pad = static_cast<int>((*pads)[3]);
+
+    // The Pad output must be consumed only by this Conv (use_count == 1).
+    if (use_count[data_input_name] != 1) continue;
+
+    // Don't absorb a Pad that another fusion already claimed.
+    const std::string pad_key = NodeKey(pad);
+    if (plan.consumed_nodes.count(pad_key) > 0) continue;
+
+    plan.consumed_nodes.insert(pad_key);
+    FusionPlan::AbsorbedPad absorbed;
+    absorbed.p0 = w_pad;
+    absorbed.p1 = h_pad;
+    absorbed.data_input_name = std::string(pad_inputs[0].GetName());
+    plan.absorbed_pads.emplace(NodeKey(conv), std::move(absorbed));
+  }
+}
+
 }  // namespace
 
 MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
@@ -1600,5 +1732,6 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
   DetectWindowMaskAddFusions(ort_graph, analysis.constants, analysis.folded_nodes,
                              analysis.fusions);
   DetectQKVSplitFusions(ort_graph, analysis.constants, analysis.folded_nodes, analysis.fusions);
+  DetectPadConvFusions(ort_graph, analysis.constants, analysis.fusions);
   return analysis;
 }

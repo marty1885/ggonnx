@@ -777,8 +777,28 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       op->compile_attrs(node, &compiled_node);
     }
 
+    // Fold an absorbed zero-Pad into this Conv's padding attributes.
+    const FusionPlan::AbsorbedPad* absorbed_pad = nullptr;
+    if (compiled_node.op_type == "Conv") {
+      auto apit = meta_analysis.fusions.absorbed_pads.find(node_key);
+      if (apit != meta_analysis.fusions.absorbed_pads.end()) {
+        absorbed_pad = &apit->second;
+        if (auto* ca = std::get_if<NodeDesc::Conv2DAttrs>(&compiled_node.attrs)) {
+          ca->p0 += absorbed_pad->p0;
+          ca->p1 += absorbed_pad->p1;
+        }
+      }
+    }
+
     for (size_t input_idx = 0; input_idx < node_inputs.size(); ++input_idx) {
       Ort::ConstValueInfo input = node_inputs[input_idx];
+      // For an absorbed-Pad Conv, bypass the Pad output and wire the Pad's
+      // upstream data input directly so no padded tensor is materialised.
+      if (input_idx == 0 && absorbed_pad != nullptr) {
+        input = find_value_info_for(absorbed_pad->data_input_name);
+        GGONNX_ASSERT(input != nullptr,
+                      "absorbed Pad data input value_info not found in graph");
+      }
       if (input == nullptr) {
         compiled_node.inputs.push_back(kOptionalValueAbsent);
         continue;

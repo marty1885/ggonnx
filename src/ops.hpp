@@ -334,4 +334,14 @@ struct FusionPlan {
   // unchanged — only size-1 ONNX axes are dropped — so the existing constant
   // materializer can copy straight through.
   std::unordered_map<std::string, std::vector<int64_t>> constant_override_dims;
+  // Keyed by Conv node key. A zero-constant Pad whose sole consumer is this
+  // Conv has been absorbed: its H/W padding is folded into the Conv's p0/p1,
+  // the Pad is in consumed_nodes, and data_input_name is the Pad's data input
+  // (bypassing the Pad's output so no padded tensor is materialised).
+  struct AbsorbedPad {
+    int p0;  // extra W padding (ggml axis 0)
+    int p1;  // extra H padding (ggml axis 1)
+    std::string data_input_name;
+  };
+  std::unordered_map<std::string, AbsorbedPad> absorbed_pads;
 };
