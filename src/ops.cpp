@@ -2888,15 +2888,15 @@ EmitResult EmitTransposeNode(ggml_context* ctx,
 // ONNX Concat: join N inputs along `axis`. GGML's ggml_concat takes two tensors
 // and a GGML-axis integer, so we translate ONNX axis -> (rank-1-axis) and fold
 // left-to-right.
-SupportResult IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(!inputs.empty() && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
                 "Concat: wrong input/output count");
   SUPPORT_CHECK(outputs[0] != nullptr, "Concat: null output");
   const TensorMetadata out = getTensorMetadata(outputs[0]);
-  SUPPORT_CHECK(isGGMLFloatType(out.element_type),
-                "Concat: non-float output type " + std::to_string(out.element_type));
+  SUPPORT_CHECK(OnnxTypeToGGML(out.element_type).has_value(),
+                "Concat: unsupported output type " + std::to_string(out.element_type));
   SUPPORT_CHECK(rankSupportedByGGML(out), "Concat: output rank exceeds GGML_MAX_DIMS");
   const size_t rank = out.dims.size();
   SUPPORT_CHECK(rank > 0, "Concat: scalar output");
@@ -2915,6 +2915,20 @@ SupportResult IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap*
                       " != output type " + std::to_string(out.element_type));
     SUPPORT_CHECK(meta.dims.size() == rank, "Concat: input rank mismatch");
     SUPPORT_CHECK(rankSupportedByGGML(meta), "Concat: input rank exceeds GGML_MAX_DIMS");
+    // Shape-derived pseudo-constants (Shape→Gather→Unsqueeze folds) carry
+    // per-element dim bindings: their value is really dim A of runtime tensor
+    // B. The EP resolves those at graph-materialize time only if B is a
+    // subgraph input of the same partition. In practice these Concats live in
+    // their own tiny partitions with no runtime inputs, so resolution fails.
+    // Hand them to CPU where the real shape is available via normal execution.
+    if (constants != nullptr) {
+      auto cit = constants->find(std::string(input.GetName()));
+      if (cit != constants->end() && !cit->second.dim_bindings.empty()) {
+        SUPPORT_CHECK(false,
+                      "Concat: input '" + std::string(input.GetName()) +
+                          "' carries shape-derived dynamic bindings; defer to CPU");
+      }
+    }
   }
   return support_ok();
 }

@@ -110,6 +110,11 @@ struct CompiledPartition {
   ggml_backend_buffer_t constant_buffer{nullptr};
   std::vector<ggml_tensor*> constants;
   std::vector<std::optional<ConstantTensor>> folded_constants;
+  // Meta-eval pseudo-constants whose data contains dynamic-shape sentinels
+  // bound to runtime input dims. Materialized per-graph in
+  // BuildMaterializedGraph (not in the persistent constant_ctx) because their
+  // resolved values change with the runtime input shape key.
+  std::unordered_map<size_t, ConstantTensor> shape_bound_constants;
 
   ggml_backend_t primary_backend() const { return backends.empty() ? nullptr : backends.front(); }
 
@@ -138,6 +143,7 @@ struct CompiledPartition {
     constant_buffer = other.constant_buffer;
     constants = std::move(other.constants);
     folded_constants = std::move(other.folded_constants);
+    shape_bound_constants = std::move(other.shape_bound_constants);
     other.sched = nullptr;
     other.constant_ctx = nullptr;
     other.constant_buffer = nullptr;
@@ -445,16 +451,6 @@ SupportResult isNodeSupported(Ort::ConstNode node, const ConstantValueMap& const
   return get_node_support(node, &constants);
 }
 
-// Maps ONNX element types to GGML types for tensors that flow through the GGML
-// runtime graph. Returns nullopt for types that have no GGML representation
-// (e.g. int64, bool) — those are consumed at compile time as attributes.
-static std::optional<ggml_type> OnnxTypeToGGML(ONNXTensorElementDataType t) {
-  switch (t) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   return GGML_TYPE_F32;
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return GGML_TYPE_F16;
-    default: return std::nullopt;
-  }
-}
 
 size_t elementCount(const std::vector<int64_t>& dims) {
   size_t count = 1;
@@ -793,11 +789,21 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       }
       const size_t id = ensure_value(input);
       compiled_node.inputs.push_back(id);
-      if (constants_by_name.count(std::string(input.GetName())) > 0) {
-        const ConstantLayout layout = (op->constant_layout != nullptr)
-            ? op->constant_layout(compiled_node, input_idx)
-            : ConstantLayout::AS_IS;
-        record_constant_use(id, layout);
+      {
+        auto cit = constants_by_name.find(std::string(input.GetName()));
+        if (cit != constants_by_name.end()) {
+          if (cit->second.dim_bindings.empty()) {
+            // Fully-static constant: persistent materialization.
+            const ConstantLayout layout = (op->constant_layout != nullptr)
+                ? op->constant_layout(compiled_node, input_idx)
+                : ConstantLayout::AS_IS;
+            record_constant_use(id, layout);
+          } else {
+            // Sentinel-bearing pseudo-constant: resolved per-graph from
+            // runtime input metadata in BuildMaterializedGraph.
+            partition.shape_bound_constants.emplace(id, cit->second);
+          }
+        }
       }
     }
     for (Ort::ConstValueInfo output : node_outputs) {
@@ -845,7 +851,9 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
   if (!constant_layout_by_id.empty()) {
     size_t constant_bytes = 0;
     for (const auto& [id, layout] : constant_layout_by_id) {
-      constant_bytes += ConstantByteSize(partition.values[id].dims);
+      auto it = constants_by_name.find(partition.values[id].name);
+      GGONNX_ASSERT(it != constants_by_name.end(), "constant not found during byte-size estimation");
+      constant_bytes += it->second.data.size();
     }
     const size_t mem_size =
         constant_bytes +
@@ -867,7 +875,12 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       const auto gtype = OnnxTypeToGGML(it->second.element_type);
       GGONNX_ASSERT(gtype.has_value(), "GGML constant has no GGML type representation");
 
-      std::vector<int64_t> tensor_dims = value.dims;
+      // Prefer ORT metadata dims (which carry fusion overrides such as
+      // rank-reduced mask shapes) over the raw constant dims. Fall back to
+      // the actual constant dims only when the ORT metadata is dynamic (e.g.
+      // meta-eval-folded INT64 shape tensors whose ORT shape is still [-1]).
+      std::vector<int64_t> tensor_dims =
+          shapeIsFullyStatic(value.dims) ? value.dims : it->second.dims;
       if (layout == ConstantLayout::MATMUL_WEIGHT_TRANSPOSED && tensor_dims.size() >= 2) {
         std::swap(tensor_dims[tensor_dims.size() - 2], tensor_dims[tensor_dims.size() - 1]);
       }
@@ -896,6 +909,8 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       GGONNX_ASSERT(OnnxTypeToGGML(it->second.element_type).has_value(),
                     "GGML constant has no GGML type representation");
 
+      GGONNX_ASSERT(t->buffer != nullptr,
+                    "constant tensor '" + value.name + "' has no backend buffer after allocation");
       if (it->second.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
         std::vector<float> materialized(elementCount(value.dims));
         MaterializeConstantData(reinterpret_cast<const float*>(it->second.data.data()),
@@ -1032,6 +1047,15 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
       graph_state->value_dims[id] = partition.values[id].dims;
     }
 
+    // Map subgraph-input names to their input_metadata index so shape-bound
+    // constants can resolve "dim A of input B" bindings against runtime shapes.
+    std::unordered_map<std::string, size_t> input_idx_by_name;
+    input_idx_by_name.reserve(partition.graph_inputs.size());
+    for (size_t i = 0; i < partition.graph_inputs.size(); ++i) {
+      const size_t value_id = partition.graph_inputs[i];
+      input_idx_by_name.emplace(partition.values[value_id].name, i);
+    }
+
     for (size_t i = 0; i < partition.graph_inputs.size(); ++i) {
       const size_t value_id = partition.graph_inputs[i];
       const TensorMetadata& meta = input_metadata[i];
@@ -1051,6 +1075,20 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
       graph_state->values[value_id] = input_tensor;
       graph_state->value_dims[value_id] = meta.dims;
       graph_state->input_tensors[i] = input_tensor;
+    }
+
+    // Create tensors for shape-bound pseudo-constants (sentinel-bearing folds).
+    // We resolve their data below, after gallocr allocates the backend buffers.
+    std::vector<std::pair<ggml_tensor*, const ConstantTensor*>> shape_bound_uploads;
+    shape_bound_uploads.reserve(partition.shape_bound_constants.size());
+    for (const auto& [vid, constant] : partition.shape_bound_constants) {
+      std::vector<int64_t> dims = constant.dims.empty() ? std::vector<int64_t>{1} : constant.dims;
+      ggml_tensor* t = CreateTensorForOnnxShape(ctx, dims, constant.element_type);
+      GGONNX_NOT_NULL(t, "failed to allocate shape-bound constant tensor");
+      ggml_set_input(t);  // make gallocr allocate a backend buffer for us
+      graph_state->values[vid] = t;
+      graph_state->value_dims[vid] = constant.dims;
+      shape_bound_uploads.push_back({t, &constant});
     }
 
     for (const NodeDesc& node : partition.nodes) {
@@ -1143,6 +1181,46 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
       }
     }
 
+    // Input tensors consumed only as compile-time attributes (e.g. Reshape's
+    // shape input) are not wired into any GGML op by their emitter, so they
+    // never enter the cgraph and gallocr never allocates them. Null them out so
+    // the data-copy loop skips them rather than crashing on a null buffer.
+    for (ggml_tensor*& t : graph_state->input_tensors) {
+      if (t != nullptr && t->buffer == nullptr) {
+        t = nullptr;
+      }
+    }
+
+    // Resolve and upload shape-bound constants: substitute each bound element's
+    // sentinel with the actual dim from runtime input_metadata, then upload the
+    // patched bytes to the backend buffer that gallocr just allocated.
+    for (const auto& [t, pc] : shape_bound_uploads) {
+      if (t->buffer == nullptr) continue;  // not consumed by any op → safe to skip
+      std::vector<uint8_t> bytes = pc->data;
+      for (size_t i = 0; i < pc->dim_bindings.size(); ++i) {
+        const auto& binding = pc->dim_bindings[i];
+        if (!binding.has_value()) continue;
+        auto nit = input_idx_by_name.find(binding->source_name);
+        GGONNX_ASSERT(nit != input_idx_by_name.end(),
+                      "shape-bound constant '" + partition.values[static_cast<size_t>(0)].name +
+                          "' references unknown subgraph input '" + binding->source_name + "'");
+        const std::vector<int64_t>& src_dims = input_metadata[nit->second].dims;
+        GGONNX_ASSERT(binding->axis >= 0 &&
+                          static_cast<size_t>(binding->axis) < src_dims.size(),
+                      "shape-bound constant axis out of range for '" + binding->source_name + "'");
+        const int64_t resolved = src_dims[static_cast<size_t>(binding->axis)];
+        if (pc->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+          std::memcpy(bytes.data() + i * sizeof(int64_t), &resolved, sizeof(int64_t));
+        } else if (pc->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+          const int32_t v32 = static_cast<int32_t>(resolved);
+          std::memcpy(bytes.data() + i * sizeof(int32_t), &v32, sizeof(int32_t));
+        } else {
+          GGONNX_ABORT("shape-bound constant has non-integer element type");
+        }
+      }
+      ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+    }
+
     g_debug_graph_build_count.fetch_add(1, std::memory_order_relaxed);
     return graph_state;
   } catch (...) {
@@ -1197,6 +1275,7 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
 
   GGONNX_NOT_NULL(state.active_graph.get(), "active GGML graph must not be null");
   for (size_t i = 0; i < partition.graph_inputs.size(); ++i) {
+    if (state.active_graph->input_tensors[i] == nullptr) continue;
     const size_t input_id = partition.graph_inputs[i];
     CopyInputDataToTensor(float_input_values[i],
                           state.active_graph->value_dims[input_id],
@@ -1247,6 +1326,14 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
     GGONNX_ASSERT(bytes == elementCount(output_dims) * ggml_element_size(output_tensor),
                   "GGML output byte size mismatch for '" + partition.values[output_id].name + "'");
     ggml_backend_tensor_get(output_tensor, output_data, 0, bytes);
+    if (output_tensor->type == GGML_TYPE_I64) {
+      const int64_t* v = reinterpret_cast<const int64_t*>(output_data);
+      const size_t n = bytes / 8;
+      fprintf(stderr, "[ggonnx-debug] live INT64 output '%s' dims=%s:",
+              partition.values[output_id].name.c_str(), FormatDims(output_dims).c_str());
+      for (size_t k = 0; k < n && k < 8; ++k) fprintf(stderr, " %lld", (long long)v[k]);
+      fprintf(stderr, "\n");
+    }
   }
 }
 

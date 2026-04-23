@@ -2018,3 +2018,70 @@ def test_window_mask_add_fusion_matches_cpu(
     got = ggml.run(["y"], inputs)[0]
     np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
     assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.parametrize("dtype,tensor_type", [
+    (np.int64, TensorProto.INT64),
+    (np.int32, TensorProto.INT32),
+])
+def test_concat_integer_runs_on_ggml(suite_tmpdir, ep_library: Path, dtype, tensor_type) -> None:
+    # Verifies the INT32/INT64 Concat path: tensors flow through GGML (not
+    # folded or rejected), match CPU values, and retain their integer dtype.
+    a_info = helper.make_tensor_value_info("a", tensor_type, [2, 3])
+    b_info = helper.make_tensor_value_info("b", tensor_type, [2, 4])
+    c_info = helper.make_tensor_value_info("c", tensor_type, [2, 7])
+    node = helper.make_node("Concat", ["a", "b"], ["c"], axis=1)
+    graph = helper.make_graph([node], "concat_int", [a_info, b_info], [c_info])
+    model_path = ensure_model(suite_tmpdir, graph)
+
+    rng = np.random.default_rng(0)
+    inputs = {
+        "a": rng.integers(-1000, 1000, size=(2, 3)).astype(dtype),
+        "b": rng.integers(-1000, 1000, size=(2, 4)).astype(dtype),
+    }
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    cpu_out = cpu.run(["c"], inputs)[0]
+    ggml_out = ggml.run(["c"], inputs)[0]
+    assert ggml_out.dtype == dtype
+    np.testing.assert_array_equal(ggml_out, cpu_out)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def test_shape_derived_concat_to_constantofshape(suite_tmpdir, ep_library: Path) -> None:
+    # Mirrors the TinyStories-LSTM pattern that previously crashed: an INT64
+    # Concat whose middle input is a Shape->Gather->Unsqueeze chain bound to
+    # the runtime batch dim. The Concat must defer to CPU because its partition
+    # has no subgraph input carrying the bound source tensor; downstream
+    # ConstantOfShape must see the real batch size.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 4])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, "batch", 3])
+
+    gather_idx = helper.make_tensor("gather_idx", TensorProto.INT64, [], [0])
+    unsq_axes = helper.make_tensor("unsq_axes", TensorProto.INT64, [1], [0])
+    two = helper.make_tensor("two", TensorProto.INT64, [1], [2])
+    three = helper.make_tensor("three", TensorProto.INT64, [1], [3])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["x_shape"], name="shape0"),
+        helper.make_node("Gather", ["x_shape", "gather_idx"], ["batch_scalar"],
+                         name="gather0", axis=0),
+        helper.make_node("Unsqueeze", ["batch_scalar", "unsq_axes"], ["batch_1d"],
+                         name="unsq0"),
+        helper.make_node("Concat", ["two", "batch_1d", "three"], ["out_shape"],
+                         name="shape_concat", axis=0),
+        helper.make_node("ConstantOfShape", ["out_shape"], ["y"], name="zeros"),
+    ]
+    graph = helper.make_graph(
+        nodes, "shape_derived_concat", [x], [y],
+        initializer=[gather_idx, unsq_axes, two, three],
+    )
+    model_path = ensure_model(suite_tmpdir, graph)
+
+    inputs = {"x": np.zeros((5, 4), dtype=np.float32)}
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    expected = cpu.run(["y"], inputs)[0]
+    got = ggml.run(["y"], inputs)[0]
+    assert got.shape == (2, 5, 3)
+    np.testing.assert_array_equal(got, expected)

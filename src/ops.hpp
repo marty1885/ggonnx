@@ -19,15 +19,39 @@
 
 inline constexpr size_t kOptionalValueAbsent = std::numeric_limits<size_t>::max();
 
+inline std::optional<ggml_type> OnnxTypeToGGML(ONNXTensorElementDataType t) {
+  switch (t) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   return GGML_TYPE_F32;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return GGML_TYPE_F16;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:   return GGML_TYPE_I32;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:   return GGML_TYPE_I64;
+    default: return std::nullopt;
+  }
+}
+
 struct TensorMetadata {
   ONNXTensorElementDataType element_type{};
   std::vector<int64_t> dims;
+};
+
+// Binding for a single folded-constant element that was populated with
+// kUnknownShapeDimSentinel at meta-eval time: the true value is dim `axis` of
+// the runtime tensor named `source_name`. The EP resolves these from runtime
+// input metadata when materializing the compute graph.
+struct DynamicDimBinding {
+  std::string source_name;
+  int64_t axis;
 };
 
 struct ConstantTensor {
   ONNXTensorElementDataType element_type{};
   std::vector<int64_t> dims;
   std::vector<uint8_t> data;
+  // Per-element dynamic bindings, parallel to `data` in element order. Empty
+  // means fully-static. When non-empty, size == total element count; each slot
+  // is either nullopt (the data holds a concrete value) or a binding (the data
+  // holds the sentinel, to be substituted at inference time).
+  std::vector<std::optional<DynamicDimBinding>> dim_bindings;
 };
 
 using ConstantValueMap = std::unordered_map<std::string, ConstantTensor>;

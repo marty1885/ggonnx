@@ -19,7 +19,9 @@ constexpr size_t kMaxFoldedElements = 256;
 // Sentinel used inside compile-time shape tensors for dimensions that ORT
 // knows exist but cannot statically resolve. It must survive int64<->int32
 // shape casts without colliding with ONNX's meaningful shape placeholders 0/-1.
-constexpr int64_t kUnknownShapeDimSentinel = std::numeric_limits<int32_t>::min();
+// Keep the local definition for internal use; the header also exposes it.
+static_assert(static_cast<int64_t>(std::numeric_limits<int32_t>::min()) == kUnknownShapeDimSentinel,
+              "sentinel mismatch between header and meta_eval.cpp");
 // Raw initializers live on disk/in ORT memory already; loading them into the
 // constants map is a bounded duplication, not an unbounded compute. The
 // tighter kMaxFoldedElements still guards derived folds (Tile/Expand/etc.)
@@ -75,6 +77,40 @@ std::vector<T> ReadTypedData(const ConstantTensor& tensor) {
   return out;
 }
 
+// Build a per-element bindings vector for a shape tensor produced from
+// `source_name`, where element `i` corresponds to `source_dims[axis_for[i]]`.
+// Returns {} if no dim at any selected axis is dynamic (fully-static result).
+std::vector<std::optional<DynamicDimBinding>> MakeShapeBindings(
+    const std::vector<int64_t>& source_dims,
+    const std::string& source_name,
+    const std::vector<size_t>& axis_for) {
+  bool any_dynamic = false;
+  for (size_t axis : axis_for) {
+    if (axis < source_dims.size() && source_dims[axis] < 0) {
+      any_dynamic = true;
+      break;
+    }
+  }
+  if (!any_dynamic) return {};
+  std::vector<std::optional<DynamicDimBinding>> out(axis_for.size());
+  for (size_t pos = 0; pos < axis_for.size(); ++pos) {
+    const size_t axis = axis_for[pos];
+    if (axis < source_dims.size() && source_dims[axis] < 0) {
+      out[pos] = DynamicDimBinding{source_name, static_cast<int64_t>(axis)};
+    }
+  }
+  return out;
+}
+
+// Normalize a possibly-empty dim_bindings vector to length `n` (all nullopt).
+void NormalizeBindings(std::vector<std::optional<DynamicDimBinding>>& bindings, size_t n) {
+  if (bindings.empty()) {
+    bindings.assign(n, std::nullopt);
+  } else {
+    GGONNX_ASSERT(bindings.size() == n, "dim_bindings size mismatch");
+  }
+}
+
 bool ContainsUnknownShapeDim(const ConstantTensor& tensor) {
   if (tensor.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
     const auto values = ReadTypedData<int64_t>(tensor);
@@ -87,6 +123,7 @@ bool ContainsUnknownShapeDim(const ConstantTensor& tensor) {
   }
   return false;
 }
+
 
 template <typename T>
 ConstantTensor MakeConstant(std::vector<int64_t> dims, std::vector<T> values,
@@ -172,6 +209,11 @@ ConstantTensor CastConstant(const ConstantTensor& input, ONNXTensorElementDataTy
   const size_t count = ElementCount(input.dims);
   if (input.element_type == to_type) return input;
 
+  // Integer-to-integer casts preserve per-element positions and the sentinel
+  // value INT32_MIN (fits both int32 and int64 losslessly); we propagate
+  // bindings. Casts involving floats lose the sentinel meaning so we don't
+  // propagate (and in practice those shouldn't occur for shape tensors).
+
   if (to_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
     std::vector<int32_t> out(count);
     if (input.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
@@ -183,7 +225,11 @@ ConstantTensor CastConstant(const ConstantTensor& input, ONNXTensorElementDataTy
     } else {
       throw std::runtime_error("unsupported cast source dtype");
     }
-    return MakeConstant(std::vector<int64_t>(input.dims), std::move(out), to_type);
+    auto result = MakeConstant(std::vector<int64_t>(input.dims), std::move(out), to_type);
+    if (input.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+      result.dim_bindings = input.dim_bindings;
+    }
+    return result;
   }
   if (to_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
     std::vector<int64_t> out(count);
@@ -196,7 +242,11 @@ ConstantTensor CastConstant(const ConstantTensor& input, ONNXTensorElementDataTy
     } else {
       throw std::runtime_error("unsupported cast source dtype");
     }
-    return MakeConstant(std::vector<int64_t>(input.dims), std::move(out), to_type);
+    auto result = MakeConstant(std::vector<int64_t>(input.dims), std::move(out), to_type);
+    if (input.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+      result.dim_bindings = input.dim_bindings;
+    }
+    return result;
   }
   if (to_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     std::vector<float> out(count);
@@ -299,8 +349,14 @@ std::optional<ConstantTensor> EvalShape(const ConstantValueMap& /*constants*/, O
   for (int64_t& dim : values) {
     if (dim < 0) dim = kUnknownShapeDimSentinel;
   }
-  return MakeConstant<int64_t>({static_cast<int64_t>(values.size())}, std::move(values),
-                               ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  auto result = MakeConstant<int64_t>({static_cast<int64_t>(values.size())}, std::move(values),
+                                       ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  // Bind each position p → axis p of this Shape op's input, so the EP can
+  // substitute the real dim at inference time.
+  std::vector<size_t> axis_for(meta.dims.size());
+  for (size_t i = 0; i < axis_for.size(); ++i) axis_for[i] = i;
+  result.dim_bindings = MakeShapeBindings(meta.dims, std::string(inputs[0].GetName()), axis_for);
+  return result;
 }
 
 std::optional<ConstantTensor> EvalCast(const ConstantValueMap& constants, Ort::ConstNode node) {
@@ -337,6 +393,15 @@ std::optional<ConstantTensor> EvalConcat(const ConstantValueMap& constants, Ort:
   for (const auto& tensor : tensors) {
     if (tensor.element_type != element_type) return std::nullopt;
   }
+  // If any input carries dynamic-dim bindings, leave the Concat unfolded so
+  // the EP can run it as a real GGML node with the sentinel-input values
+  // resolved from runtime input shapes. Folding-with-bindings is only useful
+  // when the result will itself flow into another op that knows how to consume
+  // bindings — graph outputs memcpy raw bytes and would leak the sentinel.
+  for (const auto& tensor : tensors) {
+    if (!tensor.dim_bindings.empty()) return std::nullopt;
+  }
+  bool any_bindings = false;
 
   Ort::ConstOpAttr attr{nullptr};
   const Ort::Status status = node.GetAttributeByName("axis", attr);
@@ -359,13 +424,36 @@ std::optional<ConstantTensor> EvalConcat(const ConstantValueMap& constants, Ort:
   }
   if (!FitsFoldLimit(out_dims)) return std::nullopt;
 
+  // Bindings can be concatenated flat only when the concat axis is the
+  // outermost one (axis==0) — then each input contributes a contiguous block
+  // of elements to the output in input order. For inner-axis concats the
+  // elements interleave, which we don't currently reconstruct.
+  if (any_bindings && axis != 0) return std::nullopt;
+  auto concat_bindings = [&]() {
+    std::vector<std::optional<DynamicDimBinding>> out;
+    if (!any_bindings) return out;
+    for (const auto& tensor : tensors) {
+      const size_t n = ElementCount(tensor.dims);
+      if (tensor.dim_bindings.empty()) {
+        out.insert(out.end(), n, std::nullopt);
+      } else {
+        GGONNX_ASSERT(tensor.dim_bindings.size() == n,
+                      "dim_bindings length mismatch in Concat input");
+        out.insert(out.end(), tensor.dim_bindings.begin(), tensor.dim_bindings.end());
+      }
+    }
+    return out;
+  };
+
   if (element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
     std::vector<int32_t> out;
     for (const auto& tensor : tensors) {
       auto values = ReadTypedData<int32_t>(tensor);
       out.insert(out.end(), values.begin(), values.end());
     }
-    return MakeConstant(std::move(out_dims), std::move(out), element_type);
+    auto result = MakeConstant(std::move(out_dims), std::move(out), element_type);
+    result.dim_bindings = concat_bindings();
+    return result;
   }
   if (element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
     std::vector<int64_t> out;
@@ -373,7 +461,9 @@ std::optional<ConstantTensor> EvalConcat(const ConstantValueMap& constants, Ort:
       auto values = ReadTypedData<int64_t>(tensor);
       out.insert(out.end(), values.begin(), values.end());
     }
-    return MakeConstant(std::move(out_dims), std::move(out), element_type);
+    auto result = MakeConstant(std::move(out_dims), std::move(out), element_type);
+    result.dim_bindings = concat_bindings();
+    return result;
   }
   if (element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     std::vector<float> out;
@@ -381,6 +471,7 @@ std::optional<ConstantTensor> EvalConcat(const ConstantValueMap& constants, Ort:
       auto values = ReadTypedData<float>(tensor);
       out.insert(out.end(), values.begin(), values.end());
     }
+    // float concat never has bindings (bindings live only on int shape tensors)
     return MakeConstant(std::move(out_dims), std::move(out), element_type);
   }
   return std::nullopt;
@@ -870,6 +961,23 @@ std::optional<ConstantTensor> EvalGather(const ConstantValueMap& constants, Ort:
       dst += inner_bytes;
     }
   }
+  // Propagate per-element bindings alongside the data copy. Gather is a
+  // permutation/selection at the element level, so this mirrors the memcpy
+  // loop above but operates on one optional<binding> per element.
+  if (!data->dim_bindings.empty()) {
+    const size_t inner_sz = static_cast<size_t>(inner);
+    out.dim_bindings.assign(ElementCount(out.dims), std::nullopt);
+    size_t d = 0;
+    for (int64_t o = 0; o < outer; ++o) {
+      for (int64_t k : idx_values) {
+        const size_t src = (static_cast<size_t>(o) * static_cast<size_t>(axis_len) +
+                            static_cast<size_t>(k)) * inner_sz;
+        for (size_t q = 0; q < inner_sz; ++q) {
+          out.dim_bindings[d++] = data->dim_bindings[src + q];
+        }
+      }
+    }
+  }
   return out;
 }
 
@@ -926,16 +1034,22 @@ std::optional<ConstantTensor> EvalShapeTensorGather(
   }
 
   std::vector<int64_t> gathered;
+  std::vector<size_t> picked_axes;
   gathered.reserve(raw_indices.size());
+  picked_axes.reserve(raw_indices.size());
   for (int64_t idx : raw_indices) {
     if (idx < 0) idx += rank;
     if (idx < 0 || idx >= rank) return std::nullopt;
     const int64_t dim = source_meta.dims[static_cast<size_t>(idx)];
     gathered.push_back(dim < 0 ? kUnknownShapeDimSentinel : dim);
+    picked_axes.push_back(static_cast<size_t>(idx));
   }
 
-  return MakeConstant<int64_t>(indices_meta.dims, std::move(gathered),
-                               ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  auto result = MakeConstant<int64_t>(indices_meta.dims, std::move(gathered),
+                                       ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+  result.dim_bindings =
+      MakeShapeBindings(source_meta.dims, std::string(shape_inputs[0].GetName()), picked_axes);
+  return result;
 }
 
 std::optional<ConstantTensor> EvalConstantOfShape(const ConstantValueMap& constants,
@@ -1102,6 +1216,10 @@ std::optional<ConstantTensor> TryFoldNode(const ConstantValueMap& constants, Ort
 }
 
 }  // namespace
+
+bool ConstantContainsSentinel(const ConstantTensor& tensor) {
+  return ContainsUnknownShapeDim(tensor);
+}
 
 std::string NodeKey(Ort::ConstNode node) {
   const auto outputs = node.GetOutputs();

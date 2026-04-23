@@ -11,6 +11,7 @@
 
 [[noreturn]] static void GGONNX_ABORT(const char* message) noexcept {
   fprintf(stderr, "%s\n", message);
+  fflush(stderr);
   std::abort();
 }
 
