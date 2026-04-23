@@ -10,6 +10,7 @@ from test_support import (
     assert_all_nodes_run_on_ggml,
     assert_provider_does_not_run_ops,
     cpu_session,
+    end_profiling_profile,
     ggml_session,
     ensure_model,
     ensure_model_with_opset,
@@ -49,6 +50,24 @@ def build_single_binary_model(tmpdir: Path, op_type: str) -> Path:
     z = helper.make_tensor_value_info("z", TensorProto.FLOAT, [2, 3])
     node = helper.make_node(op_type, ["x", "y"], ["z"], name=f"{op_type.lower()}_0")
     graph = helper.make_graph([node], f"single_{op_type.lower()}", [x, y], [z])
+    return ensure_model(tmpdir, graph)
+
+
+def build_bidirectional_broadcast_add_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 1])
+    z = helper.make_tensor_value_info("z", TensorProto.FLOAT, [2, 2])
+    node = helper.make_node("Add", ["x", "y"], ["z"], name="add_bidirectional_bcast")
+    graph = helper.make_graph([node], "bidirectional_broadcast_add", [x, y], [z])
+    return ensure_model(tmpdir, graph)
+
+
+def build_pow_model(tmpdir: Path, exponent: float) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+    exp_init = helper.make_tensor("exp", TensorProto.FLOAT, [], [exponent])
+    node = helper.make_node("Pow", ["x", "exp"], ["y"], name="pow_0")
+    graph = helper.make_graph([node], "single_pow", [x], [y], initializer=[exp_init])
     return ensure_model(tmpdir, graph)
 
 
@@ -241,6 +260,68 @@ def test_broadcast_add_runs_on_ggml(suite_tmpdir, ep_library: Path, debug_api) -
 def test_single_binary_ops(suite_tmpdir, ep_library: Path, op_type: str) -> None:
     model_path = build_single_binary_model(suite_tmpdir, op_type)
     assert_model_matches_cpu(model_path, ep_library, "z", standard_inputs())
+
+
+def test_pow_square_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_pow_model(suite_tmpdir, 2.0)
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    inputs = {"x": standard_inputs()["x"]}
+    cpu_out = cpu.run(["y"], inputs)[0]
+    ggml_out = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(ggml_out, cpu_out, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def test_pow_non_square_falls_back_to_cpu(suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_pow_model(suite_tmpdir, 3.0)
+    ggml = ggml_session(model_path, ep_library)
+    inputs = {"x": standard_inputs()["x"]}
+    ggml_out = ggml.run(["y"], inputs)[0]
+    expected = np.power(inputs["x"], 3.0, dtype=np.float32)
+    np.testing.assert_allclose(ggml_out, expected, rtol=1e-6, atol=1e-6)
+    profile = end_profiling_profile(ggml)
+    cpu_pow = [
+        event for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and event.get("args", {}).get("op_name") == "Pow"
+    ]
+    ggml_pow = [
+        event for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
+        and event.get("args", {}).get("op_name") == "Pow"
+    ]
+    assert cpu_pow, f"expected CPUExecutionProvider to run Pow, got profile: {profile}"
+    assert not ggml_pow, f"unexpected GGMLExecutionProvider Pow events: {ggml_pow}"
+
+
+def test_bidirectional_broadcast_add_falls_back_to_cpu(suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_bidirectional_broadcast_add_model(suite_tmpdir)
+    ggml = ggml_session(model_path, ep_library)
+    inputs = {
+        "x": np.array([[1.0, 2.0]], dtype=np.float32),
+        "y": np.array([[10.0], [20.0]], dtype=np.float32),
+    }
+    ggml_out = ggml.run(["z"], inputs)[0]
+    expected = np.array([[11.0, 12.0], [21.0, 22.0]], dtype=np.float32)
+    np.testing.assert_allclose(ggml_out, expected, rtol=1e-6, atol=1e-6)
+    profile = end_profiling_profile(ggml)
+    cpu_add = [
+        event for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and event.get("args", {}).get("op_name") == "Add"
+    ]
+    ggml_add = [
+        event for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
+        and event.get("args", {}).get("op_name") == "Add"
+    ]
+    assert cpu_add, f"expected CPUExecutionProvider to run Add, got profile: {profile}"
+    assert not ggml_add, f"unexpected GGMLExecutionProvider Add events: {ggml_add}"
 
 
 def build_scalar_broadcast_binary_model(tmpdir: Path, op_type: str, x_shape) -> Path:

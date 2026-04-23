@@ -441,44 +441,8 @@ std::vector<int64_t> inferBroadcastOutputDims(const std::vector<int64_t>& lhs_di
   return output_dims;
 }
 
-bool isNodeSupported(Ort::ConstNode node, const ConstantValueMap& constants) {
-  const Ort::ConstGraph graph = node.GetGraph();
-  if (graph.GetParentNode() != nullptr) {
-    for (Ort::ConstValueInfo output : node.GetOutputs()) {
-      if (output == nullptr) continue;
-      // Sequence/Optional outputs don't have a tensor shape — skip them so
-      // getTensorMetadata doesn't crash on GetTensorTypeAndShapeInfo.
-      if (!isTensorTyped(output)) {
-        return false;
-      }
-      const TensorMetadata meta = getTensorMetadata(output);
-      if (meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
-          meta.dims.empty()) {
-        return false;
-      }
-    }
-  }
-  // Empty tensors (any dim == 0) aren't something the ggml allocator or
-  // kernels handle cleanly — fall back to ORT's CPU kernels rather than
-  // risk a crash on the backend.
-  auto has_zero_dim = [](Ort::ConstValueInfo vi) {
-    if (vi == nullptr || !isTensorTyped(vi)) return false;
-    const TensorMetadata meta = getTensorMetadata(vi);
-    for (int64_t d : meta.dims) {
-      if (d == 0) return true;
-    }
-    return false;
-  };
-  for (Ort::ConstValueInfo input : node.GetInputs()) {
-    if (has_zero_dim(input)) return false;
-  }
-  for (Ort::ConstValueInfo output : node.GetOutputs()) {
-    if (has_zero_dim(output)) return false;
-  }
-  const std::string op_type = node.GetOperatorType();
-  const std::string domain = node.GetDomain();
-  const OpDefinition* op = FindOpDefinition(domain, op_type);
-  return op != nullptr && op->support(node, &constants);
+SupportResult isNodeSupported(Ort::ConstNode node, const ConstantValueMap& constants) {
+  return get_node_support(node, &constants);
 }
 
 // Maps ONNX element types to GGML types for tensors that flow through the GGML
@@ -771,8 +735,11 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       partition.nodes.push_back(std::move(compiled_node));
       continue;
     }
-    if (!isNodeSupported(node, meta_analysis.constants)) {
-      throw std::runtime_error("GGONNX Compile received an unsupported partition");
+    const SupportResult support = isNodeSupported(node, meta_analysis.constants);
+    if (!support.has_value()) {
+      throw std::runtime_error("GGONNX Compile received an unsupported node '" +
+                               std::string(node.GetOperatorType()) + "' (" + node.GetName() +
+                               "): " + support.error());
     }
 
     const auto node_inputs = node.GetInputs();
@@ -1417,7 +1384,8 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
           meta_analysis.fusions.window_mask_add_anchors.count(key) > 0;
       const bool is_fusion_consumed = meta_analysis.fusions.consumed_nodes.count(key) > 0;
       const bool supported =
-          (isNodeSupported(node, meta_analysis.constants) || is_fusion_anchor) && has_visible_output(node);
+          ((isNodeSupported(node, meta_analysis.constants).has_value()) || is_fusion_anchor) &&
+          has_visible_output(node);
       if (supported || meta_analysis.folded_nodes.count(key) > 0 || is_fusion_consumed) {
         current_group.push_back(node);
         current_group_has_runtime_node = current_group_has_runtime_node || supported;

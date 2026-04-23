@@ -1261,8 +1261,7 @@ std::optional<int64_t> ReadInt64Attr(Ort::ConstNode node, const char* name) {
 }
 
 bool IsNodeCompilable(Ort::ConstNode node, const ConstantValueMap& constants) {
-  const OpDefinition* op = FindOpDefinition(node.GetDomain(), node.GetOperatorType());
-  return op != nullptr && op->support != nullptr && op->support(node, &constants);
+  return get_node_support(node, &constants).has_value();
 }
 
 void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,

@@ -1,8 +1,10 @@
 #include "ops.hpp"
 #include "inner/helpers.hpp"
 #include "inner/ort_api_helpers.hpp"
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -12,6 +14,37 @@ static bool isGGMLFloatType(ONNXTensorElementDataType t) {
   return t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
          t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
 }
+
+std::string describe_node(Ort::ConstNode node) {
+  if (node == nullptr) return "<null-node>";
+  std::ostringstream oss;
+  oss << "'" << node.GetOperatorType() << "'";
+  const std::string name = node.GetName();
+  if (!name.empty()) oss << " (" << name << ")";
+  return oss.str();
+}
+
+bool support_trace_enabled() {
+  const char* trace = std::getenv("GGONNX_TRACE_SUPPORT");
+  return trace != nullptr && std::string(trace) != "0" && std::string(trace) != "";
+}
+
+SupportResult normalize_support_result(Ort::ConstNode node, SupportResult result) {
+  if (result.has_value()) return result;
+  if (!result.error().empty()) return result;
+  return support_error("support predicate rejected " + describe_node(node));
+}
+
+void trace_support_decision(Ort::ConstNode node, const SupportResult& result) {
+  if (!support_trace_enabled() || result.has_value()) return;
+  std::fprintf(stderr, "[ggonnx][support] reject %s: %s\n",
+               describe_node(node).c_str(), result.error().c_str());
+}
+
+#define SUPPORT_CHECK(cond, msg) \
+  do { \
+    if (!(cond)) return support_error(msg); \
+  } while (false)
 
 void ComputeErf(ggml_tensor* dst, const ggml_tensor* src, int ith, int nth, void* /*userdata*/) {
   GGONNX_NOT_NULL(dst, "Erf custom op destination must not be null");
@@ -69,6 +102,14 @@ std::optional<ConstantTensor> LookupCompileTimeConstant(Ort::ConstValueInfo valu
 
 }  // namespace
 
+SupportResult support_ok() {
+  return SupportResult::success();
+}
+
+SupportResult support_error(std::string message) {
+  return SupportResult::failure(std::move(message));
+}
+
 TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info) {
   const auto tensor_info = value_info.TypeInfo().GetTensorTypeAndShapeInfo();
 
@@ -76,6 +117,22 @@ TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info) {
   result.element_type = tensor_info.GetElementType();
   result.dims = tensor_info.GetShape();
   return result;
+}
+
+Expected<TensorMetadata, std::string> try_get_tensor_metadata(Ort::ConstValueInfo value_info) {
+  if (value_info == nullptr) {
+    return Expected<TensorMetadata, std::string>::failure("value info is null");
+  }
+  if (!isTensorTyped(value_info)) {
+    return Expected<TensorMetadata, std::string>::failure("value is not tensor-typed");
+  }
+  try {
+    return getTensorMetadata(value_info);
+  } catch (const Ort::Exception& ex) {
+    return Expected<TensorMetadata, std::string>::failure(ex.what());
+  } catch (const std::exception& ex) {
+    return Expected<TensorMetadata, std::string>::failure(ex.what());
+  }
 }
 
 bool isTensorTyped(Ort::ConstValueInfo value_info) {
@@ -197,12 +254,11 @@ bool inferIntegerSpatialScale(const TensorMetadata& x,
   return true;
 }
 
-bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_type,
+SupportResult IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_type,
                                        const ConstantValueMap* /*constants*/) {
-  if (!(op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div" ||
-        op_type == "Max" || op_type == "Min")) {
-    return false;
-  }
+  SUPPORT_CHECK(op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div" ||
+                    op_type == "Max" || op_type == "Min",
+                "unexpected binary op registration");
 
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -210,9 +266,8 @@ bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_t
   const size_t num_inputs = inputs.size();
   const size_t num_outputs = outputs.size();
   const size_t num_implicit_inputs = implicit_inputs.size();
-  if (num_inputs != 2 || num_outputs != 1 || num_implicit_inputs != 0) {
-    return false;
-  }
+  SUPPORT_CHECK(num_inputs == 2 && num_outputs == 1 && num_implicit_inputs == 0,
+                "binary ops require exactly 2 inputs, 1 output, and no implicit inputs");
 
   GGONNX_ASSERT(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
                 "ORT returned null binary op input/output metadata");
@@ -224,44 +279,51 @@ bool IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_t
   if (!isGGMLFloatType(lhs.element_type) ||
       rhs.element_type != lhs.element_type ||
       out.element_type != lhs.element_type) {
-    return false;
+    return support_error("binary op tensors must all share the same float element type");
   }
   // Max/Min are synthesized via ggml_scale which is F32-only on CPU.
   if ((op_type == "Max" || op_type == "Min") &&
       lhs.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
+    return support_error("Max/Min are only supported for float32 tensors");
   }
-  if (!rankSupportedByGGML(lhs) || !rankSupportedByGGML(rhs) || !rankSupportedByGGML(out)) {
-    return false;
-  }
+  SUPPORT_CHECK(rankSupportedByGGML(lhs) && rankSupportedByGGML(rhs) && rankSupportedByGGML(out),
+                "binary op rank exceeds GGML_MAX_DIMS");
   // Either operand may broadcast to the output shape — check both sides against
   // the output rather than against each other. The older lhs→rhs check only
   // accepted broadcasts where rhs was the larger side.
-  if (!broadcastSupportedByGGML(lhs.dims, out.dims)) {
-    return false;
-  }
-  if (!broadcastSupportedByGGML(rhs.dims, out.dims)) {
-    return false;
-  }
+  SUPPORT_CHECK(broadcastSupportedByGGML(lhs.dims, out.dims),
+                "left operand cannot broadcast to output shape");
+  SUPPORT_CHECK(broadcastSupportedByGGML(rhs.dims, out.dims),
+                "right operand cannot broadcast to output shape");
 
   // GGML's binary ops require the second operand to broadcast into the first
   // (the first operand's shape determines the output). For commutative ops we
-  // can swap operands at emit time, but for Sub/Div the order is meaningful, so
-  // only accept the node if lhs already matches the output shape.
+  // can swap operands at emit time, but only if one operand can serve as the
+  // full output shape directly. ONNX patterns where both operands broadcast
+  // into a third shape (e.g. [1,2] + [2,1] -> [2,2]) are not representable by
+  // ggml's binary kernels.
   const bool commutative =
       (op_type == "Add" || op_type == "Mul" || op_type == "Max" || op_type == "Min");
-  if (!commutative && ToPaddedGGMLDims(lhs.dims) != ToPaddedGGMLDims(out.dims)) {
-    return false;
+  if (commutative) {
+    const bool rhs_into_lhs = broadcastSupportedByGGML(rhs.dims, lhs.dims);
+    const bool lhs_into_rhs = broadcastSupportedByGGML(lhs.dims, rhs.dims);
+    SUPPORT_CHECK(rhs_into_lhs || lhs_into_rhs,
+                  "GGML cannot realize this ONNX broadcast because neither operand can be the output shape");
+  } else {
+    SUPPORT_CHECK(ToPaddedGGMLDims(lhs.dims) == ToPaddedGGMLDims(out.dims),
+                  "Sub/Div require lhs shape to match the output exactly");
+    SUPPORT_CHECK(broadcastSupportedByGGML(rhs.dims, lhs.dims),
+                  "Sub/Div require rhs to broadcast directly into lhs");
   }
 
-  return true;
+  return support_ok();
 }
 
-bool IsSupportedElementwiseBinaryOpNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedElementwiseBinaryOpNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   return IsSupportedElementwiseBinaryNode(node, node.GetOperatorType(), constants);
 }
 
-bool IsSupportedGRUNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedGRUNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   const auto implicit_inputs = node.GetImplicitInputs();
@@ -400,8 +462,22 @@ EmitResult EmitElementwiseBinaryNode(ggml_context* ctx,
   // smaller tensor first (e.g. `bias [N] + matmul [B, S, N]`).
   const bool commutative =
       (op_type == "Add" || op_type == "Mul" || op_type == "Max" || op_type == "Min");
-  if (commutative && !ggml_can_repeat(rhs, lhs)) {
-    std::swap(lhs, rhs);
+  if (commutative) {
+    if (!ggml_can_repeat(rhs, lhs)) {
+      if (ggml_can_repeat(lhs, rhs)) {
+        std::swap(lhs, rhs);
+      } else {
+        throw std::runtime_error(
+            "GGML cannot realize ONNX broadcast for '" + std::string(op_type) + "': lhs " +
+            FormatDims(ToOnnxDims(lhs)) + ", rhs " + FormatDims(ToOnnxDims(rhs)) +
+            ". ONNX allows both operands to broadcast into a third shape, but ggml requires one operand to be the output shape.");
+      }
+    }
+  } else if (!ggml_can_repeat(rhs, lhs)) {
+    throw std::runtime_error(
+        "GGML cannot realize broadcast for '" + std::string(op_type) + "': rhs " +
+        FormatDims(ToOnnxDims(rhs)) + " does not broadcast into lhs " +
+        FormatDims(ToOnnxDims(lhs)));
   }
   if (op_type == "Add") {
     return EmitOutputs{ggml_add(ctx, lhs, rhs)};
@@ -564,7 +640,7 @@ EmitResult EmitGRUNode(ggml_context* ctx,
   return outputs;
 }
 
-bool IsSupportedLSTMNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedLSTMNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   const auto implicit_inputs = node.GetImplicitInputs();
@@ -854,7 +930,7 @@ EmitResult EmitLSTMNode(ggml_context* ctx,
 
 // Shape-preserving unary float op with no attributes. Covers Relu, Sigmoid, Tanh, Neg,
 // Abs, Sqrt, Exp, Log, Erf, Softplus, Elu (ONNX default alpha=1.0 only).
-bool IsSupportedUnaryFloatNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedUnaryFloatNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -917,7 +993,7 @@ EmitResult EmitUnaryFloatNode(ggml_context* ctx,
   return std::nullopt;
 }
 
-bool IsSupportedLeakyReluNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedLeakyReluNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   return IsSupportedUnaryFloatNode(node, constants);
 }
 
@@ -942,7 +1018,7 @@ EmitResult EmitLeakyReluNode(ggml_context* ctx,
 // unidirectionally broadcastable to X. ggml has no native PRelu, so we emit
 // Y = relu(X) - slope * relu(-X), which evaluates to relu(X) when X >= 0 and
 // to slope * X when X < 0 (since -relu(-X) == X on that branch).
-bool IsSupportedPReluNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedPReluNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -1006,7 +1082,62 @@ static std::optional<float> readClipBound(Ort::ConstNode node, size_t input_idx,
   return std::nullopt;
 }
 
-bool IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+static std::optional<float> readPowExponent(Ort::ConstNode node, const ConstantValueMap* constants) {
+  if (const auto v = readConstantInputArray<float>(node, 1,
+                                                   ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, constants)) {
+    if (v->size() == 1) return (*v)[0];
+    return std::nullopt;
+  }
+  if (const auto v = readConstantInputArray<ggml_fp16_t>(node, 1,
+                                                         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, constants)) {
+    if (v->size() == 1) return ggml_fp16_to_fp32((*v)[0]);
+    return std::nullopt;
+  }
+  if (const auto v = readConstantInputArray<int32_t>(node, 1,
+                                                     ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, constants)) {
+    if (v->size() == 1) return static_cast<float>((*v)[0]);
+    return std::nullopt;
+  }
+  if (const auto v = readConstantInputArray<int64_t>(node, 1,
+                                                     ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants)) {
+    if (v->size() == 1) return static_cast<float>((*v)[0]);
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+SupportResult IsSupportedPowNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "Pow requires exactly 2 inputs, 1 output, and no implicit inputs");
+  SUPPORT_CHECK(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
+                "Pow input/output metadata must not be null");
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  SUPPORT_CHECK(isGGMLFloatType(x.element_type) && y.element_type == x.element_type,
+                "Pow only supports float/float16 tensors with matching output type");
+  SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(y),
+                "Pow rank exceeds GGML_MAX_DIMS");
+  const auto exponent = readPowExponent(node, constants);
+  SUPPORT_CHECK(exponent.has_value(), "Pow exponent must be a compile-time scalar constant");
+  SUPPORT_CHECK(std::fabs(*exponent - 2.0f) <= 1e-6f,
+                "Pow only supports exponent 2");
+  return support_ok();
+}
+
+EmitResult EmitPowNode(ggml_context* ctx,
+                       const NodeDesc& node,
+                       const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(node.inputs.size() == 2 && node.outputs.size() == 1,
+                "compiled Pow node has invalid arity");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Pow node missing GGML base input");
+  return EmitOutputs{ggml_sqr(ctx, x)};
+}
+
+SupportResult IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.empty() || inputs.size() > 3 || outputs.size() != 1 ||
@@ -1065,29 +1196,24 @@ EmitResult EmitClipNode(ggml_context* ctx,
 // ONNX Softmax (opset >= 13): softmax along `axis` (default -1). GGML's ggml_soft_max
 // operates along ne[0], which is the last ONNX dim.. so we only accept axis=-1 or
 // axis=rank-1. Pre-opset-13 Softmax with its "coerce to 2D" semantics is rejected.
-bool IsSupportedSoftmaxNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedSoftmaxNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (inputs[0] == nullptr || outputs[0] == nullptr) {
-    return false;
-  }
+  SUPPORT_CHECK(inputs.size() == 1 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "Softmax requires exactly 1 input, 1 output, and no implicit inputs");
+  SUPPORT_CHECK(inputs[0] != nullptr && outputs[0] != nullptr,
+                "Softmax input/output metadata must not be null");
   const TensorMetadata in = getTensorMetadata(inputs[0]);
-  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || !rankSupportedByGGML(in)) {
-    return false;
-  }
-  if (in.dims.empty()) {
-    return false;
-  }
+  SUPPORT_CHECK(in.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "Softmax only supports float32 tensors");
+  SUPPORT_CHECK(rankSupportedByGGML(in), "Softmax rank exceeds GGML_MAX_DIMS");
+  SUPPORT_CHECK(!in.dims.empty(), "Softmax does not support scalar tensors");
   const int64_t rank = static_cast<int64_t>(in.dims.size());
   const int64_t axis = readNodeAttribute<int64_t>(node, "axis").value_or(-1);
   const int64_t normalized = axis < 0 ? axis + rank : axis;
-  if (normalized != rank - 1) {
-    return false;
-  }
-  return true;
+  SUPPORT_CHECK(normalized == rank - 1,
+                "Softmax only supports the trailing ONNX axis");
+  return support_ok();
 }
 
 void CompileSoftmaxAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
@@ -1111,45 +1237,39 @@ EmitResult EmitSoftmaxNode(ggml_context* ctx,
 // (the shared K), so we transpose+materialize B to get [K, N, batch...] and pass
 // that as the "weight" operand. Result shape is [N, M, batch...] which is the
 // reversed ONNX [..., M, N]. We require batch dims to match exactly for now.
-bool IsSupportedMatMulNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedMatMulNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr) {
-    return false;
-  }
+  SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "MatMul requires exactly 2 inputs, 1 output, and no implicit inputs");
+  SUPPORT_CHECK(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
+                "MatMul input/output metadata must not be null");
   const TensorMetadata a = getTensorMetadata(inputs[0]);
   const TensorMetadata b = getTensorMetadata(inputs[1]);
   const TensorMetadata c = getTensorMetadata(outputs[0]);
   if (a.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
       b.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
       c.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
+    return support_error("MatMul only supports float32 tensors");
   }
-  if (a.dims.size() < 2 || b.dims.size() < 2) {
-    return false;
-  }
-  if (a.dims.size() != b.dims.size()) {
-    return false;  // skip rank-broadcasting matmul for now
-  }
-  if (!rankSupportedByGGML(a) || !rankSupportedByGGML(b) || !rankSupportedByGGML(c)) {
-    return false;
-  }
+  SUPPORT_CHECK(a.dims.size() >= 2 && b.dims.size() >= 2,
+                "MatMul requires both operands to have rank >= 2");
+  SUPPORT_CHECK(a.dims.size() == b.dims.size(),
+                "MatMul batch-rank broadcasting is not supported yet");
+  SUPPORT_CHECK(rankSupportedByGGML(a) && rankSupportedByGGML(b) && rankSupportedByGGML(c),
+                "MatMul rank exceeds GGML_MAX_DIMS");
   // Inner dims must agree when both are concrete.
   const int64_t a_k = a.dims[a.dims.size() - 1];
   const int64_t b_k = b.dims[b.dims.size() - 2];
-  if (a_k >= 0 && b_k >= 0 && a_k != b_k) {
-    return false;
-  }
+  SUPPORT_CHECK(!(a_k >= 0 && b_k >= 0 && a_k != b_k),
+                "MatMul inner dimensions do not match");
   // Batch dims must match exactly (concrete or symbolic-identical not checked — conservative).
   for (size_t i = 0; i + 2 < a.dims.size(); ++i) {
     if (a.dims[i] >= 0 && b.dims[i] >= 0 && a.dims[i] != b.dims[i]) {
-      return false;
+      return support_error("MatMul batch dimensions must match exactly");
     }
   }
-  return true;
+  return support_ok();
 }
 
 void CompileMatMulAttributes(Ort::ConstNode /*node*/, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
@@ -1254,16 +1374,14 @@ ggml_tensor* CropSpatialOutputIfNeeded(ggml_context* ctx,
 
 }  // namespace
 
-bool IsSupportedConvNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedConvNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
-      node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr) {
-    return false;
-  }
+  SUPPORT_CHECK((inputs.size() == 2 || inputs.size() == 3) && outputs.size() == 1 &&
+                    node.GetImplicitInputs().size() == 0,
+                "Conv requires 2 or 3 inputs, 1 output, and no implicit inputs");
+  SUPPORT_CHECK(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
+                "Conv input/output metadata must not be null");
 
   const TensorMetadata x = getTensorMetadata(inputs[0]);
   const TensorMetadata w = getTensorMetadata(inputs[1]);
@@ -1271,44 +1389,41 @@ bool IsSupportedConvNode(Ort::ConstNode node, const ConstantValueMap* /*constant
   if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
       w.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
       y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
+    return support_error("Conv only supports float32 tensors");
   }
-  if (w.dims.size() != 3 && w.dims.size() != 4) {
-    return false;
-  }
+  SUPPORT_CHECK(w.dims.size() == 3 || w.dims.size() == 4,
+                "Conv only supports 1D and 2D kernels");
   const size_t spatial_rank = w.dims.size() - 2;
-  if ((x.dims.empty() ? false : x.dims.size() != spatial_rank + 2) ||
-      (y.dims.empty() ? false : y.dims.size() != spatial_rank + 2)) {
-    return false;
-  }
-  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(w) || !rankSupportedByGGML(y)) {
-    return false;
-  }
+  SUPPORT_CHECK(!x.dims.empty() && x.dims.size() == spatial_rank + 2 &&
+                    !y.dims.empty() && y.dims.size() == spatial_rank + 2,
+                "Conv input/output rank does not match the kernel rank");
+  SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(w) && rankSupportedByGGML(y),
+                "Conv rank exceeds GGML_MAX_DIMS");
 
   // Accept group == 1 (regular conv) and depthwise (group == C_in == C_out with
   // weight shape [C, 1, kH, kW]). Depthwise maps to ggml_conv_2d_dw_direct.
   const int64_t group = readNodeAttribute<int64_t>(node, "group").value_or(1);
   if (group != 1) {
-    if (!x.dims.empty() && x.dims[1] < 0) return false;
-    if (w.dims[0] < 0 || w.dims[1] < 0) return false;
-    if (!y.dims.empty() && y.dims[1] < 0) return false;
-    if (!x.dims.empty() && group != x.dims[1]) return false;  // must equal C_in
-    if (w.dims[0] != group) return false;           // C_out == group (multiplier 1)
-    if (w.dims[1] != 1) return false;               // weight IC/group == 1
-    if (!y.dims.empty() && y.dims[1] != group) return false;
+    SUPPORT_CHECK(!x.dims.empty() && x.dims[1] >= 0, "depthwise Conv requires static input channels");
+    SUPPORT_CHECK(w.dims[0] >= 0 && w.dims[1] >= 0, "depthwise Conv requires static weight channels");
+    SUPPORT_CHECK(!y.dims.empty() && y.dims[1] >= 0, "depthwise Conv requires static output channels");
+    SUPPORT_CHECK(group == x.dims[1], "depthwise Conv requires group == input channels");
+    SUPPORT_CHECK(w.dims[0] == group, "depthwise Conv requires output channels == group");
+    SUPPORT_CHECK(w.dims[1] == 1, "depthwise Conv requires weight IC/group == 1");
+    SUPPORT_CHECK(y.dims[1] == group, "depthwise Conv requires output channels == group");
   }
 
   const std::string auto_pad = readNodeAttribute<std::string>(node, "auto_pad").value_or("NOTSET");
   if (auto_pad != "NOTSET" && auto_pad != "VALID" &&
       auto_pad != "SAME_UPPER" && auto_pad != "SAME_LOWER") {
-    return false;
+    return support_error("Conv auto_pad must be NOTSET, VALID, SAME_UPPER, or SAME_LOWER");
   }
   const bool same_auto_pad = auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER";
   if (same_auto_pad) {
-    if (spatial_rank == 1) return false;
+    SUPPORT_CHECK(spatial_rank != 1, "Conv1D does not support SAME_* auto_pad");
     if (x.dims[2] < 0 || x.dims[3] < 0 || y.dims[2] < 0 || y.dims[3] < 0 ||
         w.dims[2] < 0 || w.dims[3] < 0) {
-      return false;
+      return support_error("SAME_* Conv requires concrete spatial dimensions");
     }
   }
 
@@ -1339,17 +1454,19 @@ bool IsSupportedConvNode(Ort::ConstNode node, const ConstantValueMap* /*constant
     }
   }
 
-  if (group == 1 && !x.dims.empty() && x.dims[1] >= 0 && w.dims[1] >= 0 && x.dims[1] != w.dims[1]) {
-    return false;  // IC mismatch (group=1 path).
-  }
+  SUPPORT_CHECK(!(group == 1 && !x.dims.empty() && x.dims[1] >= 0 && w.dims[1] >= 0 &&
+                  x.dims[1] != w.dims[1]),
+                "Conv input channels must match weight channels");
 
   if (inputs.size() == 3 && inputs[2] != nullptr) {
     const TensorMetadata b = getTensorMetadata(inputs[2]);
-    if (b.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || b.dims.size() != 1) return false;
-    if (b.dims[0] >= 0 && w.dims[0] >= 0 && b.dims[0] != w.dims[0]) return false;
+    SUPPORT_CHECK(b.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT && b.dims.size() == 1,
+                  "Conv bias must be a float32 1D tensor");
+    SUPPORT_CHECK(!(b.dims[0] >= 0 && w.dims[0] >= 0 && b.dims[0] != w.dims[0]),
+                  "Conv bias length must match output channels");
   }
 
-  return true;
+  return support_ok();
 }
 
 void CompileConvAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
@@ -1485,7 +1602,7 @@ EmitResult EmitConvNode(ggml_context* ctx,
 // ONNX ConvTranspose: 2D only, square stride, symmetric pads. Maps to
 // ggml_conv_transpose_2d_p0 (no built-in padding) followed by a center crop
 // when ONNX pads are non-zero, since output = (in-1)*s - 2p + kernel.
-bool IsSupportedConvTransposeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedConvTransposeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
@@ -1586,7 +1703,7 @@ EmitResult EmitConvTransposeNode(ggml_context* ctx,
 // be a compile-time constant so the target dims land in the compiled attrs —
 // ORT's shape inference typically leaves the output shape symbolic when the
 // shape tensor comes from a Where/Equal chain.
-bool IsSupportedExpandNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedExpandNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -1660,7 +1777,7 @@ EmitResult EmitExpandNode(ggml_context* ctx,
 // ONNX Gemm: Y = alpha * A' @ B' + beta * C, where A' = transA ? A^T : A (shape [M,K])
 // and B' = transB ? B^T : B (shape [K,N]). Maps to ggml_mul_mat after making both
 // operands have the shared K dim at ne[0].
-bool IsSupportedGemmNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedGemmNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
@@ -1768,7 +1885,7 @@ EmitResult EmitGemmNode(ggml_context* ctx,
 // ONNX Reshape: data + shape input. We require the output shape to be fully static
 // (resolved by shape inference) and snapshot it at compile time — the runtime shape
 // tensor is ignored.
-bool IsSupportedReshapeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedReshapeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -1830,7 +1947,7 @@ EmitResult EmitReshapeNode(ggml_context* ctx,
 // ONNX Flatten: collapses input dims around `axis` into a 2D tensor. We reuse
 // the Reshape machinery — the output shape is fully determined by shape
 // inference, so we snapshot it and emit a ggml reshape.
-bool IsSupportedFlattenNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedFlattenNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -1858,7 +1975,7 @@ bool IsSupportedFlattenNode(Ort::ConstNode node, const ConstantValueMap* /*const
 // derive the actual output shape from the runtime input tensor in EmitSqueezeNode,
 // so the emit is correct even when ORT's static shape inference for If-branch
 // subgraphs is inconsistent with the actual runtime input shape.
-bool IsSupportedSqueezeNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedSqueezeNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if ((inputs.size() != 1 && inputs.size() != 2) || outputs.size() != 1 ||
@@ -2017,7 +2134,7 @@ void CompileFlattenAttributes(Ort::ConstNode node, NodeDesc* compiled_node, cons
 // strides/pads are [h, w] so we swap. GGML's AveragePool divides by the full kernel
 // area regardless of how many in-bounds samples were summed (i.e. count_include_pad=1),
 // so we reject AveragePool with non-zero padding unless count_include_pad=1.
-bool IsSupportedPool2DNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedPool2DNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.empty() || node.GetImplicitInputs().size() != 0) {
@@ -2143,7 +2260,7 @@ void CompilePool2DAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const
   compiled_node->attrs = attrs;
 }
 
-bool IsSupportedGlobalPoolNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedGlobalPoolNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2212,7 +2329,7 @@ EmitResult EmitPool2DNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
-bool IsSupportedPadNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedPadNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.empty() || inputs.size() > 4 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2381,7 +2498,7 @@ EmitResult EmitPadNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
-bool IsSupportedInstanceNormalizationNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedInstanceNormalizationNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 3 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2447,7 +2564,7 @@ EmitResult EmitInstanceNormalizationNode(ggml_context* ctx,
   return EmitOutputs{ggml_add(ctx, ggml_mul(ctx, norm, scale_4d), bias_4d)};
 }
 
-bool IsSupportedUpsampleNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedUpsampleNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   const std::string op_type = node.GetOperatorType();
@@ -2587,7 +2704,7 @@ EmitResult EmitUpsampleNode(ggml_context* ctx,
 // Identity: logical copy. We emit a view of the input so the result has a
 // distinct ggml_tensor* (graph build asserts on reused output slots) while
 // sharing storage and staying cheap.
-bool IsSupportedIdentityNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedIdentityNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2629,7 +2746,7 @@ EmitResult EmitIdentityNode(ggml_context* ctx,
 // ONNX Transpose: permutes dims by `perm` (default = reverse). GGML dim order is
 // reversed vs ONNX, so the ggml axis that feeds output GGML axis j is
 // R-1 - perm[R-1 - j]. Axes beyond the ONNX rank are padded identity.
-bool IsSupportedTransposeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedTransposeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2718,7 +2835,7 @@ EmitResult EmitTransposeNode(ggml_context* ctx,
 // ONNX Concat: join N inputs along `axis`. GGML's ggml_concat takes two tensors
 // and a GGML-axis integer, so we translate ONNX axis -> (rank-1-axis) and fold
 // left-to-right.
-bool IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.empty() || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2784,7 +2901,7 @@ EmitResult EmitConcatNode(ggml_context* ctx,
 // common case where starts/ends/axes/steps are constant int64 initializers and
 // all steps are 1 — that lets us lower the op to a single ggml_view_4d, which
 // is a zero-copy aliased view of the source buffer.
-bool IsSupportedSliceNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedSliceNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() < 3 || inputs.size() > 5 || outputs.size() != 1 ||
@@ -2919,7 +3036,7 @@ EmitResult EmitSliceNode(ggml_context* ctx,
 // reversed layout is ggml axis (rank-2). ORT usually folds BN into the
 // preceding Conv bias, so this mostly matters for BN outside Conv (e.g. the
 // trailing BN on arcface's flattened feature vector, or language models).
-bool IsSupportedBatchNormNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedBatchNormNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 5 || outputs.size() != 1 ||
@@ -3009,7 +3126,7 @@ EmitResult EmitBatchNormNode(ggml_context* ctx,
 // We handle the case where the split sizes are known at compile time — either
 // via the `split` attribute (opset <13), the `split` input (opset 13+), or by
 // equal division into `outputs.size()` chunks (the default).
-bool IsSupportedSplitNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedSplitNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.empty() || inputs.size() > 2 || outputs.empty() ||
@@ -3114,7 +3231,7 @@ EmitResult EmitSplitNode(ggml_context* ctx,
 // contiguous suffix of the ONNX dims — e.g. axes=[2,3] on an [N,C,H,W] input —
 // because that's what ggml_mean (which reduces only axis 0) can express after
 // collapsing the trailing dims.
-bool IsSupportedReduceMeanNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedReduceMeanNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.empty() || inputs.size() > 2 || outputs.size() != 1 ||
@@ -3332,7 +3449,7 @@ static ggml_tensor* EmitDepthToSpaceShuffleBatch1(ggml_context* ctx,
   return ggml_reshape_4d(ctx, p2, W * b, H * b, Cout, 1);
 }
 
-bool IsSupportedDepthToSpaceNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedDepthToSpaceNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -3499,6 +3616,80 @@ EmitResult EmitQKVSplitNode(ggml_context* ctx,
   return out;
 }
 
+SupportResult get_node_support(Ort::ConstNode node, const ConstantValueMap* constants) {
+  try {
+    if (node == nullptr) {
+      return support_error("node metadata must not be null");
+    }
+
+    const Ort::ConstGraph graph = node.GetGraph();
+    if (graph.GetParentNode() != nullptr) {
+      for (Ort::ConstValueInfo output : node.GetOutputs()) {
+        if (output == nullptr) continue;
+        const auto meta = try_get_tensor_metadata(output);
+        if (!meta.has_value()) {
+          auto result = support_error("subgraph output '" + std::string(output.GetName()) +
+                                     "' is not a usable tensor: " + meta.error());
+          trace_support_decision(node, result);
+          return result;
+        }
+        if (meta.value().element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+            meta.value().dims.empty()) {
+          auto result = support_error("subgraph scalar float outputs are not supported");
+          trace_support_decision(node, result);
+          return result;
+        }
+      }
+    }
+
+    auto has_zero_dim = [](Ort::ConstValueInfo vi) -> SupportResult {
+      if (vi == nullptr) return support_ok();
+      const auto meta = try_get_tensor_metadata(vi);
+      if (!meta.has_value()) return support_ok();
+      for (int64_t dim : meta.value().dims) {
+        if (dim == 0) {
+          return support_error("zero-sized tensors are not supported");
+        }
+      }
+      return support_ok();
+    };
+
+    for (Ort::ConstValueInfo input : node.GetInputs()) {
+      SupportResult result = has_zero_dim(input);
+      if (!result.has_value()) {
+        trace_support_decision(node, result);
+        return result;
+      }
+    }
+    for (Ort::ConstValueInfo output : node.GetOutputs()) {
+      SupportResult result = has_zero_dim(output);
+      if (!result.has_value()) {
+        trace_support_decision(node, result);
+        return result;
+      }
+    }
+
+    const OpDefinition* op = FindOpDefinition(node.GetDomain(), node.GetOperatorType());
+    if (op == nullptr || op->support == nullptr) {
+      auto result = support_error("operator is not registered in GGONNX");
+      trace_support_decision(node, result);
+      return result;
+    }
+
+    SupportResult result = normalize_support_result(node, op->support(node, constants));
+    trace_support_decision(node, result);
+    return result;
+  } catch (const Ort::Exception& ex) {
+    SupportResult result = support_error(std::string("ORT exception in support check: ") + ex.what());
+    trace_support_decision(node, result);
+    return result;
+  } catch (const std::exception& ex) {
+    SupportResult result = support_error(std::string("support check threw: ") + ex.what());
+    trace_support_decision(node, result);
+    return result;
+  }
+}
+
 const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view op_type) {
 
   struct PairHash {
@@ -3527,6 +3718,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Erf"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Softplus"}, {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Elu"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
+      {{"", "Pow"},      {IsSupportedPowNode, nullptr, EmitPowNode}},
       {{"", "LeakyRelu"}, {IsSupportedLeakyReluNode, CompileLeakyReluAttributes, EmitLeakyReluNode}},
       {{"", "PRelu"},     {IsSupportedPReluNode, nullptr, EmitPReluNode}},
       {{"", "Clip"},      {IsSupportedClipNode, CompileClipAttributes, EmitClipNode}},

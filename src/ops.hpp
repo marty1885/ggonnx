@@ -14,6 +14,7 @@
 
 #include <onnxruntime/onnxruntime_cxx_api.h>
 
+#include "expected.hpp"
 #include "inner/helpers.hpp"
 
 inline constexpr size_t kOptionalValueAbsent = std::numeric_limits<size_t>::max();
@@ -30,9 +31,14 @@ struct ConstantTensor {
 };
 
 using ConstantValueMap = std::unordered_map<std::string, ConstantTensor>;
+using SupportResult = ExpectedVoid<std::string>;
 
 TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info);
 TensorMetadata getTensorMetadata(Ort::ConstValue value);
+Expected<TensorMetadata, std::string> try_get_tensor_metadata(Ort::ConstValueInfo value_info);
+SupportResult get_node_support(Ort::ConstNode node, const ConstantValueMap* constants);
+SupportResult support_error(std::string message);
+SupportResult support_ok();
 
 // True only for plain tensor-typed value infos. Sequence/Optional/Map types
 // make GetTensorTypeAndShapeInfo() invalid — any support-check path that
@@ -299,7 +305,7 @@ enum class ConstantLayout {
 using ConstantLayoutFn = ConstantLayout (*)(const NodeDesc& node, size_t input_idx);
 
 struct OpDefinition {
-  bool (*support)(Ort::ConstNode node, const ConstantValueMap* constants);
+  SupportResult (*support)(Ort::ConstNode node, const ConstantValueMap* constants);
   CompileAttrsFn compile_attrs;
   EmitNodeFn emit;
   ConstantLayoutFn constant_layout;
