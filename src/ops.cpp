@@ -1186,6 +1186,93 @@ EmitResult EmitCumSumNode(ggml_context* ctx,
   return EmitOutputs{ggml_cumsum(ctx, x)};
 }
 
+// ONNX Range(start, limit, delta): emits a 1-D tensor with
+//   N = max(ceil((limit - start) / delta), 0) elements.
+// ggml_arange takes start/stop/step as floats, so all three inputs must be
+// compile-time scalar constants. Integer outputs are produced by casting the
+// F32 arange result.
+static std::optional<float> readConstantScalarAsFloat(Ort::ConstNode node,
+                                                      size_t input_idx,
+                                                      const ConstantValueMap* constants) {
+  if (const auto v = readConstantInputArray<float>(node, input_idx,
+                                                   ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, constants)) {
+    if (v->size() == 1) return (*v)[0];
+    return std::nullopt;
+  }
+  if (const auto v = readConstantInputArray<ggml_fp16_t>(node, input_idx,
+                                                         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, constants)) {
+    if (v->size() == 1) return ggml_fp16_to_fp32((*v)[0]);
+    return std::nullopt;
+  }
+  if (const auto v = readConstantInputArray<int32_t>(node, input_idx,
+                                                     ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, constants)) {
+    if (v->size() == 1) return static_cast<float>((*v)[0]);
+    return std::nullopt;
+  }
+  if (const auto v = readConstantInputArray<int64_t>(node, input_idx,
+                                                     ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants)) {
+    if (v->size() == 1) return static_cast<float>((*v)[0]);
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+SupportResult IsSupportedRangeNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  SUPPORT_CHECK(inputs.size() == 3 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "Range requires exactly 3 inputs, 1 output, and no implicit inputs");
+  SUPPORT_CHECK(inputs[0] != nullptr && inputs[1] != nullptr && inputs[2] != nullptr &&
+                    outputs[0] != nullptr,
+                "Range input/output metadata must not be null");
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  const auto target_gtype = OnnxTypeToGGML(out.element_type);
+  SUPPORT_CHECK(target_gtype.has_value(), "Range: unsupported output element type");
+  SUPPORT_CHECK(out.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+                    out.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 ||
+                    out.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                "Range: output type must be float/int32/int64");
+  const auto start = readConstantScalarAsFloat(node, 0, constants);
+  const auto limit = readConstantScalarAsFloat(node, 1, constants);
+  const auto delta = readConstantScalarAsFloat(node, 2, constants);
+  SUPPORT_CHECK(start.has_value() && limit.has_value() && delta.has_value(),
+                "Range: start/limit/delta must be compile-time scalar constants");
+  SUPPORT_CHECK(*delta != 0.0f, "Range: delta must be non-zero");
+  return support_ok();
+}
+
+void CompileRangeAttributes(Ort::ConstNode node, NodeDesc* compiled_node,
+                            const ConstantValueMap* constants) {
+  const auto outputs = node.GetOutputs();
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  const auto start = readConstantScalarAsFloat(node, 0, constants);
+  const auto limit = readConstantScalarAsFloat(node, 1, constants);
+  const auto delta = readConstantScalarAsFloat(node, 2, constants);
+  GGONNX_ASSERT(start.has_value() && limit.has_value() && delta.has_value(),
+                "Range compile: start/limit/delta must be constant scalars");
+  NodeDesc::RangeAttrs attrs;
+  attrs.start = *start;
+  attrs.limit = *limit;
+  attrs.delta = *delta;
+  attrs.target_type = OnnxTypeToGGML(out.element_type).value_or(GGML_TYPE_F32);
+  compiled_node->attrs = attrs;
+}
+
+EmitResult EmitRangeNode(ggml_context* ctx,
+                         const NodeDesc& node,
+                         const std::vector<ggml_tensor*>& /*values*/) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::RangeAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Range node missing attributes");
+  ggml_tensor* out = ggml_arange(ctx, attrs->start, attrs->limit, attrs->delta);
+  GGONNX_NOT_NULL(out, "ggml_arange returned null");
+  if (attrs->target_type != GGML_TYPE_F32) {
+    out = ggml_cast(ctx, out, attrs->target_type);
+    GGONNX_NOT_NULL(out, "ggml_cast for Range output returned null");
+  }
+  return EmitOutputs{out};
+}
+
 SupportResult IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -3873,6 +3960,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Elu"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Pow"},      {IsSupportedPowNode, nullptr, EmitPowNode}},
       {{"", "CumSum"},   {IsSupportedCumSumNode, nullptr, EmitCumSumNode}},
+      {{"", "Range"},    {IsSupportedRangeNode, CompileRangeAttributes, EmitRangeNode}},
       {{"", "LeakyRelu"}, {IsSupportedLeakyReluNode, CompileLeakyReluAttributes, EmitLeakyReluNode}},
       {{"", "PRelu"},     {IsSupportedPReluNode, nullptr, EmitPReluNode}},
       {{"", "Clip"},      {IsSupportedClipNode, CompileClipAttributes, EmitClipNode}},

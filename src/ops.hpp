@@ -278,6 +278,16 @@ struct NodeDesc {
     // Driven by the `ep.ggonnx.matmul_precision` provider option.
     bool force_f32{false};
   };
+  struct RangeAttrs {
+    // ONNX Range(start, limit, delta). All three inputs must be compile-time
+    // scalar constants so we can lower to ggml_arange, which takes floats.
+    float start{0.0f};
+    float limit{0.0f};
+    float delta{1.0f};
+    // ggml_arange always produces F32; for integer-typed Range outputs we emit
+    // a trailing ggml_cast to this type.
+    ggml_type target_type{GGML_TYPE_F32};
+  };
 
   using Attrs = std::variant<NoAttrs,
                              GRUAttrs,
@@ -304,7 +314,8 @@ struct NodeDesc {
                              DepthToSpaceAttrs,
                              GenericShuffleAttrs,
                              QKVSplitAttrs,
-                             MatMulAttrs>;
+                             MatMulAttrs,
+                             RangeAttrs>;
 
   std::string op_type;
   std::string domain;

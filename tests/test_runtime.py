@@ -322,6 +322,64 @@ def test_pow_non_square_falls_back_to_cpu(suite_tmpdir, ep_library: Path) -> Non
     assert not ggml_pow, f"unexpected GGMLExecutionProvider Pow events: {ggml_pow}"
 
 
+def build_range_model(
+    tmpdir: Path,
+    *,
+    start: float,
+    limit: float,
+    delta: float,
+    dtype: int,
+) -> Path:
+    np_dtype = {
+        TensorProto.FLOAT: np.float32,
+        TensorProto.INT32: np.int32,
+        TensorProto.INT64: np.int64,
+    }[dtype]
+    n = max(int(np.ceil((limit - start) / delta)), 0)
+    # Carry a dynamic scalar bias through the output so ORT's constant-folding
+    # pass can't just fold the whole graph away — we want Range to actually run
+    # on the EP at inference time.
+    bias = helper.make_tensor_value_info("bias", dtype, [])
+    y = helper.make_tensor_value_info("y", dtype, [n])
+    start_init = helper.make_tensor("start", dtype, [], [np_dtype(start)])
+    limit_init = helper.make_tensor("limit", dtype, [], [np_dtype(limit)])
+    delta_init = helper.make_tensor("delta", dtype, [], [np_dtype(delta)])
+    nodes = [
+        helper.make_node("Range", ["start", "limit", "delta"], ["r"], name="range_0"),
+        helper.make_node("Add", ["r", "bias"], ["y"], name="add_bias"),
+    ]
+    graph = helper.make_graph(
+        nodes, "single_range", [bias], [y], initializer=[start_init, limit_init, delta_init]
+    )
+    return ensure_model(tmpdir, graph)
+
+
+@pytest.mark.parametrize(
+    "start,limit,delta,dtype",
+    [
+        (0.0, 10.0, 1.0, TensorProto.FLOAT),
+        (1.5, 5.0, 0.5, TensorProto.FLOAT),
+        (10.0, 2.0, -2.0, TensorProto.FLOAT),
+    ],
+)
+def test_range_runs_on_ggml(suite_tmpdir, ep_library: Path, start, limit, delta, dtype) -> None:
+    model_path = build_range_model(
+        suite_tmpdir, start=start, limit=limit, delta=delta, dtype=dtype
+    )
+    np_dtype = {
+        TensorProto.FLOAT: np.float32,
+        TensorProto.INT32: np.int32,
+        TensorProto.INT64: np.int64,
+    }[dtype]
+    inputs = {"bias": np.array(0, dtype=np_dtype)}
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_array_equal(got, expected)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
 def test_cumsum_trailing_axis_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
     model_path = build_cumsum_model(suite_tmpdir, shape=(2, 3, 4), axis=-1)
     ggml = ggml_session(model_path, ep_library)
