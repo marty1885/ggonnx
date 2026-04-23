@@ -234,11 +234,15 @@ struct NodeDesc {
     std::vector<int64_t> output_onnx_dims;
   };
   struct ReduceAttrs {
-    // Reduce a contiguous suffix of the ONNX dims. Stored as the count of
-    // trailing ONNX axes to reduce; emit collapses them into a single ggml
-    // axis (the fastest-varying, axis 0) and calls ggml_mean.
+    // Number of axes being reduced.
     int trailing_count{0};
     bool keepdims{true};
+    // GGML permutation to move the reduction axes to positions [0, k-1].
+    // Identity ([0,1,2,3]) when they are already the leading GGML axes
+    // (= trailing ONNX axes). inv_perm is the inverse permutation for
+    // the keepdims restore step.
+    std::array<int, GGML_MAX_DIMS> perm{0, 1, 2, 3};
+    std::array<int, GGML_MAX_DIMS> inv_perm{0, 1, 2, 3};
   };
   struct MatMulAttrs {
     // When true, tag the ggml_mul_mat output with GGML_PREC_F32 so backends

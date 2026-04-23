@@ -1761,23 +1761,23 @@ EmitResult EmitConvTransposeNode(ggml_context* ctx,
 SupportResult IsSupportedExpandNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr) return false;
+  SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "Expand: wrong input/output count");
+  SUPPORT_CHECK(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
+                "Expand: null input or output");
   const TensorMetadata x = getTensorMetadata(inputs[0]);
   const TensorMetadata y = getTensorMetadata(outputs[0]);
-  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
-  }
-  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) return false;
-  if (!shapeIsFullyStatic(x)) return false;
+  SUPPORT_CHECK(x.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    y.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "Expand: non-float type");
+  SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(y), "Expand: rank exceeds GGML_MAX_DIMS");
+  SUPPORT_CHECK(shapeIsFullyStatic(x), "Expand: input has dynamic shape");
 
   const auto target = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-  if (!target) return false;
+  SUPPORT_CHECK(target.has_value(), "Expand: shape input is not a compile-time constant");
   std::vector<int64_t> target_dims(target->begin(), target->end());
-  if (!rankSupportedByGGML({ONNXTensorElementDataType{}, target_dims})) return false;
+  SUPPORT_CHECK(rankSupportedByGGML({ONNXTensorElementDataType{}, target_dims}),
+                "Expand: target rank exceeds GGML_MAX_DIMS");
 
   // Align to the longer rank (ONNX Expand broadcasts leading dims).
   const size_t out_rank = std::max(x.dims.size(), target_dims.size());
@@ -1786,10 +1786,14 @@ SupportResult IsSupportedExpandNode(Ort::ConstNode node, const ConstantValueMap*
   std::copy_backward(x.dims.begin(), x.dims.end(), padded_x.end());
   std::copy_backward(target_dims.begin(), target_dims.end(), padded_t.end());
   for (size_t i = 0; i < out_rank; ++i) {
-    if (padded_x[i] != 1 && padded_t[i] != 1 && padded_x[i] != padded_t[i]) return false;
-    if (padded_t[i] < 0) return false;
+    SUPPORT_CHECK(padded_x[i] == 1 || padded_t[i] == 1 || padded_x[i] == padded_t[i],
+                  "Expand: incompatible broadcast dims at axis " + std::to_string(i) +
+                      " (x=" + std::to_string(padded_x[i]) + " t=" + std::to_string(padded_t[i]) + ")");
+    SUPPORT_CHECK(padded_t[i] >= 0,
+                  "Expand: target shape has negative/sentinel dim at axis " + std::to_string(i) +
+                      " (value=" + std::to_string(padded_t[i]) + ")");
   }
-  return true;
+  return support_ok();
 }
 
 void CompileExpandAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
@@ -1943,25 +1947,19 @@ EmitResult EmitGemmNode(ggml_context* ctx,
 SupportResult IsSupportedReshapeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (inputs[0] == nullptr || outputs[0] == nullptr) {
-    return false;
-  }
+  SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "Reshape: wrong input/output count");
+  SUPPORT_CHECK(inputs[0] != nullptr && outputs[0] != nullptr, "Reshape: null input or output");
   const TensorMetadata in = getTensorMetadata(inputs[0]);
   const TensorMetadata out = getTensorMetadata(outputs[0]);
-  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
-  }
-  if (!rankSupportedByGGML(in) || !rankSupportedByGGML(out)) {
-    return false;
-  }
-  if (!shapeIsFullyStatic(out.dims)) {
-    return false;
-  }
-  return true;
+  SUPPORT_CHECK(in.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    out.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "Reshape: non-float type (in=" + std::to_string(in.element_type) +
+                    " out=" + std::to_string(out.element_type) + ")");
+  SUPPORT_CHECK(rankSupportedByGGML(in) && rankSupportedByGGML(out),
+                "Reshape: rank exceeds GGML_MAX_DIMS");
+  SUPPORT_CHECK(shapeIsFullyStatic(out.dims), "Reshape: output has dynamic shape");
+  return support_ok();
 }
 
 void CompileReshapeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
@@ -2893,31 +2891,32 @@ EmitResult EmitTransposeNode(ggml_context* ctx,
 SupportResult IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if (inputs.empty() || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (outputs[0] == nullptr) return false;
+  SUPPORT_CHECK(!inputs.empty() && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "Concat: wrong input/output count");
+  SUPPORT_CHECK(outputs[0] != nullptr, "Concat: null output");
   const TensorMetadata out = getTensorMetadata(outputs[0]);
-  if (!isGGMLFloatType(out.element_type) || !rankSupportedByGGML(out)) {
-    return false;
-  }
+  SUPPORT_CHECK(isGGMLFloatType(out.element_type),
+                "Concat: non-float output type " + std::to_string(out.element_type));
+  SUPPORT_CHECK(rankSupportedByGGML(out), "Concat: output rank exceeds GGML_MAX_DIMS");
   const size_t rank = out.dims.size();
-  if (rank == 0) return false;
+  SUPPORT_CHECK(rank > 0, "Concat: scalar output");
 
   const auto axis_attr = readNodeAttribute<int64_t>(node, "axis");
-  if (!axis_attr) return false;
+  SUPPORT_CHECK(axis_attr.has_value(), "Concat: missing axis attribute");
   int64_t axis = *axis_attr;
   if (axis < 0) axis += static_cast<int64_t>(rank);
-  if (axis < 0 || axis >= static_cast<int64_t>(rank)) return false;
+  SUPPORT_CHECK(axis >= 0 && axis < static_cast<int64_t>(rank), "Concat: axis out of range");
 
   for (Ort::ConstValueInfo input : inputs) {
-    if (input == nullptr) return false;
+    SUPPORT_CHECK(input != nullptr, "Concat: null input");
     const TensorMetadata meta = getTensorMetadata(input);
-    if (meta.element_type != out.element_type) return false;
-    if (meta.dims.size() != rank) return false;
-    if (!rankSupportedByGGML(meta)) return false;
+    SUPPORT_CHECK(meta.element_type == out.element_type,
+                  "Concat: input type " + std::to_string(meta.element_type) +
+                      " != output type " + std::to_string(out.element_type));
+    SUPPORT_CHECK(meta.dims.size() == rank, "Concat: input rank mismatch");
+    SUPPORT_CHECK(rankSupportedByGGML(meta), "Concat: input rank exceeds GGML_MAX_DIMS");
   }
-  return true;
+  return support_ok();
 }
 
 void CompileConcatAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
@@ -3289,28 +3288,26 @@ EmitResult EmitSplitNode(ggml_context* ctx,
 SupportResult IsSupportedReduceMeanNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if (inputs.empty() || inputs.size() > 2 || outputs.size() != 1 ||
-      node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (inputs[0] == nullptr || outputs[0] == nullptr) return false;
+  SUPPORT_CHECK(!inputs.empty() && inputs.size() <= 2 && outputs.size() == 1 &&
+                    node.GetImplicitInputs().size() == 0,
+                "ReduceMean: wrong input/output count");
+  SUPPORT_CHECK(inputs[0] != nullptr && outputs[0] != nullptr, "ReduceMean: null input or output");
   const TensorMetadata x = getTensorMetadata(inputs[0]);
   const TensorMetadata y = getTensorMetadata(outputs[0]);
-  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
-  }
-  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) return false;
-  if (!shapeIsFullyStatic(x)) return false;
+  SUPPORT_CHECK(x.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    y.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "ReduceMean: non-float type");
+  SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(y),
+                "ReduceMean: rank exceeds GGML_MAX_DIMS");
 
   const int64_t rank = static_cast<int64_t>(x.dims.size());
-  if (rank == 0) return false;
+  SUPPORT_CHECK(rank > 0, "ReduceMean: scalar input");
 
   // Collect axes. Prefer the `axes` input (opset 18+), then the attribute.
   std::vector<int64_t> axes;
   if (inputs.size() == 2 && inputs[1] != nullptr) {
     const auto v = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-    if (!v) return false;
+    SUPPORT_CHECK(v.has_value(), "ReduceMean: axes input is not a compile-time constant");
     axes = *v;
   } else if (const auto attr = readNodeAttribute<std::vector<int64_t>>(node, "axes")) {
     axes = *attr;
@@ -3319,25 +3316,29 @@ SupportResult IsSupportedReduceMeanNode(Ort::ConstNode node, const ConstantValue
     axes.resize(rank);
     for (int64_t i = 0; i < rank; ++i) axes[i] = i;
   }
-  if (axes.empty()) return false;
+  SUPPORT_CHECK(!axes.empty(), "ReduceMean: empty axes");
 
   std::vector<int64_t> normalized;
   normalized.reserve(axes.size());
   for (int64_t a : axes) {
     if (a < 0) a += rank;
-    if (a < 0 || a >= rank) return false;
+    SUPPORT_CHECK(a >= 0 && a < rank, "ReduceMean: axis out of range");
     normalized.push_back(a);
   }
   std::sort(normalized.begin(), normalized.end());
   for (size_t i = 1; i < normalized.size(); ++i) {
-    if (normalized[i] == normalized[i - 1]) return false;
+    SUPPORT_CHECK(normalized[i] != normalized[i - 1], "ReduceMean: duplicate axes");
   }
-  // Must be a contiguous suffix: [rank - k, rank - 1].
-  const int64_t k = static_cast<int64_t>(normalized.size());
-  for (int64_t i = 0; i < k; ++i) {
-    if (normalized[i] != rank - k + i) return false;
+  // Require a contiguous block (not necessarily trailing) so the permute
+  // approach collapses them in one pass.
+  for (size_t i = 1; i < normalized.size(); ++i) {
+    SUPPORT_CHECK(normalized[i] == normalized[i - 1] + 1,
+                  "ReduceMean: axes must be a contiguous block (non-contiguous at " +
+                      std::to_string(normalized[i]) + ")");
   }
-  return true;
+  SUPPORT_CHECK(static_cast<int64_t>(normalized.size()) + rank <= GGML_MAX_DIMS * 2,
+                "ReduceMean: too many axes for GGML");
+  return support_ok();
 }
 
 void CompileReduceMeanAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
@@ -3361,47 +3362,99 @@ void CompileReduceMeanAttributes(Ort::ConstNode node, NodeDesc* compiled_node, c
   NodeDesc::ReduceAttrs attrs;
   attrs.trailing_count = static_cast<int>(axes.size());
   attrs.keepdims = readNodeAttribute<int64_t>(node, "keepdims").value_or(1) != 0;
+
+  // Normalize axes and compute the GGML permutation that moves the reduction
+  // GGML axes to positions [0, k-1] so the existing "leading GGML axes"
+  // mean logic applies. For trailing ONNX axes this is the identity.
+  std::vector<int64_t> onnx_axes = axes;
+  for (int64_t& a : onnx_axes) { if (a < 0) a += rank; }
+  std::sort(onnx_axes.begin(), onnx_axes.end());
+
+  // In GGML (reversed dims) the ONNX axis i maps to GGML axis (rank-1-i).
+  // Collect the GGML positions that need to be reduced, sorted ascending.
+  std::vector<int> ggml_reduce_axes;
+  for (int64_t a : onnx_axes) ggml_reduce_axes.push_back(static_cast<int>(rank - 1 - a));
+  std::sort(ggml_reduce_axes.begin(), ggml_reduce_axes.end());
+
+  // Build perm: put reduction axes first, then the rest in original order.
+  std::array<int, GGML_MAX_DIMS> perm{0, 1, 2, 3};
+  std::array<int, GGML_MAX_DIMS> inv_perm{0, 1, 2, 3};
+  const int k = static_cast<int>(ggml_reduce_axes.size());
+  std::vector<int> non_reduce;
+  for (int i = 0; i < static_cast<int>(rank); ++i) {
+    if (std::find(ggml_reduce_axes.begin(), ggml_reduce_axes.end(), i) == ggml_reduce_axes.end()) {
+      non_reduce.push_back(i);
+    }
+  }
+  for (int i = 0; i < k; ++i) perm[i] = ggml_reduce_axes[i];
+  for (int i = 0; i < static_cast<int>(non_reduce.size()); ++i) perm[k + i] = non_reduce[i];
+  // Fill unused GGML dims (rank < GGML_MAX_DIMS) as identity.
+  for (int i = static_cast<int>(rank); i < GGML_MAX_DIMS; ++i) perm[i] = i;
+  // Inverse permutation: inv_perm[perm[i]] = i.
+  for (int i = 0; i < GGML_MAX_DIMS; ++i) inv_perm[perm[i]] = i;
+
+  attrs.perm = perm;
+  attrs.inv_perm = inv_perm;
   compiled_node->attrs = attrs;
+}
+
+// Shared reduce emit: applies permute → collapse → reduce_fn → reshape → inv_permute.
+static EmitResult EmitReduceCore(ggml_context* ctx,
+                                 const NodeDesc& node,
+                                 const std::vector<ggml_tensor*>& values,
+                                 ggml_tensor* (*reduce_fn)(ggml_context*, ggml_tensor*)) {
+  const auto* attrs = std::get_if<NodeDesc::ReduceAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Reduce node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Reduce node missing GGML input");
+
+  const int k = attrs->trailing_count;
+
+  // Step 1: permute so the reduction axes are at GGML positions [0, k-1].
+  // Skip permute when perm is already the identity (trailing-axes case).
+  const auto& p = attrs->perm;
+  const bool is_identity_perm = (p[0] == 0 && p[1] == 1 && p[2] == 2 && p[3] == 3);
+  ggml_tensor* xp = is_identity_perm ? x : ggml_permute(ctx, x, p[0], p[1], p[2], p[3]);
+
+  // Step 2: collapse the k leading GGML axes into one, then reduce.
+  int64_t collapsed = 1;
+  for (int i = 0; i < k; ++i) collapsed *= xp->ne[i];
+  int64_t keep[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  keep[0] = collapsed;
+  for (int i = k; i < GGML_MAX_DIMS; ++i) keep[i - k + 1] = xp->ne[i];
+
+  ggml_tensor* src = ggml_is_contiguous(xp) ? xp : ggml_cont(ctx, xp);
+  ggml_tensor* flat = ggml_reshape_4d(ctx, src, keep[0], keep[1], keep[2], keep[3]);
+  ggml_tensor* reduced = reduce_fn(ctx, flat);  // ne[0] becomes 1
+
+  if (!attrs->keepdims) {
+    // Drop the leading size-1 axis by repacking the kept axes.
+    int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+    for (int i = 0; i < GGML_MAX_DIMS - 1; ++i) out_ne[i] = reduced->ne[i + 1];
+    return EmitOutputs{
+        ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+  }
+
+  // keepdims: expand the single collapsed axis back to k separate size-1 axes,
+  // then permute back to the original GGML axis order.
+  int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  for (int i = k; i < GGML_MAX_DIMS; ++i) out_ne[i] = reduced->ne[i - k + 1];
+  ggml_tensor* expanded =
+      ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+
+  // Apply inverse permutation to restore the original axis ordering.
+  // Skip when perm was identity (trailing-axes case, no reorder needed).
+  const auto& ip = attrs->inv_perm;
+  const bool is_identity_inv = (ip[0] == 0 && ip[1] == 1 && ip[2] == 2 && ip[3] == 3);
+  return EmitOutputs{is_identity_inv ? expanded
+                                     : ggml_permute(ctx, expanded, ip[0], ip[1], ip[2], ip[3])};
 }
 
 EmitResult EmitReduceMeanNode(ggml_context* ctx,
                               const NodeDesc& node,
                               const std::vector<ggml_tensor*>& values) {
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
-  const auto* attrs = std::get_if<NodeDesc::ReduceAttrs>(&node.attrs);
-  GGONNX_ASSERT(attrs != nullptr, "compiled ReduceMean node missing attributes");
-  ggml_tensor* x = values[node.inputs[0]];
-  GGONNX_NOT_NULL(x, "compiled ReduceMean node missing GGML input");
-
-  // Collapse the trailing ONNX axes (= leading ggml axes) into ggml axis 0 so
-  // ggml_mean reduces them in one shot.
-  const int k = attrs->trailing_count;
-  int64_t collapsed = 1;
-  for (int i = 0; i < k; ++i) collapsed *= x->ne[i];
-  int64_t keep[GGML_MAX_DIMS] = {1, 1, 1, 1};
-  keep[0] = collapsed;
-  for (int i = k; i < GGML_MAX_DIMS; ++i) keep[i - k + 1] = x->ne[i];
-
-  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
-  ggml_tensor* flat = ggml_reshape_4d(ctx, src, keep[0], keep[1], keep[2], keep[3]);
-  ggml_tensor* reduced = ggml_mean(ctx, flat);  // ne[0] becomes 1
-
-  if (attrs->keepdims) {
-    // ggml_mean left the leading ggml axis at size 1; that corresponds to the
-    // collapsed ONNX trailing axes. Expand back to k separate size-1 axes,
-    // which for k in {1,2,3} fits in 4D.
-    int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
-    for (int i = 0; i < k; ++i) out_ne[i] = 1;
-    for (int i = k; i < GGML_MAX_DIMS; ++i) out_ne[i] = reduced->ne[i - k + 1];
-    return EmitOutputs{
-        ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
-  }
-  // keepdims == 0: drop the leading size-1 axis by re-packing kept axes into
-  // ggml positions [0..rank-k-1].
-  int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
-  for (int i = 0; i < GGML_MAX_DIMS - 1; ++i) out_ne[i] = reduced->ne[i + 1];
-  return EmitOutputs{
-      ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+  return EmitReduceCore(ctx, node, values, ggml_mean);
 }
 
 // ONNX ReduceSum: identical structure to ReduceMean; swap ggml_mean -> ggml_sum_rows.
@@ -3409,33 +3462,7 @@ EmitResult EmitReduceSumNode(ggml_context* ctx,
                              const NodeDesc& node,
                              const std::vector<ggml_tensor*>& values) {
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
-  const auto* attrs = std::get_if<NodeDesc::ReduceAttrs>(&node.attrs);
-  GGONNX_ASSERT(attrs != nullptr, "compiled ReduceSum node missing attributes");
-  ggml_tensor* x = values[node.inputs[0]];
-  GGONNX_NOT_NULL(x, "compiled ReduceSum node missing GGML input");
-
-  const int k = attrs->trailing_count;
-  int64_t collapsed = 1;
-  for (int i = 0; i < k; ++i) collapsed *= x->ne[i];
-  int64_t keep[GGML_MAX_DIMS] = {1, 1, 1, 1};
-  keep[0] = collapsed;
-  for (int i = k; i < GGML_MAX_DIMS; ++i) keep[i - k + 1] = x->ne[i];
-
-  ggml_tensor* src = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
-  ggml_tensor* flat = ggml_reshape_4d(ctx, src, keep[0], keep[1], keep[2], keep[3]);
-  ggml_tensor* reduced = ggml_sum_rows(ctx, flat);  // ne[0] becomes 1
-
-  if (attrs->keepdims) {
-    int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
-    for (int i = 0; i < k; ++i) out_ne[i] = 1;
-    for (int i = k; i < GGML_MAX_DIMS; ++i) out_ne[i] = reduced->ne[i - k + 1];
-    return EmitOutputs{
-        ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
-  }
-  int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
-  for (int i = 0; i < GGML_MAX_DIMS - 1; ++i) out_ne[i] = reduced->ne[i + 1];
-  return EmitOutputs{
-      ggml_reshape_4d(ctx, reduced, out_ne[0], out_ne[1], out_ne[2], out_ne[3])};
+  return EmitReduceCore(ctx, node, values, ggml_sum_rows);
 }
 
 // ONNX DepthToSpace: [N, C, H, W] -> [N, C/b^2, H*b, W*b]. Two modes:
