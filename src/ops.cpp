@@ -71,15 +71,9 @@ std::optional<ConstantTensor> LookupCompileTimeConstant(Ort::ConstValueInfo valu
     if (value != nullptr) {
       const TensorMetadata meta = getTensorMetadata(value);
       const auto tensor_info = value.GetTensorTypeAndShapeInfo();
-      const size_t bytes = tensor_info.GetElementCount() *
-                           (meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT   ? sizeof(float)
-                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? sizeof(uint16_t)
-                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32   ? sizeof(int32_t)
-                            : meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64   ? sizeof(int64_t)
-                            : 0);
-      if (bytes == 0 && tensor_info.GetElementCount() != 0) {
-        return std::nullopt;
-      }
+      const auto gtype = OnnxTypeToGGML(meta.element_type);
+      if (!gtype.has_value()) return std::nullopt;
+      const size_t bytes = tensor_info.GetElementCount() * ggml_type_size(*gtype);
       const void* raw_data = nullptr;
       ggonnx::ort_internal::THROW_ON_ERROR(
           ggonnx::ort_internal::GetOrtApi().GetTensorData(value, &raw_data));
@@ -2796,6 +2790,69 @@ EmitResult EmitIdentityNode(ggml_context* ctx,
   return EmitOutputs{ggml_cont(ctx, x)};
 }
 
+// ONNX Cast: convert `input` elementwise to the `to` dtype. Meta-eval folds
+// compile-time constants via CastConstant; this handles the runtime path by
+// emitting ggml_cast. Same-dtype casts degrade to ggml_cont (Identity).
+SupportResult IsSupportedCastNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  SUPPORT_CHECK(inputs.size() == 1 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "Cast: wrong input/output count");
+  SUPPORT_CHECK(inputs[0] != nullptr && outputs[0] != nullptr, "Cast: null input/output");
+  SUPPORT_CHECK(isTensorTyped(inputs[0]) && isTensorTyped(outputs[0]),
+                "Cast: non-tensor-typed input/output");
+  const TensorMetadata in = getTensorMetadata(inputs[0]);
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  SUPPORT_CHECK(OnnxTypeToGGML(in.element_type).has_value(),
+                "Cast: unsupported input dtype " + std::to_string(in.element_type));
+  SUPPORT_CHECK(OnnxTypeToGGML(out.element_type).has_value(),
+                "Cast: unsupported output dtype " + std::to_string(out.element_type));
+  SUPPORT_CHECK(rankSupportedByGGML(in) && rankSupportedByGGML(out),
+                "Cast: rank exceeds GGML_MAX_DIMS");
+  // ONNX `saturate` (default 1) only matters for float8 targets, which we
+  // don't support anyway; any value is fine otherwise.
+  const ggml_type src_g = *OnnxTypeToGGML(in.element_type);
+  const ggml_type dst_g = *OnnxTypeToGGML(out.element_type);
+  // ggml-cpu's ggml_compute_forward_dup only implements a small set of
+  // (src,dst) pairs. Everything else — including I64 as src or dst, I8 as
+  // anything but a same-type copy — aborts. Keep the allowlist tight and
+  // defer the rest to CPU.
+  auto supported_pair = [](ggml_type s, ggml_type d) {
+    if (s == d) return true;
+    if ((s == GGML_TYPE_F32 && d == GGML_TYPE_F16) ||
+        (s == GGML_TYPE_F16 && d == GGML_TYPE_F32)) return true;
+    if ((s == GGML_TYPE_F32 && d == GGML_TYPE_I32) ||
+        (s == GGML_TYPE_I32 && d == GGML_TYPE_F32)) return true;
+    return false;
+  };
+  SUPPORT_CHECK(supported_pair(src_g, dst_g),
+                "Cast: ggml_cast doesn't implement this (src,dst) pair");
+  return support_ok();
+}
+
+void CompileCastAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto outputs = node.GetOutputs();
+  const TensorMetadata out = getTensorMetadata(outputs[0]);
+  const auto gtype = OnnxTypeToGGML(out.element_type);
+  GGONNX_ASSERT(gtype.has_value(), "Cast target dtype has no GGML representation");
+  compiled_node->attrs = NodeDesc::CastAttrs{.target_type = *gtype};
+}
+
+EmitResult EmitCastNode(ggml_context* ctx,
+                        const NodeDesc& node,
+                        const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::CastAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Cast node missing CastAttrs");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Cast node missing GGML input");
+  if (x->type == attrs->target_type) {
+    return EmitOutputs{ggml_cont(ctx, x)};
+  }
+  return EmitOutputs{ggml_cast(ctx, x, attrs->target_type)};
+}
+
 // ONNX Transpose: permutes dims by `perm` (default = reverse). GGML dim order is
 // reversed vs ONNX, so the ggml axis that feeds output GGML axis j is
 // R-1 - perm[R-1 - j]. Axes beyond the ONNX rank are padded identity.
@@ -3839,6 +3896,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Upsample"}, {IsSupportedUpsampleNode, CompileUpsampleAttributes, EmitUpsampleNode}},
       {{"", "Resize"}, {IsSupportedUpsampleNode, CompileUpsampleAttributes, EmitUpsampleNode}},
       {{"", "Identity"}, {IsSupportedIdentityNode, nullptr, EmitIdentityNode}},
+      {{"", "Cast"}, {IsSupportedCastNode, CompileCastAttributes, EmitCastNode}},
       {{"", "Transpose"}, {IsSupportedTransposeNode, CompileTransposeAttributes, EmitTransposeNode}},
       {{"", "Concat"}, {IsSupportedConcatNode, CompileConcatAttributes, EmitConcatNode}},
       {{"", "Slice"}, {IsSupportedSliceNode, CompileSliceAttributes, EmitSliceNode}},

@@ -2020,31 +2020,42 @@ def test_window_mask_add_fusion_matches_cpu(
     assert_all_nodes_run_on_ggml(ggml)
 
 
-@pytest.mark.parametrize("dtype,tensor_type", [
-    (np.int64, TensorProto.INT64),
-    (np.int32, TensorProto.INT32),
-])
-def test_concat_integer_runs_on_ggml(suite_tmpdir, ep_library: Path, dtype, tensor_type) -> None:
-    # Verifies the INT32/INT64 Concat path: tensors flow through GGML (not
+def test_concat_integer_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
+    # Verifies INT32/INT64/INT8 Concat paths: tensors flow through GGML (not
     # folded or rejected), match CPU values, and retain their integer dtype.
-    a_info = helper.make_tensor_value_info("a", tensor_type, [2, 3])
-    b_info = helper.make_tensor_value_info("b", tensor_type, [2, 4])
-    c_info = helper.make_tensor_value_info("c", tensor_type, [2, 7])
-    node = helper.make_node("Concat", ["a", "b"], ["c"], axis=1)
-    graph = helper.make_graph([node], "concat_int", [a_info, b_info], [c_info])
+    # All dtypes share one session — init dominates per-case runtime.
+    cases = [
+        ("i64", np.int64, TensorProto.INT64),
+        ("i32", np.int32, TensorProto.INT32),
+        ("i8",  np.int8,  TensorProto.INT8),
+    ]
+    input_infos, output_infos, nodes = [], [], []
+    for tag, _dt, tt in cases:
+        input_infos.append(helper.make_tensor_value_info(f"a_{tag}", tt, [2, 3]))
+        input_infos.append(helper.make_tensor_value_info(f"b_{tag}", tt, [2, 4]))
+        output_infos.append(helper.make_tensor_value_info(f"c_{tag}", tt, [2, 7]))
+        nodes.append(helper.make_node("Concat", [f"a_{tag}", f"b_{tag}"],
+                                      [f"c_{tag}"], name=f"concat_{tag}", axis=1))
+    graph = helper.make_graph(nodes, "concat_int_all", input_infos, output_infos)
     model_path = ensure_model(suite_tmpdir, graph)
 
     rng = np.random.default_rng(0)
-    inputs = {
-        "a": rng.integers(-1000, 1000, size=(2, 3)).astype(dtype),
-        "b": rng.integers(-1000, 1000, size=(2, 4)).astype(dtype),
-    }
+    inputs = {}
+    for tag, dt, _tt in cases:
+        info = np.iinfo(dt)
+        lo = max(info.min, -1000)
+        hi = min(info.max, 1000)
+        inputs[f"a_{tag}"] = rng.integers(lo, hi, size=(2, 3)).astype(dt)
+        inputs[f"b_{tag}"] = rng.integers(lo, hi, size=(2, 4)).astype(dt)
+
     cpu = cpu_session(model_path)
     ggml = ggml_session(model_path, ep_library)
-    cpu_out = cpu.run(["c"], inputs)[0]
-    ggml_out = ggml.run(["c"], inputs)[0]
-    assert ggml_out.dtype == dtype
-    np.testing.assert_array_equal(ggml_out, cpu_out)
+    output_names = [f"c_{c[0]}" for c in cases]
+    cpu_outs = cpu.run(output_names, inputs)
+    ggml_outs = ggml.run(output_names, inputs)
+    for (tag, dt, _tt), cpu_out, ggml_out in zip(cases, cpu_outs, ggml_outs):
+        assert ggml_out.dtype == dt, tag
+        np.testing.assert_array_equal(ggml_out, cpu_out, err_msg=tag)
     assert_all_nodes_run_on_ggml(ggml)
 
 
@@ -2085,3 +2096,45 @@ def test_shape_derived_concat_to_constantofshape(suite_tmpdir, ep_library: Path)
     got = ggml.run(["y"], inputs)[0]
     assert got.shape == (2, 5, 3)
     np.testing.assert_array_equal(got, expected)
+
+
+def test_cast_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
+    # All supported (src,dst) pairs in one graph so we pay session init once.
+    cases = [
+        ("f32_to_i32", np.float32, TensorProto.FLOAT,   np.int32,   TensorProto.INT32),
+        ("i32_to_f32", np.int32,   TensorProto.INT32,   np.float32, TensorProto.FLOAT),
+        ("f32_to_f16", np.float32, TensorProto.FLOAT,   np.float16, TensorProto.FLOAT16),
+        ("f16_to_f32", np.float16, TensorProto.FLOAT16, np.float32, TensorProto.FLOAT),
+        ("f32_to_f32", np.float32, TensorProto.FLOAT,   np.float32, TensorProto.FLOAT),
+    ]
+
+    input_infos, output_infos, nodes = [], [], []
+    for name, _src_np, src_type, _dst_np, dst_type in cases:
+        input_infos.append(helper.make_tensor_value_info(f"x_{name}", src_type, [2, 3]))
+        output_infos.append(helper.make_tensor_value_info(f"y_{name}", dst_type, [2, 3]))
+        nodes.append(helper.make_node("Cast", [f"x_{name}"], [f"y_{name}"],
+                                      name=f"cast_{name}", to=dst_type))
+    graph = helper.make_graph(nodes, "cast_all", input_infos, output_infos)
+    model_path = ensure_model(suite_tmpdir, graph)
+
+    rng = np.random.default_rng(0)
+    inputs = {}
+    for name, src_np, _src_type, _dst_np, _dst_type in cases:
+        if np.issubdtype(src_np, np.integer):
+            info = np.iinfo(src_np)
+            lo = max(info.min, -100)
+            hi = min(info.max, 100)
+            inputs[f"x_{name}"] = rng.integers(lo, hi, size=(2, 3)).astype(src_np)
+        else:
+            inputs[f"x_{name}"] = (rng.standard_normal((2, 3)) * 50.0).astype(src_np)
+
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    output_names = [f"y_{c[0]}" for c in cases]
+    cpu_outs = cpu.run(output_names, inputs)
+    ggml_outs = ggml.run(output_names, inputs)
+    for (name, _src_np, _src_type, dst_np, _dst_type), cpu_out, ggml_out in zip(
+            cases, cpu_outs, ggml_outs):
+        assert ggml_out.dtype == dst_np, name
+        np.testing.assert_array_equal(ggml_out, cpu_out, err_msg=name)
+    assert_all_nodes_run_on_ggml(ggml)

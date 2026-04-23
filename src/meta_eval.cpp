@@ -29,14 +29,25 @@ static_assert(static_cast<int64_t>(std::numeric_limits<int32_t>::min()) == kUnkn
 constexpr size_t kMaxInitializerElements = 1 << 20;  // 1M elements (~4 MB f32)
 
 size_t ByteWidth(ONNXTensorElementDataType element_type) {
-  switch (element_type) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   return sizeof(float);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return sizeof(uint16_t);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return sizeof(int32_t);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return sizeof(int64_t);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: return sizeof(uint8_t);
-    default:
-      throw std::runtime_error("unsupported compile-time constant dtype");
+  if (element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) return sizeof(uint8_t);
+  if (const auto g = OnnxTypeToGGML(element_type)) return ggml_type_size(*g);
+  throw std::runtime_error("unsupported compile-time constant dtype");
+}
+
+// Invokes `fn(T{})` with the C++ arithmetic type corresponding to `et`.
+// Returns fn's result for supported dtypes; returns {} (default-constructed)
+// for unsupported ones so callers can keep returning std::nullopt uniformly.
+// Add a new dtype once here and every typed evaluator (Binary/Concat/Slice/
+// Tile/Equal/...) picks it up automatically.
+template <typename F>
+auto DispatchByElementType(ONNXTensorElementDataType et, F&& fn)
+    -> decltype(fn(float{})) {
+  switch (et) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return fn(float{});
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:  return fn(int8_t{});
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return fn(int32_t{});
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return fn(int64_t{});
+    default: return {};
   }
 }
 
@@ -50,10 +61,7 @@ size_t ElementCount(const std::vector<int64_t>& dims) {
 }
 
 bool IsFoldableDType(ONNXTensorElementDataType element_type) {
-  return element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT   ||
-         element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ||
-         element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 ||
-         element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 ||
+  return OnnxTypeToGGML(element_type).has_value() ||
          element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;
 }
 
@@ -445,36 +453,19 @@ std::optional<ConstantTensor> EvalConcat(const ConstantValueMap& constants, Ort:
     return out;
   };
 
-  if (element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
-    std::vector<int32_t> out;
+  return DispatchByElementType(element_type, [&](auto tag) -> std::optional<ConstantTensor> {
+    using T = decltype(tag);
+    std::vector<T> out;
     for (const auto& tensor : tensors) {
-      auto values = ReadTypedData<int32_t>(tensor);
+      auto values = ReadTypedData<T>(tensor);
       out.insert(out.end(), values.begin(), values.end());
     }
     auto result = MakeConstant(std::move(out_dims), std::move(out), element_type);
+    // bindings only exist on int32/int64 shape tensors (their values can be
+    // INT32_MIN). For other dtypes concat_bindings() yields empty.
     result.dim_bindings = concat_bindings();
     return result;
-  }
-  if (element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
-    std::vector<int64_t> out;
-    for (const auto& tensor : tensors) {
-      auto values = ReadTypedData<int64_t>(tensor);
-      out.insert(out.end(), values.begin(), values.end());
-    }
-    auto result = MakeConstant(std::move(out_dims), std::move(out), element_type);
-    result.dim_bindings = concat_bindings();
-    return result;
-  }
-  if (element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    std::vector<float> out;
-    for (const auto& tensor : tensors) {
-      auto values = ReadTypedData<float>(tensor);
-      out.insert(out.end(), values.begin(), values.end());
-    }
-    // float concat never has bindings (bindings live only on int shape tensors)
-    return MakeConstant(std::move(out_dims), std::move(out), element_type);
-  }
-  return std::nullopt;
+  });
 }
 
 std::optional<ConstantTensor> EvalUnsqueeze(const ConstantValueMap& constants, Ort::ConstNode node) {
@@ -579,16 +570,10 @@ std::optional<ConstantTensor> EvalBinary(const ConstantValueMap& constants, Ort:
   if (!lhs || !rhs || lhs->element_type != rhs->element_type) return std::nullopt;
   if (ContainsUnknownShapeDim(*lhs) || ContainsUnknownShapeDim(*rhs)) return std::nullopt;
   const std::string op_type = node.GetOperatorType();
-  switch (lhs->element_type) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-      return EvalBinaryTyped<int32_t>(*lhs, *rhs, op_type, lhs->element_type);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-      return EvalBinaryTyped<int64_t>(*lhs, *rhs, op_type, lhs->element_type);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-      return EvalBinaryTyped<float>(*lhs, *rhs, op_type, lhs->element_type);
-    default:
-      return std::nullopt;
-  }
+  return DispatchByElementType(lhs->element_type, [&](auto tag) -> std::optional<ConstantTensor> {
+    using T = decltype(tag);
+    return EvalBinaryTyped<T>(*lhs, *rhs, op_type, lhs->element_type);
+  });
 }
 
 std::optional<ConstantTensor> EvalReshape(const ConstantValueMap& constants, Ort::ConstNode node) {
@@ -643,16 +628,10 @@ std::optional<ConstantTensor> EvalSlice(const ConstantValueMap& constants, Ort::
     if (!steps_opt) return std::nullopt;
     steps = *steps_opt;
   }
-  switch (data->element_type) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-      return EvalSliceTyped<int32_t>(*data, *starts, *ends, std::move(axes), steps, data->element_type);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-      return EvalSliceTyped<int64_t>(*data, *starts, *ends, std::move(axes), steps, data->element_type);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-      return EvalSliceTyped<float>(*data, *starts, *ends, std::move(axes), steps, data->element_type);
-    default:
-      return std::nullopt;
-  }
+  return DispatchByElementType(data->element_type, [&](auto tag) -> std::optional<ConstantTensor> {
+    using T = decltype(tag);
+    return EvalSliceTyped<T>(*data, *starts, *ends, std::move(axes), steps, data->element_type);
+  });
 }
 
 template <typename T>
@@ -697,16 +676,10 @@ std::optional<ConstantTensor> EvalTile(const ConstantValueMap& constants, Ort::C
   if (!data) return std::nullopt;
   const auto repeats = ReadConstantInt64Input(constants, node, 1);
   if (!repeats) return std::nullopt;
-  switch (data->element_type) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-      return EvalTileTyped<int32_t>(*data, *repeats, data->element_type);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-      return EvalTileTyped<int64_t>(*data, *repeats, data->element_type);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-      return EvalTileTyped<float>(*data, *repeats, data->element_type);
-    default:
-      return std::nullopt;
-  }
+  return DispatchByElementType(data->element_type, [&](auto tag) -> std::optional<ConstantTensor> {
+    using T = decltype(tag);
+    return EvalTileTyped<T>(*data, *repeats, data->element_type);
+  });
 }
 
 std::optional<std::vector<ConstantTensor>> EvalArangeLoop(const ConstantValueMap& constants,
@@ -1141,12 +1114,10 @@ std::optional<ConstantTensor> EvalEqual(const ConstantValueMap& constants, Ort::
   const auto rhs = LookupConstant(constants, inputs[1]);
   if (!lhs || !rhs || lhs->element_type != rhs->element_type) return std::nullopt;
   if (ContainsUnknownShapeDim(*lhs) || ContainsUnknownShapeDim(*rhs)) return std::nullopt;
-  switch (lhs->element_type) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return EvalEqualTyped<int32_t>(*lhs, *rhs);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return EvalEqualTyped<int64_t>(*lhs, *rhs);
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return EvalEqualTyped<float>(*lhs, *rhs);
-    default: return std::nullopt;
-  }
+  return DispatchByElementType(lhs->element_type, [&](auto tag) -> std::optional<ConstantTensor> {
+    using T = decltype(tag);
+    return EvalEqualTyped<T>(*lhs, *rhs);
+  });
 }
 
 std::optional<ConstantTensor> EvalWhere(const ConstantValueMap& constants, Ort::ConstNode node) {

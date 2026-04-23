@@ -23,6 +23,7 @@ inline std::optional<ggml_type> OnnxTypeToGGML(ONNXTensorElementDataType t) {
   switch (t) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   return GGML_TYPE_F32;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return GGML_TYPE_F16;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:    return GGML_TYPE_I8;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:   return GGML_TYPE_I32;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:   return GGML_TYPE_I64;
     default: return std::nullopt;
@@ -134,6 +135,9 @@ struct NodeDesc {
   };
   struct AxisAttrs {
     int64_t axis{};
+  };
+  struct CastAttrs {
+    ggml_type target_type{GGML_TYPE_F32};
   };
   struct Conv2DAttrs {
     int spatial_rank{2};
@@ -280,6 +284,7 @@ struct NodeDesc {
                              LSTMAttrs,
                              AlphaAttrs,
                              AxisAttrs,
+                             CastAttrs,
                              Conv2DAttrs,
                              ClipAttrs,
                              GemmAttrs,
