@@ -9,6 +9,8 @@ from onnx import TensorProto, helper
 from test_support import (
     assert_all_nodes_run_on_ggml,
     assert_provider_does_not_run_ops,
+    assert_provider_runs_any_node,
+    assert_provider_runs_ops,
     cpu_session,
     end_profiling_profile,
     ggml_session,
@@ -68,6 +70,29 @@ def build_pow_model(tmpdir: Path, exponent: float) -> Path:
     exp_init = helper.make_tensor("exp", TensorProto.FLOAT, [], [exponent])
     node = helper.make_node("Pow", ["x", "exp"], ["y"], name="pow_0")
     graph = helper.make_graph([node], "single_pow", [x], [y], initializer=[exp_init])
+    return ensure_model(tmpdir, graph)
+
+
+def build_cumsum_model(
+    tmpdir: Path,
+    *,
+    shape,
+    axis: int,
+    exclusive: int = 0,
+    reverse: int = 0,
+) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, list(shape))
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, list(shape))
+    axis_init = helper.make_tensor("axis", TensorProto.INT64, [], [axis])
+    node = helper.make_node(
+        "CumSum",
+        ["x", "axis"],
+        ["y"],
+        name="cumsum_0",
+        exclusive=exclusive,
+        reverse=reverse,
+    )
+    graph = helper.make_graph([node], "single_cumsum", [x], [y], initializer=[axis_init])
     return ensure_model(tmpdir, graph)
 
 
@@ -295,6 +320,56 @@ def test_pow_non_square_falls_back_to_cpu(suite_tmpdir, ep_library: Path) -> Non
     ]
     assert cpu_pow, f"expected CPUExecutionProvider to run Pow, got profile: {profile}"
     assert not ggml_pow, f"unexpected GGMLExecutionProvider Pow events: {ggml_pow}"
+
+
+def test_cumsum_trailing_axis_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_cumsum_model(suite_tmpdir, shape=(2, 3, 4), axis=-1)
+    ggml = ggml_session(model_path, ep_library)
+    inputs = {
+        "x": np.array(
+            [
+                [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, 1.5], [3.0, 0.0, -2.0, 5.0]],
+                [[-1.0, 1.0, -1.0, 1.0], [2.0, 2.0, 2.0, 2.0], [4.0, 3.0, 2.0, 1.0]],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    ggml_out = ggml.run(["y"], inputs)[0]
+    expected = np.cumsum(inputs["x"], axis=-1, dtype=np.float32)
+    np.testing.assert_allclose(ggml_out, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+def test_cumsum_non_trailing_axis_falls_back_to_cpu(suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_cumsum_model(suite_tmpdir, shape=(2, 3, 4), axis=1)
+    ggml = ggml_session(model_path, ep_library)
+    inputs = {
+        "x": np.array(
+            [
+                [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, 1.5], [3.0, 0.0, -2.0, 5.0]],
+                [[-1.0, 1.0, -1.0, 1.0], [2.0, 2.0, 2.0, 2.0], [4.0, 3.0, 2.0, 1.0]],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    ggml_out = ggml.run(["y"], inputs)[0]
+    expected = np.cumsum(inputs["x"], axis=1, dtype=np.float32)
+    np.testing.assert_allclose(ggml_out, expected, rtol=1e-6, atol=1e-6)
+    profile = end_profiling_profile(ggml)
+    cpu_cumsum = [
+        event for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and event.get("args", {}).get("op_name") == "CumSum"
+    ]
+    ggml_cumsum = [
+        event for event in profile
+        if event.get("cat") == "Node"
+        and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
+        and event.get("args", {}).get("op_name") == "CumSum"
+    ]
+    assert cpu_cumsum, f"expected CPUExecutionProvider to run CumSum, got profile: {profile}"
+    assert not ggml_cumsum, f"unexpected GGMLExecutionProvider CumSum events: {ggml_cumsum}"
 
 
 def test_bidirectional_broadcast_add_falls_back_to_cpu(suite_tmpdir, ep_library: Path) -> None:
@@ -1405,6 +1480,113 @@ def build_shape_tile_folded_reshape_model(tmpdir: Path) -> Path:
     return ensure_model(tmpdir, graph)
 
 
+def build_shape_gather_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 4, 5])
+    data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [20])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [4, 5])
+
+    indices = helper.make_tensor("indices", TensorProto.INT64, [2], [1, 2])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Gather", ["shape", "indices"], ["new_shape"], name="shape_gather", axis=0),
+        helper.make_node("Reshape", ["data", "new_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "shape_gather_folded_reshape",
+        [x, data],
+        [y],
+        initializer=[indices],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_partial_shape_slice_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 4, 5])
+    data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [20])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [4, 5])
+
+    starts = helper.make_tensor("starts", TensorProto.INT64, [1], [1])
+    ends = helper.make_tensor("ends", TensorProto.INT64, [1], [3])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts", "ends", "axes", "steps"], ["new_shape"], name="shape_slice"),
+        helper.make_node("Reshape", ["data", "new_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "partial_shape_slice_folded_reshape",
+        [x, data],
+        [y],
+        initializer=[starts, ends, axes, steps],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_partial_shape_unsqueeze_concat_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 4, 5])
+    data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [20])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [4, 5])
+
+    starts1 = helper.make_tensor("starts1", TensorProto.INT64, [1], [1])
+    ends1 = helper.make_tensor("ends1", TensorProto.INT64, [1], [2])
+    starts2 = helper.make_tensor("starts2", TensorProto.INT64, [1], [2])
+    ends2 = helper.make_tensor("ends2", TensorProto.INT64, [1], [3])
+    slice_axes = helper.make_tensor("slice_axes", TensorProto.INT64, [1], [0])
+    slice_steps = helper.make_tensor("slice_steps", TensorProto.INT64, [1], [1])
+    squeeze_axes = helper.make_tensor("squeeze_axes", TensorProto.INT64, [1], [0])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts1", "ends1", "slice_axes", "slice_steps"], ["dim1_vec"], name="slice_dim1"),
+        helper.make_node("Squeeze", ["dim1_vec", "squeeze_axes"], ["dim1_scalar"], name="squeeze_dim1"),
+        helper.make_node("Unsqueeze", ["dim1_scalar", "axes"], ["dim1"], name="unsqueeze_dim1"),
+        helper.make_node("Slice", ["shape", "starts2", "ends2", "slice_axes", "slice_steps"], ["dim2"], name="slice_dim2"),
+        helper.make_node("Concat", ["dim1", "dim2"], ["new_shape"], name="shape_concat", axis=0),
+        helper.make_node("Reshape", ["data", "new_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "partial_shape_unsqueeze_concat_folded_reshape",
+        [x, data],
+        [y],
+        initializer=[starts1, ends1, starts2, ends2, slice_axes, slice_steps, squeeze_axes, axes],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_partial_shape_constant_of_shape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 4, 5])
+    bias = helper.make_tensor_value_info("bias", TensorProto.FLOAT, [4, 5])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [4, 5])
+
+    starts = helper.make_tensor("starts", TensorProto.INT64, [1], [1])
+    ends = helper.make_tensor("ends", TensorProto.INT64, [1], [3])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+    fill = helper.make_tensor("fill", TensorProto.FLOAT, [1], [0.5])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts", "ends", "axes", "steps"], ["new_shape"], name="shape_slice"),
+        helper.make_node("ConstantOfShape", ["new_shape"], ["shape_bias"], name="shape_fill", value=fill),
+        helper.make_node("Add", ["bias", "shape_bias"], ["y"], name="add_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "partial_shape_constant_of_shape",
+        [x, bias],
+        [y],
+        initializer=[starts, ends, axes, steps],
+    )
+    return ensure_model(tmpdir, graph)
+
+
 def build_loop_arange_folded_reshape_model(tmpdir: Path) -> Path:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
@@ -1466,19 +1648,76 @@ def build_loop_arange_folded_reshape_model(tmpdir: Path) -> Path:
         build_shape_folded_reshape_model,
         build_shape_concat_folded_reshape_model,
         build_shape_tile_folded_reshape_model,
+        build_shape_gather_folded_reshape_model,
+        build_partial_shape_slice_folded_reshape_model,
+        build_partial_shape_unsqueeze_concat_folded_reshape_model,
+        build_partial_shape_constant_of_shape_model,
         build_loop_arange_folded_reshape_model,
     ],
 )
 def test_compile_time_shape_subgraph_folding(suite_tmpdir, ep_library: Path, builder) -> None:
     model_path = builder(suite_tmpdir)
     rng = np.random.default_rng(23)
-    inputs = {"x": rng.standard_normal((2, 3)).astype(np.float32)}
+    if (
+        builder is build_shape_gather_folded_reshape_model
+        or builder is build_partial_shape_slice_folded_reshape_model
+        or builder is build_partial_shape_unsqueeze_concat_folded_reshape_model
+    ):
+        inputs = {
+            "x": rng.standard_normal((3, 4, 5)).astype(np.float32),
+            "data": rng.standard_normal((20,)).astype(np.float32),
+        }
+    elif builder is build_partial_shape_constant_of_shape_model:
+        inputs = {
+            "x": rng.standard_normal((3, 4, 5)).astype(np.float32),
+            "bias": rng.standard_normal((4, 5)).astype(np.float32),
+        }
+    else:
+        inputs = {"x": rng.standard_normal((2, 3)).astype(np.float32)}
     cpu = cpu_session(model_path)
     expected = cpu.run(["y"], inputs)[0]
     ggml = ggml_session(model_path, ep_library)
     got = ggml.run(["y"], inputs)[0]
     np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
-    assert_all_nodes_run_on_ggml(ggml)
+    if (
+        builder is build_partial_shape_slice_folded_reshape_model
+        or builder is build_partial_shape_unsqueeze_concat_folded_reshape_model
+    ):
+        profile = end_profiling_profile(ggml)
+        ggml_events = [
+            event
+            for event in profile
+            if event.get("cat") == "Node"
+            and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
+        ]
+        cpu_reshape_events = [
+            event
+            for event in profile
+            if event.get("cat") == "Node"
+            and event.get("args", {}).get("provider") == "CPUExecutionProvider"
+            and event.get("args", {}).get("op_name") == "Reshape"
+        ]
+        assert ggml_events, "expected at least one GGML node event"
+        assert not cpu_reshape_events, f"found CPU Reshape node events: {cpu_reshape_events}"
+    elif builder is build_partial_shape_constant_of_shape_model:
+        profile = end_profiling_profile(ggml)
+        ggml_events = [
+            event
+            for event in profile
+            if event.get("cat") == "Node"
+            and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
+        ]
+        cpu_add_events = [
+            event
+            for event in profile
+            if event.get("cat") == "Node"
+            and event.get("args", {}).get("provider") == "CPUExecutionProvider"
+            and event.get("args", {}).get("op_name") == "Add"
+        ]
+        assert ggml_events, "expected at least one GGML node event"
+        assert not cpu_add_events, f"found CPU Add node events: {cpu_add_events}"
+    else:
+        assert_all_nodes_run_on_ggml(ggml)
 
 
 def build_batchnorm_model(tmpdir: Path, x_shape, *, epsilon=1e-5) -> Path:

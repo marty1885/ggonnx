@@ -77,7 +77,7 @@ _SUPPORTED_OPS = {
     "Add", "Sub", "Mul", "Div", "Max", "Min",
     "Relu", "Sigmoid", "Tanh", "Neg", "Abs", "Sqrt", "Exp", "Log",
     "Erf", "Softplus", "Elu", "LeakyRelu", "PRelu", "Clip",
-    "Pow",
+    "Pow", "CumSum",
     "GRU", "LSTM",
     "MatMul", "Gemm",
     "Conv", "ConvTranspose",

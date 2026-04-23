@@ -1106,6 +1106,22 @@ static std::optional<float> readPowExponent(Ort::ConstNode node, const ConstantV
   return std::nullopt;
 }
 
+static std::optional<int64_t> read_constant_input_scalar_int64(Ort::ConstNode node,
+                                                               size_t input_idx,
+                                                               const ConstantValueMap* constants) {
+  if (const auto v = readConstantInputArray<int64_t>(node, input_idx,
+                                                     ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants)) {
+    if (v->size() == 1) return (*v)[0];
+    return std::nullopt;
+  }
+  if (const auto v = readConstantInputArray<int32_t>(node, input_idx,
+                                                     ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, constants)) {
+    if (v->size() == 1) return static_cast<int64_t>((*v)[0]);
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 SupportResult IsSupportedPowNode(Ort::ConstNode node, const ConstantValueMap* constants) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -1135,6 +1151,45 @@ EmitResult EmitPowNode(ggml_context* ctx,
   ggml_tensor* x = values[node.inputs[0]];
   GGONNX_NOT_NULL(x, "compiled Pow node missing GGML base input");
   return EmitOutputs{ggml_sqr(ctx, x)};
+}
+
+SupportResult IsSupportedCumSumNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
+                "CumSum requires exactly 2 inputs, 1 output, and no implicit inputs");
+  SUPPORT_CHECK(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
+                "CumSum input/output metadata must not be null");
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  SUPPORT_CHECK(x.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    y.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "CumSum only supports float32 tensors");
+  SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(y),
+                "CumSum rank exceeds GGML_MAX_DIMS");
+  SUPPORT_CHECK(!x.dims.empty(), "CumSum does not support scalar tensors");
+  const auto axis = read_constant_input_scalar_int64(node, 1, constants);
+  SUPPORT_CHECK(axis.has_value(), "CumSum axis must be a compile-time scalar integer");
+  const int64_t rank = static_cast<int64_t>(x.dims.size());
+  const int64_t normalized = *axis < 0 ? *axis + rank : *axis;
+  SUPPORT_CHECK(normalized == rank - 1,
+                "CumSum only supports the trailing ONNX axis");
+  SUPPORT_CHECK(!readNodeAttribute<int64_t>(node, "exclusive").value_or(0),
+                "CumSum does not support exclusive=1");
+  SUPPORT_CHECK(!readNodeAttribute<int64_t>(node, "reverse").value_or(0),
+                "CumSum does not support reverse=1");
+  return support_ok();
+}
+
+EmitResult EmitCumSumNode(ggml_context* ctx,
+                          const NodeDesc& node,
+                          const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  GGONNX_ASSERT(node.inputs.size() == 2 && node.outputs.size() == 1,
+                "compiled CumSum node has invalid arity");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled CumSum node missing GGML input");
+  return EmitOutputs{ggml_cumsum(ctx, x)};
 }
 
 SupportResult IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* constants) {
@@ -3719,6 +3774,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Softplus"}, {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Elu"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Pow"},      {IsSupportedPowNode, nullptr, EmitPowNode}},
+      {{"", "CumSum"},   {IsSupportedCumSumNode, nullptr, EmitCumSumNode}},
       {{"", "LeakyRelu"}, {IsSupportedLeakyReluNode, CompileLeakyReluAttributes, EmitLeakyReluNode}},
       {{"", "PRelu"},     {IsSupportedPReluNode, nullptr, EmitPReluNode}},
       {{"", "Clip"},      {IsSupportedClipNode, CompileClipAttributes, EmitClipNode}},

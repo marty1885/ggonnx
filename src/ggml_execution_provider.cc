@@ -812,6 +812,26 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
   }
 
   GGONNX_ASSERT(!partition.graph_outputs.empty(), "compiled partition must contain at least one graph output");
+  std::unordered_set<size_t> used_value_ids;
+  for (const NodeDesc& node : partition.nodes) {
+    for (size_t input_id : node.inputs) {
+      if (input_id != kOptionalValueAbsent) {
+        used_value_ids.insert(input_id);
+      }
+    }
+  }
+  std::vector<size_t> live_graph_inputs;
+  live_graph_inputs.reserve(partition.graph_inputs.size());
+  for (size_t& value_id : partition.kernel_input_to_value) {
+    if (value_id == kOptionalValueAbsent) continue;
+    if (used_value_ids.count(value_id) == 0) {
+      value_id = kOptionalValueAbsent;
+      continue;
+    }
+    live_graph_inputs.push_back(value_id);
+  }
+  partition.graph_inputs = std::move(live_graph_inputs);
+
   partition.folded_constants.resize(partition.values.size());
   for (size_t id = 0; id < partition.values.size(); ++id) {
     auto it = constants_by_name.find(partition.values[id].name);

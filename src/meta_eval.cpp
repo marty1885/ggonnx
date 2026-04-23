@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -15,6 +16,10 @@ using ggonnx::ort_internal::GetOrtApi;
 using ggonnx::ort_internal::THROW_ON_ERROR;
 
 constexpr size_t kMaxFoldedElements = 256;
+// Sentinel used inside compile-time shape tensors for dimensions that ORT
+// knows exist but cannot statically resolve. It must survive int64<->int32
+// shape casts without colliding with ONNX's meaningful shape placeholders 0/-1.
+constexpr int64_t kUnknownShapeDimSentinel = std::numeric_limits<int32_t>::min();
 // Raw initializers live on disk/in ORT memory already; loading them into the
 // constants map is a bounded duplication, not an unbounded compute. The
 // tighter kMaxFoldedElements still guards derived folds (Tile/Expand/etc.)
@@ -68,6 +73,19 @@ std::vector<T> ReadTypedData(const ConstantTensor& tensor) {
     std::memcpy(out.data(), tensor.data.data(), tensor.data.size());
   }
   return out;
+}
+
+bool ContainsUnknownShapeDim(const ConstantTensor& tensor) {
+  if (tensor.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+    const auto values = ReadTypedData<int64_t>(tensor);
+    return std::find(values.begin(), values.end(), kUnknownShapeDimSentinel) != values.end();
+  }
+  if (tensor.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+    const auto values = ReadTypedData<int32_t>(tensor);
+    return std::find(values.begin(), values.end(),
+                     static_cast<int32_t>(kUnknownShapeDimSentinel)) != values.end();
+  }
+  return false;
 }
 
 template <typename T>
@@ -277,8 +295,10 @@ std::optional<ConstantTensor> EvalShape(const ConstantValueMap& /*constants*/, O
   // comes back as [] even for non-scalar tensors. Treat [] as "unknown" here
   // instead of folding Shape(x) to an empty constant.
   if (meta.dims.empty()) return std::nullopt;
-  if (!shapeIsFullyStatic(meta)) return std::nullopt;
   std::vector<int64_t> values = meta.dims;
+  for (int64_t& dim : values) {
+    if (dim < 0) dim = kUnknownShapeDimSentinel;
+  }
   return MakeConstant<int64_t>({static_cast<int64_t>(values.size())}, std::move(values),
                                ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
 }
@@ -466,6 +486,7 @@ std::optional<ConstantTensor> EvalBinary(const ConstantValueMap& constants, Ort:
   const auto lhs = LookupConstant(constants, inputs[0]);
   const auto rhs = LookupConstant(constants, inputs[1]);
   if (!lhs || !rhs || lhs->element_type != rhs->element_type) return std::nullopt;
+  if (ContainsUnknownShapeDim(*lhs) || ContainsUnknownShapeDim(*rhs)) return std::nullopt;
   const std::string op_type = node.GetOperatorType();
   switch (lhs->element_type) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
@@ -496,6 +517,7 @@ std::optional<ConstantTensor> EvalReshape(const ConstantValueMap& constants, Ort
       infer_axis = static_cast<int64_t>(i);
       continue;
     }
+    if (out_dims[i] < -1 || out_dims[i] == kUnknownShapeDimSentinel) return std::nullopt;
     known_product *= out_dims[i];
   }
   const int64_t total = static_cast<int64_t>(ElementCount(data->dims));
@@ -851,15 +873,88 @@ std::optional<ConstantTensor> EvalGather(const ConstantValueMap& constants, Ort:
   return out;
 }
 
+std::optional<ConstantTensor> EvalShapeTensorGather(
+    const ConstantValueMap& constants,
+    const std::unordered_map<std::string, Ort::ConstNode>& producer_by_output,
+    Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 2 || inputs[0] == nullptr || inputs[1] == nullptr) return std::nullopt;
+
+  int64_t axis = 0;
+  if (auto attr = [&]() -> std::optional<int64_t> {
+        Ort::ConstOpAttr a{nullptr};
+        const Ort::Status s = node.GetAttributeByName("axis", a);
+        if (!s.IsOK() || a == nullptr) return std::nullopt;
+        int64_t v = 0;
+        Ort::ThrowOnError(a.GetValue(v));
+        return v;
+      }()) {
+    axis = *attr;
+  }
+  if (axis != 0 && axis != -1) return std::nullopt;
+
+  auto pit = producer_by_output.find(std::string(inputs[0].GetName()));
+  if (pit == producer_by_output.end()) return std::nullopt;
+  Ort::ConstNode producer = pit->second;
+  if (producer == nullptr || producer.GetOperatorType() != "Shape") return std::nullopt;
+  const std::string producer_domain = producer.GetDomain();
+  if (!producer_domain.empty() && producer_domain != "ai.onnx") return std::nullopt;
+
+  const auto shape_inputs = producer.GetInputs();
+  if (shape_inputs.size() != 1 || shape_inputs[0] == nullptr) return std::nullopt;
+  const TensorMetadata source_meta = getTensorMetadata(shape_inputs[0]);
+  const int64_t rank = static_cast<int64_t>(source_meta.dims.size());
+  if (rank == 0) return std::nullopt;
+
+  const auto indices_tensor = LookupConstant(constants, inputs[1]);
+  if (!indices_tensor.has_value()) return std::nullopt;
+  const TensorMetadata indices_meta{
+      .element_type = indices_tensor->element_type,
+      .dims = indices_tensor->dims,
+  };
+  if (indices_meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 &&
+      indices_meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+    return std::nullopt;
+  }
+
+  std::vector<int64_t> raw_indices;
+  if (indices_meta.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+    raw_indices = ReadTypedData<int64_t>(*indices_tensor);
+  } else {
+    const auto v32 = ReadTypedData<int32_t>(*indices_tensor);
+    raw_indices.assign(v32.begin(), v32.end());
+  }
+
+  std::vector<int64_t> gathered;
+  gathered.reserve(raw_indices.size());
+  for (int64_t idx : raw_indices) {
+    if (idx < 0) idx += rank;
+    if (idx < 0 || idx >= rank) return std::nullopt;
+    const int64_t dim = source_meta.dims[static_cast<size_t>(idx)];
+    gathered.push_back(dim < 0 ? kUnknownShapeDimSentinel : dim);
+  }
+
+  return MakeConstant<int64_t>(indices_meta.dims, std::move(gathered),
+                               ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+}
+
 std::optional<ConstantTensor> EvalConstantOfShape(const ConstantValueMap& constants,
                                                   Ort::ConstNode node) {
   const auto inputs = node.GetInputs();
   if (inputs.size() != 1 || inputs[0] == nullptr) return std::nullopt;
   const auto shape_tensor = LookupConstant(constants, inputs[0]);
-  if (!shape_tensor || shape_tensor->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+  if (!shape_tensor ||
+      (shape_tensor->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 &&
+       shape_tensor->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32)) {
     return std::nullopt;
   }
-  const auto shape_values = ReadTypedData<int64_t>(*shape_tensor);
+  std::vector<int64_t> shape_values;
+  if (shape_tensor->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+    shape_values = ReadTypedData<int64_t>(*shape_tensor);
+  } else {
+    const auto shape_values_i32 = ReadTypedData<int32_t>(*shape_tensor);
+    shape_values.assign(shape_values_i32.begin(), shape_values_i32.end());
+  }
   for (int64_t d : shape_values) {
     if (d < 0) return std::nullopt;
   }
@@ -931,6 +1026,7 @@ std::optional<ConstantTensor> EvalEqual(const ConstantValueMap& constants, Ort::
   const auto lhs = LookupConstant(constants, inputs[0]);
   const auto rhs = LookupConstant(constants, inputs[1]);
   if (!lhs || !rhs || lhs->element_type != rhs->element_type) return std::nullopt;
+  if (ContainsUnknownShapeDim(*lhs) || ContainsUnknownShapeDim(*rhs)) return std::nullopt;
   switch (lhs->element_type) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return EvalEqualTyped<int32_t>(*lhs, *rhs);
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return EvalEqualTyped<int64_t>(*lhs, *rhs);
@@ -948,6 +1044,10 @@ std::optional<ConstantTensor> EvalWhere(const ConstantValueMap& constants, Ort::
   const auto lhs = LookupConstant(constants, inputs[1]);
   const auto rhs = LookupConstant(constants, inputs[2]);
   if (!cond || !lhs || !rhs) return std::nullopt;
+  if (ContainsUnknownShapeDim(*cond) || ContainsUnknownShapeDim(*lhs) ||
+      ContainsUnknownShapeDim(*rhs)) {
+    return std::nullopt;
+  }
   if (cond->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) return std::nullopt;
   if (lhs->element_type != rhs->element_type) return std::nullopt;
   // Limit broadcasting: all three equal-shape, or any scalar.
@@ -1731,6 +1831,37 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
   GGONNX_NOT_NULL(graph, "graph must not be null");
   const Ort::ConstGraph ort_graph{graph};
   MetaAnalysis analysis;
+  std::unordered_map<std::string, Ort::ConstNode> producer_by_output;
+  std::unordered_map<std::string, size_t> consumer_count;
+  std::unordered_map<std::string, std::vector<std::string>> consumer_ops_by_input;
+  std::unordered_set<std::string> graph_output_names;
+
+  for (Ort::ConstNode node : ort_graph.GetNodes()) {
+    for (Ort::ConstValueInfo input : node.GetInputs()) {
+      if (input != nullptr) {
+        const std::string name = input.GetName();
+        consumer_count[name]++;
+        consumer_ops_by_input[name].push_back(node.GetOperatorType());
+      }
+    }
+    for (Ort::ConstValueInfo input : node.GetImplicitInputs()) {
+      if (input != nullptr) {
+        const std::string name = input.GetName();
+        consumer_count[name]++;
+        consumer_ops_by_input[name].push_back(node.GetOperatorType());
+      }
+    }
+    for (Ort::ConstValueInfo output : node.GetOutputs()) {
+      if (output != nullptr) {
+        producer_by_output.emplace(output.GetName(), node);
+      }
+    }
+  }
+  for (Ort::ConstValueInfo output : ort_graph.GetOutputs()) {
+    if (output != nullptr) {
+      graph_output_names.insert(output.GetName());
+    }
+  }
 
   for (Ort::ConstValueInfo input : ort_graph.GetInputs()) {
     if (input == nullptr || !input.IsConstantInitializer()) continue;
@@ -1770,11 +1901,46 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
         }
       }
       const auto folded = TryFoldNode(analysis.constants, node);
-      if (!folded.has_value()) continue;
+      const auto shape_gather_folded =
+          folded.has_value() ? folded : EvalShapeTensorGather(analysis.constants, producer_by_output, node);
+      if (!shape_gather_folded.has_value()) continue;
+      if (!folded.has_value() && node.GetOperatorType() == "Gather") {
+        bool shape_only_consumers = true;
+        for (Ort::ConstValueInfo output : outputs) {
+          if (output == nullptr) continue;
+          static const std::unordered_set<std::string> kShapeOnlyConsumers = {
+              "Reshape", "Expand", "Unsqueeze", "Squeeze", "Concat", "Slice",
+          };
+          const auto it = consumer_ops_by_input.find(std::string(output.GetName()));
+          if (it == consumer_ops_by_input.end()) continue;
+          for (const std::string& op_type : it->second) {
+            if (kShapeOnlyConsumers.count(op_type) == 0) {
+              shape_only_consumers = false;
+              break;
+            }
+          }
+          if (!shape_only_consumers) break;
+        }
+        if (!shape_only_consumers) continue;
+      }
       analysis.folded_nodes.insert(NodeKey(node));
+      if (!folded.has_value() && node.GetOperatorType() == "Gather") {
+        const auto inputs = node.GetInputs();
+        if (!inputs.empty() && inputs[0] != nullptr) {
+          const std::string shape_output_name = inputs[0].GetName();
+          auto pit = producer_by_output.find(shape_output_name);
+          if (pit != producer_by_output.end() &&
+              pit->second != nullptr &&
+              pit->second.GetOperatorType() == "Shape" &&
+              consumer_count[shape_output_name] == 1 &&
+              graph_output_names.count(shape_output_name) == 0) {
+            analysis.folded_nodes.insert(NodeKey(pit->second));
+          }
+        }
+      }
       for (Ort::ConstValueInfo output : outputs) {
         if (output == nullptr) continue;
-        analysis.constants[output.GetName()] = *folded;
+        analysis.constants[output.GetName()] = *shape_gather_folded;
       }
     } catch (...) {
       continue;
