@@ -1,4 +1,5 @@
 #include "ops.hpp"
+#include "meta_eval.hpp"
 #include "inner/helpers.hpp"
 #include "inner/ort_api_helpers.hpp"
 #include <cstdlib>
@@ -249,7 +250,7 @@ bool inferIntegerSpatialScale(const TensorMetadata& x,
 }
 
 SupportResult IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_type,
-                                       const ConstantValueMap* /*constants*/) {
+                                       const MetaAnalysis* /*meta*/) {
   SUPPORT_CHECK(op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div" ||
                     op_type == "Max" || op_type == "Min",
                 "unexpected binary op registration");
@@ -313,11 +314,11 @@ SupportResult IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_
   return support_ok();
 }
 
-SupportResult IsSupportedElementwiseBinaryOpNode(Ort::ConstNode node, const ConstantValueMap* constants) {
-  return IsSupportedElementwiseBinaryNode(node, node.GetOperatorType(), constants);
+SupportResult IsSupportedElementwiseBinaryOpNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  return IsSupportedElementwiseBinaryNode(node, node.GetOperatorType(), meta);
 }
 
-SupportResult IsSupportedGRUNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedGRUNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   const auto implicit_inputs = node.GetImplicitInputs();
@@ -423,7 +424,7 @@ SupportResult IsSupportedGRUNode(Ort::ConstNode node, const ConstantValueMap* /*
   return true;
 }
 
-void CompileGRUAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileGRUAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const std::string direction = readNodeAttribute<std::string>(node, "direction").value_or("forward");
   GGONNX_ASSERT(direction == "forward", "only forward GRU direction is supported");
@@ -634,7 +635,7 @@ EmitResult EmitGRUNode(ggml_context* ctx,
   return outputs;
 }
 
-SupportResult IsSupportedLSTMNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedLSTMNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   const auto implicit_inputs = node.GetImplicitInputs();
@@ -751,7 +752,7 @@ SupportResult IsSupportedLSTMNode(Ort::ConstNode node, const ConstantValueMap* /
   return true;
 }
 
-void CompileLSTMAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileLSTMAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const std::string direction = readNodeAttribute<std::string>(node, "direction").value_or("forward");
   GGONNX_ASSERT(direction == "forward", "only forward LSTM direction is supported");
@@ -924,7 +925,7 @@ EmitResult EmitLSTMNode(ggml_context* ctx,
 
 // Shape-preserving unary float op with no attributes. Covers Relu, Sigmoid, Tanh, Neg,
 // Abs, Sqrt, Exp, Log, Erf, Softplus, Elu (ONNX default alpha=1.0 only).
-SupportResult IsSupportedUnaryFloatNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedUnaryFloatNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -987,11 +988,11 @@ EmitResult EmitUnaryFloatNode(ggml_context* ctx,
   return std::nullopt;
 }
 
-SupportResult IsSupportedLeakyReluNode(Ort::ConstNode node, const ConstantValueMap* constants) {
-  return IsSupportedUnaryFloatNode(node, constants);
+SupportResult IsSupportedLeakyReluNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  return IsSupportedUnaryFloatNode(node, meta);
 }
 
-void CompileLeakyReluAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileLeakyReluAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const float alpha = readNodeAttribute<float>(node, "alpha").value_or(0.01f);
   compiled_node->attrs = NodeDesc::AlphaAttrs{.alpha = alpha};
@@ -1012,7 +1013,7 @@ EmitResult EmitLeakyReluNode(ggml_context* ctx,
 // unidirectionally broadcastable to X. ggml has no native PRelu, so we emit
 // Y = relu(X) - slope * relu(-X), which evaluates to relu(X) when X >= 0 and
 // to slope * X when X < 0 (since -relu(-X) == X on that branch).
-SupportResult IsSupportedPReluNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedPReluNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 2 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -1116,7 +1117,8 @@ static std::optional<int64_t> read_constant_input_scalar_int64(Ort::ConstNode no
   return std::nullopt;
 }
 
-SupportResult IsSupportedPowNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedPowNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -1147,7 +1149,8 @@ EmitResult EmitPowNode(ggml_context* ctx,
   return EmitOutputs{ggml_sqr(ctx, x)};
 }
 
-SupportResult IsSupportedCumSumNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedCumSumNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -1217,7 +1220,8 @@ static std::optional<float> readConstantScalarAsFloat(Ort::ConstNode node,
   return std::nullopt;
 }
 
-SupportResult IsSupportedRangeNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedRangeNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 3 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -1242,7 +1246,8 @@ SupportResult IsSupportedRangeNode(Ort::ConstNode node, const ConstantValueMap* 
 }
 
 void CompileRangeAttributes(Ort::ConstNode node, NodeDesc* compiled_node,
-                            const ConstantValueMap* constants) {
+                            const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto outputs = node.GetOutputs();
   const TensorMetadata out = getTensorMetadata(outputs[0]);
   const auto start = readConstantScalarAsFloat(node, 0, constants);
@@ -1273,7 +1278,8 @@ EmitResult EmitRangeNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
-SupportResult IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedClipNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.empty() || inputs.size() > 3 || outputs.size() != 1 ||
@@ -1297,7 +1303,8 @@ SupportResult IsSupportedClipNode(Ort::ConstNode node, const ConstantValueMap* c
   return true;
 }
 
-void CompileClipAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
+void CompileClipAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   NodeDesc::ClipAttrs attrs;
   // Opset <11: attributes. Opset >=11: inputs.
@@ -1332,7 +1339,7 @@ EmitResult EmitClipNode(ggml_context* ctx,
 // ONNX Softmax (opset >= 13): softmax along `axis` (default -1). GGML's ggml_soft_max
 // operates along ne[0], which is the last ONNX dim.. so we only accept axis=-1 or
 // axis=rank-1. Pre-opset-13 Softmax with its "coerce to 2D" semantics is rejected.
-SupportResult IsSupportedSoftmaxNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedSoftmaxNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 1 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -1352,7 +1359,7 @@ SupportResult IsSupportedSoftmaxNode(Ort::ConstNode node, const ConstantValueMap
   return support_ok();
 }
 
-void CompileSoftmaxAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileSoftmaxAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   compiled_node->attrs =
       NodeDesc::AxisAttrs{.axis = readNodeAttribute<int64_t>(node, "axis").value_or(-1)};
@@ -1373,7 +1380,7 @@ EmitResult EmitSoftmaxNode(ggml_context* ctx,
 // (the shared K), so we transpose+materialize B to get [K, N, batch...] and pass
 // that as the "weight" operand. Result shape is [N, M, batch...] which is the
 // reversed ONNX [..., M, N]. We require batch dims to match exactly for now.
-SupportResult IsSupportedMatMulNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedMatMulNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -1408,7 +1415,7 @@ SupportResult IsSupportedMatMulNode(Ort::ConstNode node, const ConstantValueMap*
   return support_ok();
 }
 
-void CompileMatMulAttributes(Ort::ConstNode /*node*/, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileMatMulAttributes(Ort::ConstNode /*node*/, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   // MatMulAttrs.force_f32 is set by the EP after compile_attrs; default false here.
   compiled_node->attrs = NodeDesc::MatMulAttrs{};
@@ -1510,7 +1517,7 @@ ggml_tensor* CropSpatialOutputIfNeeded(ggml_context* ctx,
 
 }  // namespace
 
-SupportResult IsSupportedConvNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedConvNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK((inputs.size() == 2 || inputs.size() == 3) && outputs.size() == 1 &&
@@ -1605,7 +1612,7 @@ SupportResult IsSupportedConvNode(Ort::ConstNode node, const ConstantValueMap* /
   return support_ok();
 }
 
-void CompileConvAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileConvAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   NodeDesc::Conv2DAttrs attrs;
   const auto inputs = node.GetInputs();
@@ -1738,7 +1745,7 @@ EmitResult EmitConvNode(ggml_context* ctx,
 // ONNX ConvTranspose: 2D only, square stride, symmetric pads. Maps to
 // ggml_conv_transpose_2d_p0 (no built-in padding) followed by a center crop
 // when ONNX pads are non-zero, since output = (in-1)*s - 2p + kernel.
-SupportResult IsSupportedConvTransposeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedConvTransposeNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
@@ -1789,7 +1796,7 @@ SupportResult IsSupportedConvTransposeNode(Ort::ConstNode node, const ConstantVa
   return true;
 }
 
-void CompileConvTransposeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileConvTransposeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   NodeDesc::ConvTransposeAttrs attrs;
   const auto strides = readNodeAttribute<std::vector<int64_t>>(node, "strides");
@@ -1839,7 +1846,8 @@ EmitResult EmitConvTransposeNode(ggml_context* ctx,
 // be a compile-time constant so the target dims land in the compiled attrs —
 // ORT's shape inference typically leaves the output shape symbolic when the
 // shape tensor comes from a Where/Equal chain.
-SupportResult IsSupportedExpandNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedExpandNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -1877,7 +1885,8 @@ SupportResult IsSupportedExpandNode(Ort::ConstNode node, const ConstantValueMap*
   return support_ok();
 }
 
-void CompileExpandAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
+void CompileExpandAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
   const TensorMetadata x = getTensorMetadata(inputs[0]);
@@ -1917,7 +1926,7 @@ EmitResult EmitExpandNode(ggml_context* ctx,
 // ONNX Gemm: Y = alpha * A' @ B' + beta * C, where A' = transA ? A^T : A (shape [M,K])
 // and B' = transB ? B^T : B (shape [K,N]). Maps to ggml_mul_mat after making both
 // operands have the shared K dim at ne[0].
-SupportResult IsSupportedGemmNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedGemmNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
@@ -1959,7 +1968,7 @@ SupportResult IsSupportedGemmNode(Ort::ConstNode node, const ConstantValueMap* /
   return true;
 }
 
-void CompileGemmAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileGemmAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   NodeDesc::GemmAttrs attrs;
   attrs.alpha = readNodeAttribute<float>(node, "alpha").value_or(1.0f);
@@ -2025,7 +2034,7 @@ EmitResult EmitGemmNode(ggml_context* ctx,
 // ONNX Reshape: data + shape input. We require the output shape to be fully static
 // (resolved by shape inference) and snapshot it at compile time — the runtime shape
 // tensor is ignored.
-SupportResult IsSupportedReshapeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedReshapeNode(Ort::ConstNode node, const MetaAnalysis* meta) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -2039,17 +2048,21 @@ SupportResult IsSupportedReshapeNode(Ort::ConstNode node, const ConstantValueMap
                     " out=" + std::to_string(out.element_type) + ")");
   SUPPORT_CHECK(rankSupportedByGGML(in) && rankSupportedByGGML(out),
                 "Reshape: rank exceeds GGML_MAX_DIMS");
-  SUPPORT_CHECK(shapeIsFullyStatic(out.dims), "Reshape: output has dynamic shape");
+  // Accept either ORT's static output shape or one we propagated ourselves.
+  const auto resolved = (meta != nullptr) ? ResolveShape(outputs[0], *meta) : std::nullopt;
+  SUPPORT_CHECK(resolved.has_value(), "Reshape: output has dynamic shape");
   return support_ok();
 }
 
-void CompileReshapeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileReshapeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto outputs = node.GetOutputs();
   GGONNX_ASSERT(outputs.size() == 1 && outputs[0] != nullptr,
                 "Reshape must have a single output");
-  const TensorMetadata out = getTensorMetadata(outputs[0]);
-  compiled_node->attrs = NodeDesc::ReshapeAttrs{.onnx_dims = out.dims};
+  const auto resolved = (meta != nullptr) ? ResolveShape(outputs[0], *meta) : std::nullopt;
+  GGONNX_ASSERT(resolved.has_value(),
+                "Reshape compile: output shape must be resolvable (support predicate invariant)");
+  compiled_node->attrs = NodeDesc::ReshapeAttrs{.onnx_dims = *resolved};
 }
 
 EmitResult EmitReshapeNode(ggml_context* ctx,
@@ -2081,7 +2094,7 @@ EmitResult EmitReshapeNode(ggml_context* ctx,
 // ONNX Flatten: collapses input dims around `axis` into a 2D tensor. We reuse
 // the Reshape machinery — the output shape is fully determined by shape
 // inference, so we snapshot it and emit a ggml reshape.
-SupportResult IsSupportedFlattenNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedFlattenNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2109,7 +2122,8 @@ SupportResult IsSupportedFlattenNode(Ort::ConstNode node, const ConstantValueMap
 // derive the actual output shape from the runtime input tensor in EmitSqueezeNode,
 // so the emit is correct even when ORT's static shape inference for If-branch
 // subgraphs is inconsistent with the actual runtime input shape.
-SupportResult IsSupportedSqueezeNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedSqueezeNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if ((inputs.size() != 1 && inputs.size() != 2) || outputs.size() != 1 ||
@@ -2136,18 +2150,20 @@ SupportResult IsSupportedSqueezeNode(Ort::ConstNode node, const ConstantValueMap
     return false;
   }
   // If axes are a runtime input (not a constant) we fall back to baked output
-  // dims from ORT's inference — those must be fully static.
+  // dims — those must be resolvable either via ORT or our shape propagation.
   const bool has_const_axes =
       (inputs.size() == 2 && inputs[1] != nullptr &&
        readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants).has_value()) ||
       readNodeAttribute<std::vector<int64_t>>(node, "axes").has_value();
-  if (!has_const_axes && !shapeIsFullyStatic(out.dims)) {
-    return false;
+  if (!has_const_axes) {
+    const auto resolved = (meta != nullptr) ? ResolveShape(outputs[0], *meta) : std::nullopt;
+    if (!resolved.has_value()) return false;
   }
   return true;
 }
 
-void CompileSqueezeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
+void CompileSqueezeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
   const bool is_unsqueeze = std::string_view(node.GetOperatorType()) == "Unsqueeze";
@@ -2254,7 +2270,7 @@ EmitResult EmitSqueezeNode(ggml_context* ctx,
   return EmitOutputs{ggml_reshape_4d(ctx, src, target[0], target[1], target[2], target[3])};
 }
 
-void CompileFlattenAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileFlattenAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto outputs = node.GetOutputs();
   GGONNX_ASSERT(outputs.size() == 1 && outputs[0] != nullptr,
@@ -2268,7 +2284,7 @@ void CompileFlattenAttributes(Ort::ConstNode node, NodeDesc* compiled_node, cons
 // strides/pads are [h, w] so we swap. GGML's AveragePool divides by the full kernel
 // area regardless of how many in-bounds samples were summed (i.e. count_include_pad=1),
 // so we reject AveragePool with non-zero padding unless count_include_pad=1.
-SupportResult IsSupportedPool2DNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedPool2DNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.empty() || node.GetImplicitInputs().size() != 0) {
@@ -2351,7 +2367,7 @@ SupportResult IsSupportedPool2DNode(Ort::ConstNode node, const ConstantValueMap*
   return true;
 }
 
-void CompilePool2DAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompilePool2DAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   NodeDesc::Pool2DAttrs attrs;
   attrs.op = node.GetOperatorType() == "MaxPool" ? GGML_OP_POOL_MAX : GGML_OP_POOL_AVG;
@@ -2394,7 +2410,7 @@ void CompilePool2DAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const
   compiled_node->attrs = attrs;
 }
 
-SupportResult IsSupportedGlobalPoolNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedGlobalPoolNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2422,7 +2438,7 @@ SupportResult IsSupportedGlobalPoolNode(Ort::ConstNode node, const ConstantValue
   return true;
 }
 
-void CompileGlobalPoolAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileGlobalPoolAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   NodeDesc::Pool2DAttrs attrs;
   attrs.op = node.GetOperatorType() == "GlobalMaxPool" ? GGML_OP_POOL_MAX : GGML_OP_POOL_AVG;
@@ -2463,7 +2479,8 @@ EmitResult EmitPool2DNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
-SupportResult IsSupportedPadNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedPadNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.empty() || inputs.size() > 4 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2532,7 +2549,8 @@ SupportResult IsSupportedPadNode(Ort::ConstNode node, const ConstantValueMap* co
   return true;
 }
 
-void CompilePadAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
+void CompilePadAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto pads = readPadVector(node, constants);
   GGONNX_ASSERT(pads.has_value() && pads->size() == 8,
@@ -2632,7 +2650,7 @@ EmitResult EmitPadNode(ggml_context* ctx,
   return EmitOutputs{out};
 }
 
-SupportResult IsSupportedInstanceNormalizationNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedInstanceNormalizationNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 3 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2668,7 +2686,7 @@ SupportResult IsSupportedInstanceNormalizationNode(Ort::ConstNode node, const Co
   return true;
 }
 
-void CompileInstanceNormalizationAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileInstanceNormalizationAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   compiled_node->attrs = NodeDesc::InstanceNormAttrs{
       .epsilon = readNodeAttribute<float>(node, "epsilon").value_or(1e-5f),
@@ -2698,7 +2716,8 @@ EmitResult EmitInstanceNormalizationNode(ggml_context* ctx,
   return EmitOutputs{ggml_add(ctx, ggml_mul(ctx, norm, scale_4d), bias_4d)};
 }
 
-SupportResult IsSupportedUpsampleNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedUpsampleNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   const std::string op_type = node.GetOperatorType();
@@ -2801,7 +2820,7 @@ SupportResult IsSupportedUpsampleNode(Ort::ConstNode node, const ConstantValueMa
   return true;
 }
 
-void CompileUpsampleAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileUpsampleAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -2838,7 +2857,7 @@ EmitResult EmitUpsampleNode(ggml_context* ctx,
 // Identity: logical copy. We emit a view of the input so the result has a
 // distinct ggml_tensor* (graph build asserts on reused output slots) while
 // sharing storage and staying cheap.
-SupportResult IsSupportedIdentityNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedIdentityNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2880,7 +2899,7 @@ EmitResult EmitIdentityNode(ggml_context* ctx,
 // ONNX Cast: convert `input` elementwise to the `to` dtype. Meta-eval folds
 // compile-time constants via CastConstant; this handles the runtime path by
 // emitting ggml_cast. Same-dtype casts degrade to ggml_cont (Identity).
-SupportResult IsSupportedCastNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedCastNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 1 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -2917,7 +2936,7 @@ SupportResult IsSupportedCastNode(Ort::ConstNode node, const ConstantValueMap* /
   return support_ok();
 }
 
-void CompileCastAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileCastAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto outputs = node.GetOutputs();
   const TensorMetadata out = getTensorMetadata(outputs[0]);
@@ -2943,7 +2962,7 @@ EmitResult EmitCastNode(ggml_context* ctx,
 // ONNX Transpose: permutes dims by `perm` (default = reverse). GGML dim order is
 // reversed vs ONNX, so the ggml axis that feeds output GGML axis j is
 // R-1 - perm[R-1 - j]. Axes beyond the ONNX rank are padded identity.
-SupportResult IsSupportedTransposeNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedTransposeNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -2977,7 +2996,7 @@ SupportResult IsSupportedTransposeNode(Ort::ConstNode node, const ConstantValueM
   return true;
 }
 
-void CompileTransposeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileTransposeAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
   const size_t rank = getTensorMetadata(inputs[0]).dims.size();
@@ -3032,7 +3051,8 @@ EmitResult EmitTransposeNode(ggml_context* ctx,
 // ONNX Concat: join N inputs along `axis`. GGML's ggml_concat takes two tensors
 // and a GGML-axis integer, so we translate ONNX axis -> (rank-1-axis) and fold
 // left-to-right.
-SupportResult IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedConcatNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(!inputs.empty() && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -3077,7 +3097,7 @@ SupportResult IsSupportedConcatNode(Ort::ConstNode node, const ConstantValueMap*
   return support_ok();
 }
 
-void CompileConcatAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileConcatAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto outputs = node.GetOutputs();
   const size_t rank = getTensorMetadata(outputs[0]).dims.size();
@@ -3113,55 +3133,95 @@ EmitResult EmitConcatNode(ggml_context* ctx,
 // common case where starts/ends/axes/steps are constant int64 initializers and
 // all steps are 1 — that lets us lower the op to a single ggml_view_4d, which
 // is a zero-copy aliased view of the source buffer.
-SupportResult IsSupportedSliceNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedSliceNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if (inputs.size() < 3 || inputs.size() > 5 || outputs.size() != 1 ||
-      node.GetImplicitInputs().size() != 0) {
-    return false;
+  if (inputs.size() < 3 || inputs.size() > 5) {
+    return support_error("Slice: expected 3..5 inputs, got " + std::to_string(inputs.size()));
   }
-  if (inputs[0] == nullptr || outputs[0] == nullptr) {
-    return false;
+  if (outputs.size() != 1) {
+    return support_error("Slice: expected 1 output, got " + std::to_string(outputs.size()));
   }
+  if (node.GetImplicitInputs().size() != 0) {
+    return support_error("Slice: implicit inputs not supported");
+  }
+  if (inputs[0] == nullptr) return support_error("Slice: data input is null");
+  if (outputs[0] == nullptr) return support_error("Slice: output is null");
 
   const TensorMetadata data = getTensorMetadata(inputs[0]);
   const TensorMetadata out = getTensorMetadata(outputs[0]);
-  if (data.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
+  if (data.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return support_error("Slice: data dtype is " +
+                         std::to_string(data.element_type) + ", only FLOAT supported");
   }
-  if (!rankSupportedByGGML(data) || !rankSupportedByGGML(out)) {
-    return false;
+  if (out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return support_error("Slice: output dtype is " +
+                         std::to_string(out.element_type) + ", only FLOAT supported");
   }
-  if (!shapeIsFullyStatic(data) || data.dims.size() == 0) {
-    return false;
+  if (!rankSupportedByGGML(data)) {
+    return support_error("Slice: data rank " + std::to_string(data.dims.size()) +
+                         " exceeds GGML_MAX_DIMS");
+  }
+  if (!rankSupportedByGGML(out)) {
+    return support_error("Slice: output rank " + std::to_string(out.dims.size()) +
+                         " exceeds GGML_MAX_DIMS");
+  }
+  if (data.dims.size() == 0) {
+    return support_error("Slice: scalar data not supported");
+  }
+  // Resolve the data tensor's concrete shape, accepting either ORT's static
+  // dims or a shape we propagated through Pad/Reshape in meta_eval. If
+  // neither is available, we can't materialize the view at compile time.
+  const auto resolved = (meta != nullptr) ? ResolveShape(inputs[0], *meta) : std::nullopt;
+  if (!resolved.has_value()) {
+    return support_error("Slice: data has dynamic dims");
   }
   // We require constant int64 starts/ends (and axes/steps if present) so the
   // view can be materialized at compile time. Dynamic Slice falls back to CPU.
   const auto starts = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
+  if (!starts) return support_error("Slice: 'starts' is not a constant int64 initializer");
   const auto ends = readConstantInputArray<int64_t>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-  if (!starts || !ends || starts->size() != ends->size() || starts->empty()) {
-    return false;
+  if (!ends) return support_error("Slice: 'ends' is not a constant int64 initializer");
+  if (starts->size() != ends->size()) {
+    return support_error("Slice: starts/ends length mismatch");
   }
+  if (starts->empty()) return support_error("Slice: empty starts/ends");
+
   if (inputs.size() >= 4 && inputs[3] != nullptr) {
     const auto axes = readConstantInputArray<int64_t>(node, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-    if (!axes || axes->size() != starts->size()) return false;
+    if (!axes) return support_error("Slice: 'axes' is not a constant int64 initializer");
+    if (axes->size() != starts->size()) {
+      return support_error("Slice: axes length does not match starts");
+    }
   }
   if (inputs.size() == 5 && inputs[4] != nullptr) {
     const auto steps = readConstantInputArray<int64_t>(node, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-    if (!steps || steps->size() != starts->size()) return false;
+    if (!steps) return support_error("Slice: 'steps' is not a constant int64 initializer");
+    if (steps->size() != starts->size()) {
+      return support_error("Slice: steps length does not match starts");
+    }
     for (int64_t s : *steps) {
-      if (s != 1) return false;
+      if (s != 1) {
+        return support_error("Slice: step=" + std::to_string(s) +
+                             " not supported (only step==1)");
+      }
     }
   }
-  return true;
+  return support_ok();
 }
 
-void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
+void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
-  const TensorMetadata data = getTensorMetadata(inputs[0]);
-  const int64_t rank = static_cast<int64_t>(data.dims.size());
+  // Re-resolve the data shape (support predicate already validated it's known).
+  // Prefer the meta-eval inferred shape when ORT's view is dynamic.
+  const auto resolved = (meta != nullptr) ? ResolveShape(inputs[0], *meta) : std::nullopt;
+  GGONNX_ASSERT(resolved.has_value(),
+                "Slice compile: data shape must have been resolvable (support predicate invariant)");
+  const std::vector<int64_t>& data_dims = *resolved;
+  const int64_t rank = static_cast<int64_t>(data_dims.size());
 
   const auto starts = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
   const auto ends = readConstantInputArray<int64_t>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
@@ -3182,7 +3242,7 @@ void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
   attrs.ggml_starts.fill(0);
   // Default: each dim passes through unsliced.
   for (int64_t i = 0; i < rank; ++i) {
-    attrs.ggml_ne[rank - 1 - i] = data.dims[i];
+    attrs.ggml_ne[rank - 1 - i] = data_dims[i];
   }
   for (int i = rank; i < GGML_MAX_DIMS; ++i) {
     attrs.ggml_ne[i] = 1;
@@ -3193,7 +3253,7 @@ void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
     if (onnx_axis < 0) onnx_axis += rank;
     GGONNX_ASSERT(onnx_axis >= 0 && onnx_axis < rank,
                   "Slice compile: axis out of range");
-    const int64_t dim = data.dims[onnx_axis];
+    const int64_t dim = data_dims[onnx_axis];
 
     // ONNX clamping rules: clamp start to [0, dim], clamp end to [0, dim].
     auto clamp = [](int64_t v, int64_t lo, int64_t hi) {
@@ -3248,7 +3308,7 @@ EmitResult EmitSliceNode(ggml_context* ctx,
 // reversed layout is ggml axis (rank-2). ORT usually folds BN into the
 // preceding Conv bias, so this mostly matters for BN outside Conv (e.g. the
 // trailing BN on arcface's flattened feature vector, or language models).
-SupportResult IsSupportedBatchNormNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedBatchNormNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 5 || outputs.size() != 1 ||
@@ -3281,7 +3341,7 @@ SupportResult IsSupportedBatchNormNode(Ort::ConstNode node, const ConstantValueM
   return true;
 }
 
-void CompileBatchNormAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileBatchNormAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
   const TensorMetadata x = getTensorMetadata(inputs[0]);
@@ -3338,7 +3398,8 @@ EmitResult EmitBatchNormNode(ggml_context* ctx,
 // We handle the case where the split sizes are known at compile time — either
 // via the `split` attribute (opset <13), the `split` input (opset 13+), or by
 // equal division into `outputs.size()` chunks (the default).
-SupportResult IsSupportedSplitNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedSplitNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.empty() || inputs.size() > 2 || outputs.empty() ||
@@ -3387,7 +3448,8 @@ SupportResult IsSupportedSplitNode(Ort::ConstNode node, const ConstantValueMap* 
   return true;
 }
 
-void CompileSplitAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
+void CompileSplitAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -3443,7 +3505,8 @@ EmitResult EmitSplitNode(ggml_context* ctx,
 // contiguous suffix of the ONNX dims — e.g. axes=[2,3] on an [N,C,H,W] input —
 // because that's what ggml_mean (which reduces only axis 0) can express after
 // collapsing the trailing dims.
-SupportResult IsSupportedReduceMeanNode(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult IsSupportedReduceMeanNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(!inputs.empty() && inputs.size() <= 2 && outputs.size() == 1 &&
@@ -3499,7 +3562,8 @@ SupportResult IsSupportedReduceMeanNode(Ort::ConstNode node, const ConstantValue
   return support_ok();
 }
 
-void CompileReduceMeanAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants) {
+void CompileReduceMeanAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
   const TensorMetadata x = getTensorMetadata(inputs[0]);
@@ -3689,7 +3753,7 @@ static ggml_tensor* EmitDepthToSpaceShuffleBatch1(ggml_context* ctx,
   return ggml_reshape_4d(ctx, p2, W * b, H * b, Cout, 1);
 }
 
-SupportResult IsSupportedDepthToSpaceNode(Ort::ConstNode node, const ConstantValueMap* /*constants*/) {
+SupportResult IsSupportedDepthToSpaceNode(Ort::ConstNode node, const MetaAnalysis* meta) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   if (inputs.size() != 1 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
@@ -3705,12 +3769,14 @@ SupportResult IsSupportedDepthToSpaceNode(Ort::ConstNode node, const ConstantVal
     return false;
   }
   if (in.dims.size() != 4 || out.dims.size() != 4) return false;
-  if (!shapeIsFullyStatic(in.dims) || !shapeIsFullyStatic(out.dims)) return false;
+  const auto in_shape = (meta != nullptr) ? ResolveShape(inputs[0], *meta) : std::nullopt;
+  const auto out_shape = (meta != nullptr) ? ResolveShape(outputs[0], *meta) : std::nullopt;
+  if (!in_shape.has_value() || !out_shape.has_value()) return false;
 
   const auto blocksize = readNodeAttribute<int64_t>(node, "blocksize");
   if (!blocksize.has_value() || *blocksize < 1) return false;
   const int64_t b = *blocksize;
-  if (in.dims[1] % (b * b) != 0) return false;
+  if ((*in_shape)[1] % (b * b) != 0) return false;
 
   const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("DCR");
   if (mode != "DCR" && mode != "CRD") return false;
@@ -3718,7 +3784,7 @@ SupportResult IsSupportedDepthToSpaceNode(Ort::ConstNode node, const ConstantVal
   return true;
 }
 
-void CompileDepthToSpaceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* /*constants*/) {
+void CompileDepthToSpaceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* /*meta*/) {
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   NodeDesc::DepthToSpaceAttrs attrs;
   attrs.blocksize = static_cast<int>(*readNodeAttribute<int64_t>(node, "blocksize"));
@@ -3856,7 +3922,8 @@ EmitResult EmitQKVSplitNode(ggml_context* ctx,
   return out;
 }
 
-SupportResult get_node_support(Ort::ConstNode node, const ConstantValueMap* constants) {
+SupportResult get_node_support(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   try {
     if (node == nullptr) {
       return support_error("node metadata must not be null");
@@ -3916,7 +3983,7 @@ SupportResult get_node_support(Ort::ConstNode node, const ConstantValueMap* cons
       return result;
     }
 
-    SupportResult result = normalize_support_result(node, op->support(node, constants));
+    SupportResult result = normalize_support_result(node, op->support(node, meta));
     trace_support_decision(node, result);
     return result;
   } catch (const Ort::Exception& ex) {

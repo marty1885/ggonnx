@@ -2196,3 +2196,219 @@ def test_cast_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
         assert ggml_out.dtype == dst_np, name
         np.testing.assert_array_equal(ggml_out, cpu_out, err_msg=name)
     assert_all_nodes_run_on_ggml(ggml)
+
+
+def build_pad_then_slice_model(tmpdir: Path) -> Path:
+    # Pad ([2, 3, 4] -> [2, 3, 6] with pads on last axis), Slice the padded
+    # output along axis 1 (start=0, end=2). Validates the Slice support
+    # predicate consults the resolved shape even after the (folded) Pad.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3, 4])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 2, 6])
+
+    pads = helper.make_tensor(
+        "pads", TensorProto.INT64, [6], [0, 0, 1, 0, 0, 1])
+    starts = helper.make_tensor("starts", TensorProto.INT64, [1], [0])
+    ends = helper.make_tensor("ends", TensorProto.INT64, [1], [2])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [1])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+
+    nodes = [
+        helper.make_node("Pad", ["x", "pads"], ["padded"], name="pad_0", mode="constant"),
+        helper.make_node(
+            "Slice", ["padded", "starts", "ends", "axes", "steps"], ["y"], name="slice_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "pad_then_slice",
+        [x],
+        [y],
+        initializer=[pads, starts, ends, axes, steps],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_shape_concat_reshape_then_slice_model(tmpdir: Path) -> Path:
+    # Same shape-math pattern as build_shape_concat_folded_reshape_model but
+    # followed by a Slice on the reshape output. ORT's shape inference doesn't
+    # reliably propagate shape through a Concat-of-Shape-of-input used as a
+    # Reshape target, so the Reshape output's dims land as symbolic in ORT's
+    # view. meta_eval folds the Shape+Concat chain into a concrete int64
+    # tensor, and the new PropagateInferredShapes pass then makes the Reshape
+    # output's shape available to downstream Slice via ResolveShape.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3])
+
+    starts0 = helper.make_tensor("starts0", TensorProto.INT64, [1], [0])
+    ends0 = helper.make_tensor("ends0", TensorProto.INT64, [1], [1])
+    starts1_i32 = helper.make_tensor("starts1_i32", TensorProto.INT32, [1], [1])
+    ends1_i32 = helper.make_tensor("ends1_i32", TensorProto.INT32, [1], [2])
+    axes0 = helper.make_tensor("axes0", TensorProto.INT64, [1], [0])
+    steps0 = helper.make_tensor("steps0", TensorProto.INT64, [1], [1])
+
+    # Outer Slice on the reshape output: take the first row ([1, 3] from [2, 3]).
+    outer_starts = helper.make_tensor("outer_starts", TensorProto.INT64, [1], [0])
+    outer_ends = helper.make_tensor("outer_ends", TensorProto.INT64, [1], [1])
+    outer_axes = helper.make_tensor("outer_axes", TensorProto.INT64, [1], [0])
+    outer_steps = helper.make_tensor("outer_steps", TensorProto.INT64, [1], [1])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts0", "ends0", "axes0", "steps0"], ["dim0"], name="slice_dim0"),
+        helper.make_node("Cast", ["shape"], ["shape_i32"], name="shape_cast", to=TensorProto.INT32),
+        helper.make_node("Cast", ["starts1_i32"], ["starts1"], name="starts1_cast", to=TensorProto.INT64),
+        helper.make_node("Cast", ["ends1_i32"], ["ends1"], name="ends1_cast", to=TensorProto.INT64),
+        helper.make_node("Slice", ["shape_i32", "starts1", "ends1", "axes0", "steps0"], ["dim1_i32"], name="slice_dim1"),
+        helper.make_node("Cast", ["dim1_i32"], ["dim1"], name="dim1_cast", to=TensorProto.INT64),
+        helper.make_node("Concat", ["dim0", "dim1"], ["new_shape"], name="shape_concat", axis=0),
+        helper.make_node("Reshape", ["x", "new_shape"], ["reshaped"], name="reshape_0"),
+        helper.make_node(
+            "Slice",
+            ["reshaped", "outer_starts", "outer_ends", "outer_axes", "outer_steps"],
+            ["y"],
+            name="slice_data",
+        ),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "shape_concat_reshape_then_slice",
+        [x],
+        [y],
+        initializer=[
+            starts0, ends0, starts1_i32, ends1_i32, axes0, steps0,
+            outer_starts, outer_ends, outer_axes, outer_steps,
+        ],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def test_pad_then_slice_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_pad_then_slice_model(suite_tmpdir)
+    rng = np.random.default_rng(17)
+    inputs = {"x": rng.standard_normal((2, 3, 4)).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    expected = cpu.run(["y"], inputs)[0]
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    # GGML fuses its partition into a single event named GGMLExecutionProvider_*
+    # so a per-op "Slice" event won't appear. The invariant we care about: the
+    # data-path Slice must not fall back to the CPU EP, and at least one GGML
+    # partition runs. This test is a regression guard for the migrated
+    # predicate more than a shape-propagation test; pair with the Shape+
+    # Reshape+Slice test below.
+    profile = end_profiling_profile(ggml)
+    node_events = [e for e in profile if e.get("cat") == "Node"]
+    providers = {e.get("args", {}).get("provider") for e in node_events}
+    cpu_slices = [
+        e for e in node_events
+        if e.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and e.get("args", {}).get("op_name") == "Slice"
+    ]
+    assert not cpu_slices, f"Slice fell back to CPU: {cpu_slices}"
+    assert "GGMLExecutionProvider" in providers, "no GGML partition executed"
+
+
+def test_shape_concat_reshape_then_slice_runs_on_ggml(
+        suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_shape_concat_reshape_then_slice_model(suite_tmpdir)
+    rng = np.random.default_rng(31)
+    inputs = {"x": rng.standard_normal((2, 3)).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    expected = cpu.run(["y"], inputs)[0]
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    # The outer Slice consumes a Reshape output whose shape ORT leaves
+    # symbolic (the Reshape target comes from Shape+Slice+Concat). Shape
+    # propagation through Reshape gives meta_eval a concrete shape, and
+    # ResolveShape lets the Slice support predicate accept — so the outer
+    # data-path Slice must not fall back to CPU.
+    profile = end_profiling_profile(ggml)
+    node_events = [e for e in profile if e.get("cat") == "Node"]
+    providers = {e.get("args", {}).get("provider") for e in node_events}
+    # The inner shape-math Slices on int64 shape tensors are expected to be
+    # folded into initializers by meta_eval, so only the outer data-path Slice
+    # would ever appear. None of them should execute on CPU.
+    cpu_slices = [
+        e for e in node_events
+        if e.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and e.get("args", {}).get("op_name") == "Slice"
+    ]
+    assert not cpu_slices, f"Slice fell back to CPU: {cpu_slices}"
+    assert "GGMLExecutionProvider" in providers, "no GGML partition executed"
+
+
+def build_shape_concat_reshape_then_slice_chain_model(tmpdir: Path) -> Path:
+    # Like build_shape_concat_reshape_then_slice_model, but the Reshape output
+    # is first Transposed and then Sliced — exercises the Phase-2 Transpose
+    # shape rule so that downstream Slice can resolve the input shape via
+    # meta_eval even after the Reshape output's dims are symbolic in ORT.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [3, 1])
+
+    starts0 = helper.make_tensor("starts0", TensorProto.INT64, [1], [0])
+    ends0 = helper.make_tensor("ends0", TensorProto.INT64, [1], [1])
+    starts1_i32 = helper.make_tensor("starts1_i32", TensorProto.INT32, [1], [1])
+    ends1_i32 = helper.make_tensor("ends1_i32", TensorProto.INT32, [1], [2])
+    axes0 = helper.make_tensor("axes0", TensorProto.INT64, [1], [0])
+    steps0 = helper.make_tensor("steps0", TensorProto.INT64, [1], [1])
+
+    outer_starts = helper.make_tensor("outer_starts", TensorProto.INT64, [1], [0])
+    outer_ends = helper.make_tensor("outer_ends", TensorProto.INT64, [1], [1])
+    outer_axes = helper.make_tensor("outer_axes", TensorProto.INT64, [1], [1])
+    outer_steps = helper.make_tensor("outer_steps", TensorProto.INT64, [1], [1])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts0", "ends0", "axes0", "steps0"], ["dim0"], name="slice_dim0"),
+        helper.make_node("Cast", ["shape"], ["shape_i32"], name="shape_cast", to=TensorProto.INT32),
+        helper.make_node("Cast", ["starts1_i32"], ["starts1"], name="starts1_cast", to=TensorProto.INT64),
+        helper.make_node("Cast", ["ends1_i32"], ["ends1"], name="ends1_cast", to=TensorProto.INT64),
+        helper.make_node("Slice", ["shape_i32", "starts1", "ends1", "axes0", "steps0"], ["dim1_i32"], name="slice_dim1"),
+        helper.make_node("Cast", ["dim1_i32"], ["dim1"], name="dim1_cast", to=TensorProto.INT64),
+        helper.make_node("Concat", ["dim0", "dim1"], ["new_shape"], name="shape_concat", axis=0),
+        helper.make_node("Reshape", ["x", "new_shape"], ["reshaped"], name="reshape_0"),
+        helper.make_node("Transpose", ["reshaped"], ["transposed"], name="transpose_0", perm=[1, 0]),
+        helper.make_node(
+            "Slice",
+            ["transposed", "outer_starts", "outer_ends", "outer_axes", "outer_steps"],
+            ["y"],
+            name="slice_data",
+        ),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "shape_concat_reshape_transpose_slice",
+        [x],
+        [y],
+        initializer=[
+            starts0, ends0, starts1_i32, ends1_i32, axes0, steps0,
+            outer_starts, outer_ends, outer_axes, outer_steps,
+        ],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def test_shape_concat_reshape_transpose_slice_runs_on_ggml(
+        suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_shape_concat_reshape_then_slice_chain_model(suite_tmpdir)
+    rng = np.random.default_rng(43)
+    inputs = {"x": rng.standard_normal((2, 3)).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    expected = cpu.run(["y"], inputs)[0]
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    # Slice sees a Transpose output whose input Reshape's shape ORT left
+    # symbolic. Shape propagation must bridge through both Reshape and
+    # Transpose for the outer Slice to accept.
+    profile = end_profiling_profile(ggml)
+    node_events = [e for e in profile if e.get("cat") == "Node"]
+    providers = {e.get("args", {}).get("provider") for e in node_events}
+    cpu_slices = [
+        e for e in node_events
+        if e.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and e.get("args", {}).get("op_name") == "Slice"
+    ]
+    assert not cpu_slices, f"Slice fell back to CPU: {cpu_slices}"
+    assert "GGMLExecutionProvider" in providers, "no GGML partition executed"

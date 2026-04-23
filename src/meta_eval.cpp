@@ -1450,7 +1450,12 @@ std::optional<int64_t> ReadInt64Attr(Ort::ConstNode node, const char* name) {
 }
 
 bool IsNodeCompilable(Ort::ConstNode node, const ConstantValueMap& constants) {
-  return get_node_support(node, &constants).has_value();
+  // Fusion detection runs mid-analysis before inferred_shapes is populated,
+  // so hand the support predicates a lightweight MetaAnalysis holding only the
+  // already-folded constants.
+  MetaAnalysis partial;
+  partial.constants = constants;
+  return get_node_support(node, &partial).has_value();
 }
 
 void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
@@ -1914,7 +1919,478 @@ void DetectPadConvFusions(const Ort::ConstGraph& ort_graph,
   }
 }
 
+// Look up a tensor's shape in our maps + ORT's declared shape. Returns
+// nullopt if the tensor is not known statically. Internal helper used by
+// shape-propagation rules below — distinct from the public ResolveShape(),
+// which works off an Ort::ConstValueInfo.
+std::optional<std::vector<int64_t>> LookupInferredShape(
+    const std::string& name,
+    const MetaAnalysis& analysis,
+    const std::unordered_map<std::string, std::vector<int64_t>>& ort_static_shapes) {
+  auto it = analysis.inferred_shapes.find(name);
+  if (it != analysis.inferred_shapes.end()) return it->second;
+  auto oit = ort_static_shapes.find(name);
+  if (oit != ort_static_shapes.end()) return oit->second;
+  auto cit = analysis.constants.find(name);
+  if (cit != analysis.constants.end()) return cit->second.dims;
+  return std::nullopt;
+}
+
+bool IsShapeFullyStatic(const std::vector<int64_t>& dims) {
+  for (int64_t d : dims) {
+    if (d < 0) return false;
+  }
+  return true;
+}
+
+// Extract `pads` for Pad node across opset versions. Opset >= 11 passes pads
+// as input[1]; earlier opsets used a `pads` attribute. Returns nullopt if not
+// resolvable as a fully-known int64 vector.
+std::optional<std::vector<int64_t>> ReadPadPadsConstant(
+    Ort::ConstNode node, const ConstantValueMap& constants) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() >= 2 && inputs[1] != nullptr) {
+    auto pads = ReadConstantInt64Input(constants, node, 1);
+    if (pads.has_value()) return pads;
+  }
+  Ort::ConstOpAttr attr{nullptr};
+  const Ort::Status status = node.GetAttributeByName("pads", attr);
+  if (status.IsOK() && attr != nullptr) {
+    std::vector<int64_t> values;
+    Ort::ThrowOnError(attr.GetValueArray(values));
+    return values;
+  }
+  return std::nullopt;
+}
+
+// Shape rule: Pad.
+// out[d] = in[d] + pads[d] + pads[d + rank]
+// pads layout is ONNX-standard: [x1_begin, x2_begin, ..., x1_end, x2_end, ...]
+std::optional<std::vector<int64_t>> InferPadOutputShape(
+    Ort::ConstNode node,
+    const std::vector<int64_t>& input_dims,
+    const ConstantValueMap& constants) {
+  const auto pads = ReadPadPadsConstant(node, constants);
+  if (!pads.has_value()) return std::nullopt;
+  const size_t rank = input_dims.size();
+  if (pads->size() != rank * 2) return std::nullopt;
+  std::vector<int64_t> out(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    const int64_t dim = input_dims[i] + (*pads)[i] + (*pads)[i + rank];
+    if (dim < 0) return std::nullopt;
+    out[i] = dim;
+  }
+  return out;
+}
+
+// Shape rule: Reshape. Reuses ResolveReshapeTarget, but only when both the
+// target shape constant and the input's concrete shape are known. `allowzero`
+// (opset >= 14) disables the 0-copy-from-input rule — we currently don't
+// fold when allowzero=1; treat it as not-yet-implemented.
+std::optional<std::vector<int64_t>> InferReshapeOutputShape(
+    Ort::ConstNode node,
+    const std::vector<int64_t>& input_dims,
+    const ConstantValueMap& constants) {
+  const auto target = ReadConstantInt64Input(constants, node, 1);
+  if (!target.has_value()) return std::nullopt;
+  // Reject if any target entry is the dynamic-dim sentinel (from a folded
+  // Shape of a dynamic-dim tensor).
+  for (int64_t v : *target) {
+    if (v == kUnknownShapeDimSentinel) return std::nullopt;
+  }
+  // Respect allowzero when present: a 0 then means literal zero, not copy.
+  if (const auto allowzero = ReadInt64Attr(node, "allowzero");
+      allowzero.has_value() && *allowzero != 0) {
+    return std::nullopt;
+  }
+  return ResolveReshapeTarget(*target, input_dims);
+}
+
+// Shape rule: Transpose.
+std::optional<std::vector<int64_t>> InferTransposeOutputShape(
+    Ort::ConstNode node, const std::vector<int64_t>& input_dims) {
+  const int64_t rank = static_cast<int64_t>(input_dims.size());
+  std::vector<int64_t> perm;
+  if (const auto p = ReadTransposePerm(node)) {
+    perm = *p;
+  } else {
+    perm.resize(rank);
+    for (int64_t i = 0; i < rank; ++i) perm[i] = rank - 1 - i;
+  }
+  if (static_cast<int64_t>(perm.size()) != rank) return std::nullopt;
+  std::vector<int64_t> out(rank);
+  for (int64_t i = 0; i < rank; ++i) {
+    const int64_t ax = perm[i];
+    if (ax < 0 || ax >= rank) return std::nullopt;
+    out[i] = input_dims[ax];
+  }
+  return out;
+}
+
+// Read axes for Squeeze/Unsqueeze across opset versions: attribute pre-opset
+// 13, tensor input[1] on >= 13. Returns nullopt if the axes aren't known.
+// Empty optional vector means "axes omitted" (only valid for Squeeze).
+std::optional<std::vector<int64_t>> ReadAxesAttrOrInput(
+    Ort::ConstNode node, const ConstantValueMap& constants) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() >= 2 && inputs[1] != nullptr) {
+    auto axes = ReadConstantInt64Input(constants, node, 1);
+    if (axes.has_value()) return axes;
+    return std::nullopt;
+  }
+  Ort::ConstOpAttr attr{nullptr};
+  const Ort::Status status = node.GetAttributeByName("axes", attr);
+  if (status.IsOK() && attr != nullptr) {
+    std::vector<int64_t> values;
+    Ort::ThrowOnError(attr.GetValueArray(values));
+    return values;
+  }
+  // Squeeze allows axes to be absent — caller distinguishes.
+  return std::vector<int64_t>{};
+}
+
+std::optional<std::vector<int64_t>> InferUnsqueezeOutputShape(
+    Ort::ConstNode node,
+    const std::vector<int64_t>& input_dims,
+    const ConstantValueMap& constants) {
+  const auto axes_opt = ReadAxesAttrOrInput(node, constants);
+  if (!axes_opt.has_value()) return std::nullopt;
+  if (axes_opt->empty()) return std::nullopt;  // Unsqueeze requires axes.
+  const int64_t out_rank = static_cast<int64_t>(input_dims.size() + axes_opt->size());
+  std::vector<int64_t> axes = *axes_opt;
+  for (auto& a : axes) if (a < 0) a += out_rank;
+  std::unordered_set<int64_t> axes_set(axes.begin(), axes.end());
+  if (axes_set.size() != axes.size()) return std::nullopt;
+  std::vector<int64_t> out;
+  out.reserve(out_rank);
+  size_t in_cursor = 0;
+  for (int64_t i = 0; i < out_rank; ++i) {
+    if (axes_set.count(i)) out.push_back(1);
+    else {
+      if (in_cursor >= input_dims.size()) return std::nullopt;
+      out.push_back(input_dims[in_cursor++]);
+    }
+  }
+  return out;
+}
+
+std::optional<std::vector<int64_t>> InferSqueezeOutputShape(
+    Ort::ConstNode node,
+    const std::vector<int64_t>& input_dims,
+    const ConstantValueMap& constants) {
+  const auto axes_opt = ReadAxesAttrOrInput(node, constants);
+  if (!axes_opt.has_value()) return std::nullopt;
+  const int64_t in_rank = static_cast<int64_t>(input_dims.size());
+  std::unordered_set<int64_t> squeeze;
+  if (axes_opt->empty()) {
+    // Squeeze every size-1 axis.
+    for (int64_t i = 0; i < in_rank; ++i) {
+      if (input_dims[i] == 1) squeeze.insert(i);
+    }
+  } else {
+    for (int64_t a : *axes_opt) {
+      if (a < 0) a += in_rank;
+      if (a < 0 || a >= in_rank) return std::nullopt;
+      if (input_dims[a] != 1) return std::nullopt;
+      squeeze.insert(a);
+    }
+  }
+  std::vector<int64_t> out;
+  out.reserve(in_rank - static_cast<int64_t>(squeeze.size()));
+  for (int64_t i = 0; i < in_rank; ++i) {
+    if (!squeeze.count(i)) out.push_back(input_dims[i]);
+  }
+  return out;
+}
+
+// Shape rule: Concat. All input shapes must be known, axes resolved and
+// non-concat dims identical; output dim on the concat axis is the sum.
+std::optional<std::vector<int64_t>> InferConcatOutputShape(
+    Ort::ConstNode node,
+    const std::vector<std::optional<std::vector<int64_t>>>& input_shapes) {
+  if (input_shapes.empty()) return std::nullopt;
+  for (const auto& s : input_shapes) if (!s.has_value()) return std::nullopt;
+  const int64_t rank = static_cast<int64_t>(input_shapes[0]->size());
+  auto axis_opt = ReadInt64Attr(node, "axis");
+  if (!axis_opt.has_value()) return std::nullopt;
+  int64_t axis = *axis_opt;
+  if (axis < 0) axis += rank;
+  if (axis < 0 || axis >= rank) return std::nullopt;
+  std::vector<int64_t> out = *input_shapes[0];
+  for (size_t i = 1; i < input_shapes.size(); ++i) {
+    const auto& s = *input_shapes[i];
+    if (static_cast<int64_t>(s.size()) != rank) return std::nullopt;
+    for (int64_t d = 0; d < rank; ++d) {
+      if (d == axis) out[d] += s[d];
+      else if (s[d] != out[d]) return std::nullopt;
+    }
+  }
+  return out;
+}
+
+// Shape rule: Slice (float or int tensors). Mirrors CompileSliceAttributes
+// clamping. All of starts/ends/axes/steps must be constants.
+std::optional<std::vector<int64_t>> InferSliceOutputShape(
+    Ort::ConstNode node,
+    const std::vector<int64_t>& input_dims,
+    const ConstantValueMap& constants) {
+  const auto starts = ReadConstantInt64Input(constants, node, 1);
+  const auto ends = ReadConstantInt64Input(constants, node, 2);
+  if (!starts || !ends || starts->size() != ends->size() || starts->empty()) return std::nullopt;
+  const int64_t rank = static_cast<int64_t>(input_dims.size());
+  std::vector<int64_t> axes;
+  const auto inputs = node.GetInputs();
+  if (inputs.size() >= 4 && inputs[3] != nullptr) {
+    auto a = ReadConstantInt64Input(constants, node, 3);
+    if (!a) return std::nullopt;
+    axes = *a;
+  } else {
+    axes.resize(starts->size());
+    for (size_t i = 0; i < starts->size(); ++i) axes[i] = static_cast<int64_t>(i);
+  }
+  std::vector<int64_t> steps(starts->size(), 1);
+  if (inputs.size() == 5 && inputs[4] != nullptr) {
+    auto s = ReadConstantInt64Input(constants, node, 4);
+    if (!s) return std::nullopt;
+    steps = *s;
+  }
+  std::vector<int64_t> out = input_dims;
+  auto clamp = [](int64_t v, int64_t lo, int64_t hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+  };
+  for (size_t k = 0; k < axes.size(); ++k) {
+    int64_t ax = axes[k];
+    if (ax < 0) ax += rank;
+    if (ax < 0 || ax >= rank) return std::nullopt;
+    const int64_t dim = input_dims[ax];
+    int64_t s = (*starts)[k];
+    int64_t e = (*ends)[k];
+    const int64_t step = steps[k];
+    if (step == 0) return std::nullopt;
+    if (s < 0) s += dim;
+    if (e < 0) e += dim;
+    if (step > 0) { s = clamp(s, 0, dim); e = clamp(e, 0, dim); }
+    else          { s = clamp(s, 0, dim - 1); e = clamp(e, -1, dim - 1); }
+    int64_t length = 0;
+    if (step > 0 && e > s) length = (e - s + step - 1) / step;
+    else if (step < 0 && s > e) length = (s - e + (-step) - 1) / (-step);
+    out[ax] = length;
+  }
+  return out;
+}
+
+// Shape rule: Gather. out = in.shape[:axis] ++ indices.shape ++ in.shape[axis+1:]
+std::optional<std::vector<int64_t>> InferGatherOutputShape(
+    Ort::ConstNode node,
+    const std::vector<int64_t>& data_dims,
+    const std::vector<int64_t>& indices_dims) {
+  const int64_t rank = static_cast<int64_t>(data_dims.size());
+  int64_t axis = ReadInt64Attr(node, "axis").value_or(0);
+  if (axis < 0) axis += rank;
+  if (axis < 0 || axis >= rank) return std::nullopt;
+  std::vector<int64_t> out;
+  out.reserve(rank - 1 + indices_dims.size());
+  for (int64_t d = 0; d < axis; ++d) out.push_back(data_dims[d]);
+  for (int64_t d : indices_dims) out.push_back(d);
+  for (int64_t d = axis + 1; d < rank; ++d) out.push_back(data_dims[d]);
+  return out;
+}
+
+// Shape rule: Expand. out = broadcast(in, shape-arg). Follows ONNX bidirectional
+// broadcasting — dims are prefixed with 1 to match the longer rank, then each
+// axis takes max(lhs, rhs).
+std::optional<std::vector<int64_t>> InferExpandOutputShape(
+    Ort::ConstNode node,
+    const std::vector<int64_t>& input_dims,
+    const ConstantValueMap& constants) {
+  const auto target = ReadConstantInt64Input(constants, node, 1);
+  if (!target.has_value()) return std::nullopt;
+  for (int64_t v : *target) {
+    if (v == kUnknownShapeDimSentinel || v < 0) return std::nullopt;
+  }
+  const size_t rank = std::max(input_dims.size(), target->size());
+  std::vector<int64_t> a(rank, 1), b(rank, 1);
+  std::copy(input_dims.begin(), input_dims.end(),
+            a.begin() + (rank - input_dims.size()));
+  std::copy(target->begin(), target->end(),
+            b.begin() + (rank - target->size()));
+  std::vector<int64_t> out(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    if (a[i] == 1) out[i] = b[i];
+    else if (b[i] == 1) out[i] = a[i];
+    else if (a[i] == b[i]) out[i] = a[i];
+    else return std::nullopt;
+  }
+  return out;
+}
+
+// Shape rule: Tile. out[d] = in[d] * repeats[d].
+std::optional<std::vector<int64_t>> InferTileOutputShape(
+    Ort::ConstNode /*node*/,
+    const std::vector<int64_t>& input_dims,
+    const ConstantValueMap& constants,
+    Ort::ConstNode raw_node) {
+  const auto repeats = ReadConstantInt64Input(constants, raw_node, 1);
+  if (!repeats.has_value()) return std::nullopt;
+  if (repeats->size() != input_dims.size()) return std::nullopt;
+  std::vector<int64_t> out(input_dims.size());
+  for (size_t i = 0; i < input_dims.size(); ++i) {
+    if ((*repeats)[i] < 0) return std::nullopt;
+    out[i] = input_dims[i] * (*repeats)[i];
+  }
+  return out;
+}
+
+// Shape rule: ConstantOfShape. input[0] is the shape arg (must be in constants).
+std::optional<std::vector<int64_t>> InferConstantOfShapeOutputShape(
+    Ort::ConstNode node, const ConstantValueMap& constants) {
+  auto shape = ReadConstantInt64Input(constants, node, 0);
+  if (!shape.has_value()) return std::nullopt;
+  for (int64_t v : *shape) {
+    if (v == kUnknownShapeDimSentinel || v < 0) return std::nullopt;
+  }
+  return shape;
+}
+
+void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& analysis) {
+  const bool trace = std::getenv("GGONNX_TRACE_SHAPE_PROP") != nullptr;
+  std::unordered_map<std::string, size_t> rule_fired;
+  std::unordered_map<std::string, size_t> rule_attempted;
+  // Seed with ORT's fully-static shapes from inputs and value_info.
+  std::unordered_map<std::string, std::vector<int64_t>> ort_static;
+  auto ingest = [&](Ort::ConstValueInfo vi) {
+    if (vi == nullptr) return;
+    const std::string name = vi.GetName();
+    if (ort_static.count(name)) return;
+    // First try the value_info's declared shape.
+    try {
+      const TensorMetadata meta = getTensorMetadata(vi);
+      if (IsShapeFullyStatic(meta.dims)) {
+        ort_static.emplace(name, meta.dims);
+        return;
+      }
+    } catch (...) {}
+    // Fall back to the initializer body if this tensor has one; weight
+    // tensors often carry a full shape on the value but only a partial
+    // one on the value_info.
+    try {
+      Ort::ConstValue value{nullptr};
+      if (vi.GetInitializer(value).IsOK() && value != nullptr) {
+        const TensorMetadata meta = getTensorMetadata(value);
+        if (IsShapeFullyStatic(meta.dims)) {
+          ort_static.emplace(name, meta.dims);
+        }
+      }
+    } catch (...) {}
+  };
+  for (Ort::ConstValueInfo vi : ort_graph.GetInputs()) ingest(vi);
+  for (Ort::ConstValueInfo vi : ort_graph.GetOutputs()) ingest(vi);
+  for (Ort::ConstValueInfo vi : ort_graph.GetInitializers()) ingest(vi);
+  // Ingest intermediate tensors via every node's output value_info — that's
+  // where ORT's shape inference populates concrete dims for non-IO tensors.
+  for (Ort::ConstNode node : ort_graph.GetNodes()) {
+    for (Ort::ConstValueInfo vi : node.GetOutputs()) ingest(vi);
+    // Also ingest node inputs — many initializers surface only through
+    // node input value_infos, not graph-level GetInitializers().
+    for (Ort::ConstValueInfo vi : node.GetInputs()) ingest(vi);
+  }
+
+  auto get_in_shape = [&](size_t idx,
+                          const std::vector<Ort::ConstValueInfo>& inputs)
+      -> std::optional<std::vector<int64_t>> {
+    if (idx >= inputs.size() || inputs[idx] == nullptr) return std::nullopt;
+    return LookupInferredShape(inputs[idx].GetName(), analysis, ort_static);
+  };
+
+  // Walk nodes in topological order (GetNodes() returns topo order).
+  for (Ort::ConstNode node : ort_graph.GetNodes()) {
+    try {
+      const std::string op_type = std::string(node.GetOperatorType());
+      const auto inputs_rng = node.GetInputs();
+      const std::vector<Ort::ConstValueInfo> inputs(inputs_rng.begin(), inputs_rng.end());
+      const auto outputs = node.GetOutputs();
+      if (outputs.empty() || outputs[0] == nullptr) continue;
+      const std::string out_name = outputs[0].GetName();
+      if (ort_static.count(out_name) || analysis.inferred_shapes.count(out_name)) continue;
+
+      std::optional<std::vector<int64_t>> out_shape;
+
+      // Unary ops consuming input[0] shape.
+      auto unary = [&](auto&& fn) {
+        ++rule_attempted[op_type];
+        auto in_shape = get_in_shape(0, inputs);
+        if (!in_shape.has_value()) return;
+        out_shape = fn(*in_shape);
+        if (out_shape.has_value()) ++rule_fired[op_type];
+      };
+
+      if (op_type == "Pad") {
+        unary([&](const auto& s) { return InferPadOutputShape(node, s, analysis.constants); });
+      } else if (op_type == "Reshape") {
+        unary([&](const auto& s) { return InferReshapeOutputShape(node, s, analysis.constants); });
+      } else if (op_type == "Transpose") {
+        unary([&](const auto& s) { return InferTransposeOutputShape(node, s); });
+      } else if (op_type == "Unsqueeze") {
+        unary([&](const auto& s) { return InferUnsqueezeOutputShape(node, s, analysis.constants); });
+      } else if (op_type == "Squeeze") {
+        unary([&](const auto& s) { return InferSqueezeOutputShape(node, s, analysis.constants); });
+      } else if (op_type == "Slice") {
+        unary([&](const auto& s) { return InferSliceOutputShape(node, s, analysis.constants); });
+      } else if (op_type == "Expand") {
+        unary([&](const auto& s) { return InferExpandOutputShape(node, s, analysis.constants); });
+      } else if (op_type == "Tile") {
+        unary([&](const auto& s) { return InferTileOutputShape(node, s, analysis.constants, node); });
+      } else if (op_type == "Cast" || op_type == "Identity") {
+        unary([&](const auto& s) -> std::optional<std::vector<int64_t>> { return s; });
+      } else if (op_type == "Gather") {
+        ++rule_attempted[op_type];
+        auto data_shape = get_in_shape(0, inputs);
+        auto idx_shape = get_in_shape(1, inputs);
+        if (data_shape && idx_shape) {
+          out_shape = InferGatherOutputShape(node, *data_shape, *idx_shape);
+          if (out_shape.has_value()) ++rule_fired[op_type];
+        }
+      } else if (op_type == "Concat") {
+        ++rule_attempted[op_type];
+        std::vector<std::optional<std::vector<int64_t>>> shapes;
+        shapes.reserve(inputs.size());
+        for (size_t i = 0; i < inputs.size(); ++i) shapes.push_back(get_in_shape(i, inputs));
+        out_shape = InferConcatOutputShape(node, shapes);
+        if (out_shape.has_value()) ++rule_fired[op_type];
+      } else if (op_type == "ConstantOfShape") {
+        ++rule_attempted[op_type];
+        out_shape = InferConstantOfShapeOutputShape(node, analysis.constants);
+        if (out_shape.has_value()) ++rule_fired[op_type];
+      } else {
+        continue;
+      }
+      if (!out_shape.has_value() || !IsShapeFullyStatic(*out_shape)) continue;
+      analysis.inferred_shapes[out_name] = std::move(*out_shape);
+    } catch (...) {
+      continue;
+    }
+  }
+  if (trace) {
+    std::fprintf(stderr, "[ggonnx][shape-prop] ort_static=%zu inferred=%zu;",
+                 ort_static.size(), analysis.inferred_shapes.size());
+    for (const auto& [op, count] : rule_attempted) {
+      std::fprintf(stderr, " %s=%zu/%zu", op.c_str(), rule_fired[op], count);
+    }
+    std::fprintf(stderr, "\n");
+  }
+}
+
 }  // namespace
+
+std::optional<std::vector<int64_t>> ResolveShape(Ort::ConstValueInfo vi,
+                                                 const MetaAnalysis& meta) {
+  if (vi == nullptr) return std::nullopt;
+  const TensorMetadata ort_meta = getTensorMetadata(vi);
+  if (IsShapeFullyStatic(ort_meta.dims)) return ort_meta.dims;
+  auto it = meta.inferred_shapes.find(std::string(vi.GetName()));
+  if (it != meta.inferred_shapes.end()) return it->second;
+  return std::nullopt;
+}
 
 MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
   GGONNX_NOT_NULL(graph, "graph must not be null");
@@ -2035,6 +2511,8 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
       continue;
     }
   }
+  PropagateInferredShapes(ort_graph, analysis);
+
   DetectShuffleTripleFusions(ort_graph, analysis.constants, analysis.fusions);
   // WindowMaskAdd runs before QKVSplit: the mask-apply rank-5 bubble sits
   // between the QKV Gathers in topological order, so fusing it out first

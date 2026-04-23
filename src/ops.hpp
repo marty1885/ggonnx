@@ -58,10 +58,15 @@ struct ConstantTensor {
 using ConstantValueMap = std::unordered_map<std::string, ConstantTensor>;
 using SupportResult = ExpectedVoid<std::string>;
 
+// Forward declaration: full definition lives in meta_eval.hpp. Passed by
+// pointer through support and compile predicates so they can consult both the
+// folded constant map and the separately-propagated inferred-shape map.
+struct MetaAnalysis;
+
 TensorMetadata getTensorMetadata(Ort::ConstValueInfo value_info);
 TensorMetadata getTensorMetadata(Ort::ConstValue value);
 Expected<TensorMetadata, std::string> try_get_tensor_metadata(Ort::ConstValueInfo value_info);
-SupportResult get_node_support(Ort::ConstNode node, const ConstantValueMap* constants);
+SupportResult get_node_support(Ort::ConstNode node, const MetaAnalysis* meta);
 SupportResult support_error(std::string message);
 SupportResult support_ok();
 
@@ -330,7 +335,7 @@ using EmitResult = std::optional<EmitOutputs>;
 using EmitNodeFn = EmitResult (*)(ggml_context* ctx,
                                   const NodeDesc& node,
                                   const std::vector<ggml_tensor*>& values);
-using CompileAttrsFn = void (*)(Ort::ConstNode node, NodeDesc* compiled_node, const ConstantValueMap* constants);
+using CompileAttrsFn = void (*)(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta);
 
 // Layout hint for constant-initializer inputs materialized at compile time.
 // AS_IS: ggml ne = reversed ONNX dims, data byte-identical.
@@ -349,7 +354,7 @@ enum class ConstantLayout {
 using ConstantLayoutFn = ConstantLayout (*)(const NodeDesc& node, size_t input_idx);
 
 struct OpDefinition {
-  SupportResult (*support)(Ort::ConstNode node, const ConstantValueMap* constants);
+  SupportResult (*support)(Ort::ConstNode node, const MetaAnalysis* meta);
   CompileAttrsFn compile_attrs;
   EmitNodeFn emit;
   ConstantLayoutFn constant_layout;

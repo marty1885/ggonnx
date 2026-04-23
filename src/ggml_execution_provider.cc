@@ -447,8 +447,8 @@ std::vector<int64_t> inferBroadcastOutputDims(const std::vector<int64_t>& lhs_di
   return output_dims;
 }
 
-SupportResult isNodeSupported(Ort::ConstNode node, const ConstantValueMap& constants) {
-  return get_node_support(node, &constants);
+SupportResult isNodeSupported(Ort::ConstNode node, const MetaAnalysis& meta) {
+  return get_node_support(node, &meta);
 }
 
 
@@ -731,7 +731,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
       partition.nodes.push_back(std::move(compiled_node));
       continue;
     }
-    const SupportResult support = isNodeSupported(node, meta_analysis.constants);
+    const SupportResult support = isNodeSupported(node, meta_analysis);
     if (!support.has_value()) {
       throw std::runtime_error("GGONNX Compile received an unsupported node '" +
                                std::string(node.GetOperatorType()) + "' (" + node.GetName() +
@@ -748,7 +748,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
     const OpDefinition* op = FindOpDefinition(compiled_node.domain, compiled_node.op_type);
     GGONNX_ASSERT(op != nullptr, "compiled partition could not locate supported op definition");
     if (op->compile_attrs != nullptr) {
-      op->compile_attrs(node, &compiled_node, &meta_analysis.constants);
+      op->compile_attrs(node, &compiled_node, &meta_analysis);
     }
     if (compiled_node.op_type == "MatMul") {
       compiled_node.attrs = NodeDesc::MatMulAttrs{.force_f32 = selection.force_matmul_f32};
@@ -1491,7 +1491,7 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
           meta_analysis.fusions.window_mask_add_anchors.count(key) > 0;
       const bool is_fusion_consumed = meta_analysis.fusions.consumed_nodes.count(key) > 0;
       const bool supported =
-          ((isNodeSupported(node, meta_analysis.constants).has_value()) || is_fusion_anchor) &&
+          ((isNodeSupported(node, meta_analysis).has_value()) || is_fusion_anchor) &&
           has_visible_output(node);
       if (supported || meta_analysis.folded_nodes.count(key) > 0 || is_fusion_consumed) {
         current_group.push_back(node);
