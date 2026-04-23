@@ -1,6 +1,7 @@
 #include "meta_eval.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -1990,12 +1991,10 @@ std::optional<std::vector<int64_t>> InferPadOutputShape(
 std::optional<std::vector<int64_t>> InferReshapeOutputShape(
     Ort::ConstNode node,
     const std::vector<int64_t>& input_dims,
-    const ConstantValueMap& constants) {
-  const auto target = ReadConstantInt64Input(constants, node, 1);
-  if (!target.has_value()) return std::nullopt;
+    const std::vector<int64_t>& target) {
   // Reject if any target entry is the dynamic-dim sentinel (from a folded
   // Shape of a dynamic-dim tensor).
-  for (int64_t v : *target) {
+  for (int64_t v : target) {
     if (v == kUnknownShapeDimSentinel) return std::nullopt;
   }
   // Respect allowzero when present: a 0 then means literal zero, not copy.
@@ -2003,7 +2002,7 @@ std::optional<std::vector<int64_t>> InferReshapeOutputShape(
       allowzero.has_value() && *allowzero != 0) {
     return std::nullopt;
   }
-  return ResolveReshapeTarget(*target, input_dims);
+  return ResolveReshapeTarget(target, input_dims);
 }
 
 // Shape rule: Transpose.
@@ -2200,20 +2199,17 @@ std::optional<std::vector<int64_t>> InferGatherOutputShape(
 // broadcasting — dims are prefixed with 1 to match the longer rank, then each
 // axis takes max(lhs, rhs).
 std::optional<std::vector<int64_t>> InferExpandOutputShape(
-    Ort::ConstNode node,
     const std::vector<int64_t>& input_dims,
-    const ConstantValueMap& constants) {
-  const auto target = ReadConstantInt64Input(constants, node, 1);
-  if (!target.has_value()) return std::nullopt;
-  for (int64_t v : *target) {
+    const std::vector<int64_t>& target_dims) {
+  for (int64_t v : target_dims) {
     if (v == kUnknownShapeDimSentinel || v < 0) return std::nullopt;
   }
-  const size_t rank = std::max(input_dims.size(), target->size());
+  const size_t rank = std::max(input_dims.size(), target_dims.size());
   std::vector<int64_t> a(rank, 1), b(rank, 1);
   std::copy(input_dims.begin(), input_dims.end(),
             a.begin() + (rank - input_dims.size()));
-  std::copy(target->begin(), target->end(),
-            b.begin() + (rank - target->size()));
+  std::copy(target_dims.begin(), target_dims.end(),
+            b.begin() + (rank - target_dims.size()));
   std::vector<int64_t> out(rank);
   for (size_t i = 0; i < rank; ++i) {
     if (a[i] == 1) out[i] = b[i];
@@ -2243,13 +2239,48 @@ std::optional<std::vector<int64_t>> InferTileOutputShape(
 
 // Shape rule: ConstantOfShape. input[0] is the shape arg (must be in constants).
 std::optional<std::vector<int64_t>> InferConstantOfShapeOutputShape(
-    Ort::ConstNode node, const ConstantValueMap& constants) {
-  auto shape = ReadConstantInt64Input(constants, node, 0);
-  if (!shape.has_value()) return std::nullopt;
-  for (int64_t v : *shape) {
+    const std::vector<int64_t>& shape) {
+  for (int64_t v : shape) {
     if (v == kUnknownShapeDimSentinel || v < 0) return std::nullopt;
   }
   return shape;
+}
+
+std::optional<std::vector<int64_t>> ResolveShapeRuleInt64Input(
+    const ConstantValueMap& constants,
+    Ort::ConstNode node,
+    size_t input_idx,
+    const std::function<std::optional<std::vector<int64_t>>(const std::string&)>& lookup_shape) {
+  const auto inputs = node.GetInputs();
+  if (input_idx >= inputs.size() || inputs[input_idx] == nullptr) return std::nullopt;
+  const auto tensor = LookupConstant(constants, inputs[input_idx]);
+  if (!tensor.has_value() ||
+      tensor->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+    return std::nullopt;
+  }
+
+  const size_t count = ElementCount(tensor->dims);
+  std::vector<int64_t> values(count, 0);
+  if (count != 0) {
+    const int64_t* src = reinterpret_cast<const int64_t*>(tensor->data.data());
+    GGONNX_NOT_NULL(src, "resolved INT64 shape-rule input data must not be null");
+    values.assign(src, src + count);
+  }
+  if (tensor->dim_bindings.empty()) return values;
+
+  GGONNX_ASSERT(tensor->dim_bindings.size() == count,
+                "dim_bindings length mismatch in shape-rule input");
+  for (size_t i = 0; i < count; ++i) {
+    const auto& binding = tensor->dim_bindings[i];
+    if (!binding.has_value()) continue;
+    const auto source_shape = lookup_shape(binding->source_name);
+    if (!source_shape.has_value()) return std::nullopt;
+    if (binding->axis < 0 || static_cast<size_t>(binding->axis) >= source_shape->size()) {
+      return std::nullopt;
+    }
+    values[i] = (*source_shape)[static_cast<size_t>(binding->axis)];
+  }
+  return values;
 }
 
 void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& analysis) {
@@ -2301,6 +2332,10 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
     if (idx >= inputs.size() || inputs[idx] == nullptr) return std::nullopt;
     return LookupInferredShape(inputs[idx].GetName(), analysis, ort_static);
   };
+  auto lookup_shape_by_name =
+      [&](const std::string& name) -> std::optional<std::vector<int64_t>> {
+    return LookupInferredShape(name, analysis, ort_static);
+  };
 
   // Walk nodes in topological order (GetNodes() returns topo order).
   for (Ort::ConstNode node : ort_graph.GetNodes()) {
@@ -2327,7 +2362,13 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
       if (op_type == "Pad") {
         unary([&](const auto& s) { return InferPadOutputShape(node, s, analysis.constants); });
       } else if (op_type == "Reshape") {
-        unary([&](const auto& s) { return InferReshapeOutputShape(node, s, analysis.constants); });
+        ++rule_attempted[op_type];
+        auto in_shape = get_in_shape(0, inputs);
+        auto target = ResolveShapeRuleInt64Input(analysis.constants, node, 1, lookup_shape_by_name);
+        if (in_shape && target) {
+          out_shape = InferReshapeOutputShape(node, *in_shape, *target);
+          if (out_shape.has_value()) ++rule_fired[op_type];
+        }
       } else if (op_type == "Transpose") {
         unary([&](const auto& s) { return InferTransposeOutputShape(node, s); });
       } else if (op_type == "Unsqueeze") {
@@ -2337,7 +2378,13 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
       } else if (op_type == "Slice") {
         unary([&](const auto& s) { return InferSliceOutputShape(node, s, analysis.constants); });
       } else if (op_type == "Expand") {
-        unary([&](const auto& s) { return InferExpandOutputShape(node, s, analysis.constants); });
+        ++rule_attempted[op_type];
+        auto in_shape = get_in_shape(0, inputs);
+        auto target = ResolveShapeRuleInt64Input(analysis.constants, node, 1, lookup_shape_by_name);
+        if (in_shape && target) {
+          out_shape = InferExpandOutputShape(*in_shape, *target);
+          if (out_shape.has_value()) ++rule_fired[op_type];
+        }
       } else if (op_type == "Tile") {
         unary([&](const auto& s) { return InferTileOutputShape(node, s, analysis.constants, node); });
       } else if (op_type == "Cast" || op_type == "Identity") {
@@ -2359,7 +2406,10 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
         if (out_shape.has_value()) ++rule_fired[op_type];
       } else if (op_type == "ConstantOfShape") {
         ++rule_attempted[op_type];
-        out_shape = InferConstantOfShapeOutputShape(node, analysis.constants);
+        auto shape = ResolveShapeRuleInt64Input(analysis.constants, node, 0, lookup_shape_by_name);
+        if (shape.has_value()) {
+          out_shape = InferConstantOfShapeOutputShape(*shape);
+        }
         if (out_shape.has_value()) ++rule_fired[op_type];
       } else {
         continue;
@@ -2387,6 +2437,10 @@ std::optional<std::vector<int64_t>> ResolveShape(Ort::ConstValueInfo vi,
   if (vi == nullptr) return std::nullopt;
   const TensorMetadata ort_meta = getTensorMetadata(vi);
   if (IsShapeFullyStatic(ort_meta.dims)) return ort_meta.dims;
+  auto cit = meta.constants.find(std::string(vi.GetName()));
+  if (cit != meta.constants.end() && IsShapeFullyStatic(cit->second.dims)) {
+    return cit->second.dims;
+  }
   auto it = meta.inferred_shapes.find(std::string(vi.GetName()));
   if (it != meta.inferred_shapes.end()) return it->second;
   return std::nullopt;

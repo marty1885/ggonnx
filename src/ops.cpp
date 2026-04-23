@@ -1847,7 +1847,6 @@ EmitResult EmitConvTransposeNode(ggml_context* ctx,
 // ORT's shape inference typically leaves the output shape symbolic when the
 // shape tensor comes from a Where/Equal chain.
 SupportResult IsSupportedExpandNode(Ort::ConstNode node, const MetaAnalysis* meta) {
-  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(inputs.size() == 2 && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -1860,20 +1859,19 @@ SupportResult IsSupportedExpandNode(Ort::ConstNode node, const MetaAnalysis* met
                     y.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
                 "Expand: non-float type");
   SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(y), "Expand: rank exceeds GGML_MAX_DIMS");
-  SUPPORT_CHECK(shapeIsFullyStatic(x), "Expand: input has dynamic shape");
-
-  const auto target = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-  SUPPORT_CHECK(target.has_value(), "Expand: shape input is not a compile-time constant");
-  std::vector<int64_t> target_dims(target->begin(), target->end());
-  SUPPORT_CHECK(rankSupportedByGGML({ONNXTensorElementDataType{}, target_dims}),
-                "Expand: target rank exceeds GGML_MAX_DIMS");
+  const auto resolved_in = (meta != nullptr) ? ResolveShape(inputs[0], *meta) : std::nullopt;
+  const auto resolved_out = (meta != nullptr) ? ResolveShape(outputs[0], *meta) : std::nullopt;
+  SUPPORT_CHECK(resolved_in.has_value(), "Expand: input has dynamic shape");
+  SUPPORT_CHECK(resolved_out.has_value(), "Expand: output has dynamic shape");
+  SUPPORT_CHECK(rankSupportedByGGML({ONNXTensorElementDataType{}, *resolved_out}),
+                "Expand: resolved output rank exceeds GGML_MAX_DIMS");
 
   // Align to the longer rank (ONNX Expand broadcasts leading dims).
-  const size_t out_rank = std::max(x.dims.size(), target_dims.size());
+  const size_t out_rank = std::max(resolved_in->size(), resolved_out->size());
   std::vector<int64_t> padded_x(out_rank, 1);
   std::vector<int64_t> padded_t(out_rank, 1);
-  std::copy_backward(x.dims.begin(), x.dims.end(), padded_x.end());
-  std::copy_backward(target_dims.begin(), target_dims.end(), padded_t.end());
+  std::copy_backward(resolved_in->begin(), resolved_in->end(), padded_x.end());
+  std::copy_backward(resolved_out->begin(), resolved_out->end(), padded_t.end());
   for (size_t i = 0; i < out_rank; ++i) {
     SUPPORT_CHECK(padded_x[i] == 1 || padded_t[i] == 1 || padded_x[i] == padded_t[i],
                   "Expand: incompatible broadcast dims at axis " + std::to_string(i) +
@@ -1886,23 +1884,13 @@ SupportResult IsSupportedExpandNode(Ort::ConstNode node, const MetaAnalysis* met
 }
 
 void CompileExpandAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const MetaAnalysis* meta) {
-  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
-  const auto inputs = node.GetInputs();
-  const TensorMetadata x = getTensorMetadata(inputs[0]);
-  const auto target = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-  GGONNX_ASSERT(target.has_value(), "Expand compile: shape must be constant");
-  std::vector<int64_t> target_dims = *target;
-  const size_t out_rank = std::max(x.dims.size(), target_dims.size());
-  std::vector<int64_t> padded_x(out_rank, 1);
-  std::vector<int64_t> padded_t(out_rank, 1);
-  std::copy_backward(x.dims.begin(), x.dims.end(), padded_x.end());
-  std::copy_backward(target_dims.begin(), target_dims.end(), padded_t.end());
-  std::vector<int64_t> out_dims(out_rank);
-  for (size_t i = 0; i < out_rank; ++i) {
-    out_dims[i] = std::max<int64_t>(padded_x[i], padded_t[i]);
-  }
-  compiled_node->attrs = NodeDesc::ExpandAttrs{.onnx_dims = std::move(out_dims)};
+  const auto outputs = node.GetOutputs();
+  GGONNX_ASSERT(outputs.size() == 1 && outputs[0] != nullptr, "Expand must have a single output");
+  const auto resolved = (meta != nullptr) ? ResolveShape(outputs[0], *meta) : std::nullopt;
+  GGONNX_ASSERT(resolved.has_value(),
+                "Expand compile: output shape must be resolvable (support predicate invariant)");
+  compiled_node->attrs = NodeDesc::ExpandAttrs{.onnx_dims = *resolved};
 }
 
 EmitResult EmitExpandNode(ggml_context* ctx,
@@ -3052,7 +3040,6 @@ EmitResult EmitTransposeNode(ggml_context* ctx,
 // and a GGML-axis integer, so we translate ONNX axis -> (rank-1-axis) and fold
 // left-to-right.
 SupportResult IsSupportedConcatNode(Ort::ConstNode node, const MetaAnalysis* meta) {
-  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
   SUPPORT_CHECK(!inputs.empty() && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
@@ -3079,20 +3066,6 @@ SupportResult IsSupportedConcatNode(Ort::ConstNode node, const MetaAnalysis* met
                       " != output type " + std::to_string(out.element_type));
     SUPPORT_CHECK(meta.dims.size() == rank, "Concat: input rank mismatch");
     SUPPORT_CHECK(rankSupportedByGGML(meta), "Concat: input rank exceeds GGML_MAX_DIMS");
-    // Shape-derived pseudo-constants (Shape→Gather→Unsqueeze folds) carry
-    // per-element dim bindings: their value is really dim A of runtime tensor
-    // B. The EP resolves those at graph-materialize time only if B is a
-    // subgraph input of the same partition. In practice these Concats live in
-    // their own tiny partitions with no runtime inputs, so resolution fails.
-    // Hand them to CPU where the real shape is available via normal execution.
-    if (constants != nullptr) {
-      auto cit = constants->find(std::string(input.GetName()));
-      if (cit != constants->end() && !cit->second.dim_bindings.empty()) {
-        SUPPORT_CHECK(false,
-                      "Concat: input '" + std::string(input.GetName()) +
-                          "' carries shape-derived dynamic bindings; defer to CPU");
-      }
-    }
   }
   return support_ok();
 }

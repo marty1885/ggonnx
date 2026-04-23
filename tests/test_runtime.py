@@ -2389,6 +2389,45 @@ def build_shape_concat_reshape_then_slice_chain_model(tmpdir: Path) -> Path:
     return ensure_model(tmpdir, graph)
 
 
+def build_shape_concat_reshape_then_expand_model(tmpdir: Path) -> Path:
+    # Like build_shape_concat_reshape_then_slice_model, but the symbolic
+    # Reshape output feeds an Expand. ORT often leaves the Reshape result
+    # shape symbolic because the target comes from Shape+Slice+Concat.
+    # meta_eval must propagate that shape so Expand can accept.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 4, 3])
+
+    starts0 = helper.make_tensor("starts0", TensorProto.INT64, [1], [0])
+    ends0 = helper.make_tensor("ends0", TensorProto.INT64, [1], [1])
+    starts1_i32 = helper.make_tensor("starts1_i32", TensorProto.INT32, [1], [1])
+    ends1_i32 = helper.make_tensor("ends1_i32", TensorProto.INT32, [1], [2])
+    axes0 = helper.make_tensor("axes0", TensorProto.INT64, [1], [0])
+    steps0 = helper.make_tensor("steps0", TensorProto.INT64, [1], [1])
+    one = helper.make_tensor("one", TensorProto.INT64, [1], [1])
+    expand_shape = helper.make_tensor("expand_shape", TensorProto.INT64, [3], [2, 4, 3])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts0", "ends0", "axes0", "steps0"], ["dim0"], name="slice_dim0"),
+        helper.make_node("Cast", ["shape"], ["shape_i32"], name="shape_cast", to=TensorProto.INT32),
+        helper.make_node("Cast", ["starts1_i32"], ["starts1"], name="starts1_cast", to=TensorProto.INT64),
+        helper.make_node("Cast", ["ends1_i32"], ["ends1"], name="ends1_cast", to=TensorProto.INT64),
+        helper.make_node("Slice", ["shape_i32", "starts1", "ends1", "axes0", "steps0"], ["dim1_i32"], name="slice_dim1"),
+        helper.make_node("Cast", ["dim1_i32"], ["dim1"], name="dim1_cast", to=TensorProto.INT64),
+        helper.make_node("Concat", ["dim0", "one", "dim1"], ["new_shape"], name="shape_concat", axis=0),
+        helper.make_node("Reshape", ["x", "new_shape"], ["reshaped"], name="reshape_0"),
+        helper.make_node("Expand", ["reshaped", "expand_shape"], ["y"], name="expand_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "shape_concat_reshape_expand",
+        [x],
+        [y],
+        initializer=[starts0, ends0, starts1_i32, ends1_i32, axes0, steps0, one, expand_shape],
+    )
+    return ensure_model(tmpdir, graph)
+
+
 def test_shape_concat_reshape_transpose_slice_runs_on_ggml(
         suite_tmpdir, ep_library: Path) -> None:
     model_path = build_shape_concat_reshape_then_slice_chain_model(suite_tmpdir)
@@ -2411,4 +2450,26 @@ def test_shape_concat_reshape_transpose_slice_runs_on_ggml(
         and e.get("args", {}).get("op_name") == "Slice"
     ]
     assert not cpu_slices, f"Slice fell back to CPU: {cpu_slices}"
+    assert "GGMLExecutionProvider" in providers, "no GGML partition executed"
+
+
+def test_shape_concat_reshape_then_expand_runs_on_ggml(
+        suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_shape_concat_reshape_then_expand_model(suite_tmpdir)
+    rng = np.random.default_rng(53)
+    inputs = {"x": rng.standard_normal((2, 3)).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    expected = cpu.run(["y"], inputs)[0]
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    profile = end_profiling_profile(ggml)
+    node_events = [e for e in profile if e.get("cat") == "Node"]
+    providers = {e.get("args", {}).get("provider") for e in node_events}
+    cpu_expands = [
+        e for e in node_events
+        if e.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and e.get("args", {}).get("op_name") == "Expand"
+    ]
+    assert not cpu_expands, f"Expand fell back to CPU: {cpu_expands}"
     assert "GGMLExecutionProvider" in providers, "no GGML partition executed"
