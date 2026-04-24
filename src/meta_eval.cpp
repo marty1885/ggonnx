@@ -17,6 +17,134 @@ namespace {
 using ggonnx::ort_internal::GetOrtApi;
 using ggonnx::ort_internal::THROW_ON_ERROR;
 
+bool IsNodeCompilable(Ort::ConstNode node, const ConstantValueMap& constants);
+
+// ===========================================================================
+//  GraphIndex — central authority for graph-structure queries.
+//
+//  Built once per AnalyzeCompileTimeConstants call; fusion detectors, the
+//  main fold loop, and EvalShapeTensorGather all consult it. Holds:
+//    - producer edge:           ProducerOf(name) -> node producing it
+//    - consumer edge:           Consumers(name) -> node(s) consuming it
+//    - consumer op types:       ConsumerOps(name) -> ["Reshape", "Gather"]
+//    - graph outputs:           IsGraphOutput(name)
+//    - topological position:    TopoIndex(node_key)
+//
+//  All queries are O(1). Graph outputs are tracked separately from node
+//  consumers: callers that want "node uses + graph-output use" compose
+//  ConsumerCount(name) + IsGraphOutput(name).
+// ===========================================================================
+struct GraphIndex {
+  std::vector<Ort::ConstNode> nodes;  // topological order from GetNodes()
+  std::unordered_map<std::string, Ort::ConstNode> producer_by_output;
+  std::unordered_map<std::string, std::vector<Ort::ConstNode>> consumers_by_name;
+  std::unordered_map<std::string, std::vector<std::string>> consumer_ops_by_name;
+  std::unordered_set<std::string> graph_output_names;
+  std::unordered_map<std::string, size_t> topo_index_by_key;
+
+  explicit GraphIndex(const Ort::ConstGraph& graph) {
+    const auto ns = graph.GetNodes();
+    nodes.assign(ns.begin(), ns.end());
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      topo_index_by_key.emplace(NodeKey(nodes[i]), i);
+      const std::string op_type = std::string(nodes[i].GetOperatorType());
+      for (Ort::ConstValueInfo out : nodes[i].GetOutputs()) {
+        if (out != nullptr) producer_by_output.emplace(out.GetName(), nodes[i]);
+      }
+      auto record_use = [&](Ort::ConstValueInfo in) {
+        if (in == nullptr) return;
+        const std::string name = in.GetName();
+        consumers_by_name[name].push_back(nodes[i]);
+        consumer_ops_by_name[name].push_back(op_type);
+      };
+      for (Ort::ConstValueInfo in : nodes[i].GetInputs()) record_use(in);
+      for (Ort::ConstValueInfo in : nodes[i].GetImplicitInputs()) record_use(in);
+    }
+    for (Ort::ConstValueInfo out : graph.GetOutputs()) {
+      if (out != nullptr) graph_output_names.emplace(out.GetName());
+    }
+  }
+
+  Ort::ConstNode ProducerOf(const std::string& name) const {
+    const auto it = producer_by_output.find(name);
+    return it == producer_by_output.end() ? Ort::ConstNode{nullptr} : it->second;
+  }
+
+  size_t ConsumerCount(const std::string& name) const {
+    const auto it = consumers_by_name.find(name);
+    return it == consumers_by_name.end() ? 0 : it->second.size();
+  }
+
+  const std::vector<Ort::ConstNode>& Consumers(const std::string& name) const {
+    static const std::vector<Ort::ConstNode> empty;
+    const auto it = consumers_by_name.find(name);
+    return it == consumers_by_name.end() ? empty : it->second;
+  }
+
+  const std::vector<std::string>& ConsumerOps(const std::string& name) const {
+    static const std::vector<std::string> empty;
+    const auto it = consumer_ops_by_name.find(name);
+    return it == consumer_ops_by_name.end() ? empty : it->second;
+  }
+
+  bool IsGraphOutput(const std::string& name) const {
+    return graph_output_names.count(name) > 0;
+  }
+
+  std::optional<size_t> TopoIndex(const std::string& node_key) const {
+    const auto it = topo_index_by_key.find(node_key);
+    if (it == topo_index_by_key.end()) return std::nullopt;
+    return it->second;
+  }
+
+  // Unique consumer of `name`, or null if count != 1.
+  Ort::ConstNode OnlyConsumer(const std::string& name) const {
+    const auto& cs = Consumers(name);
+    return cs.size() == 1 ? cs.front() : Ort::ConstNode{nullptr};
+  }
+
+  // Like OnlyConsumer but also verifies op type.
+  Ort::ConstNode OnlyConsumerOf(const std::string& name, std::string_view op_type) const {
+    Ort::ConstNode c = OnlyConsumer(name);
+    if (c == nullptr || std::string_view(c.GetOperatorType()) != op_type) {
+      return Ort::ConstNode{nullptr};
+    }
+    return c;
+  }
+};
+
+// Fusion topological-span safety check: every node between the min- and
+// max-topo-index members must itself be a member, already folded, already
+// claimed by an earlier fusion, or compilable. Otherwise an unsupported
+// node would split the ORT partition and break ensure_value.
+bool FusionSpanSafe(const GraphIndex& gi,
+                    std::initializer_list<std::string> member_keys,
+                    const ConstantValueMap& constants,
+                    const std::unordered_set<std::string>& folded_nodes,
+                    const FusionPlan& plan) {
+  const std::unordered_set<std::string> members(member_keys.begin(), member_keys.end());
+  size_t lo = std::numeric_limits<size_t>::max(), hi = 0;
+  for (const std::string& k : member_keys) {
+    const auto idx = gi.TopoIndex(k);
+    if (!idx) return false;
+    lo = std::min(lo, *idx);
+    hi = std::max(hi, *idx);
+  }
+  if (lo > hi) return false;
+  for (size_t i = lo; i <= hi; ++i) {
+    const std::string key = NodeKey(gi.nodes[i]);
+    if (members.count(key)) continue;
+    if (folded_nodes.count(key)) continue;
+    if (plan.consumed_nodes.count(key)) continue;
+    if (plan.generic_shuffle_anchors.count(key)) continue;
+    if (plan.qkv_split_anchors.count(key)) continue;
+    if (plan.window_mask_add_anchors.count(key)) continue;
+    if (IsNodeCompilable(gi.nodes[i], constants)) continue;
+    return false;
+  }
+  return true;
+}
+
 constexpr size_t kMaxFoldedElements = 256;
 // Sentinel used inside compile-time shape tensors for dimensions that ORT
 // knows exist but cannot statically resolve. It must survive int64<->int32
@@ -975,7 +1103,7 @@ std::optional<ConstantTensor> EvalGather(const ConstantValueMap& constants, Ort:
 
 std::optional<ConstantTensor> EvalShapeTensorGather(
     const ConstantValueMap& constants,
-    const std::unordered_map<std::string, Ort::ConstNode>& producer_by_output,
+    const GraphIndex& graph_index,
     Ort::ConstNode node) {
   const auto inputs = node.GetInputs();
   if (inputs.size() != 2 || inputs[0] == nullptr || inputs[1] == nullptr) return std::nullopt;
@@ -993,9 +1121,7 @@ std::optional<ConstantTensor> EvalShapeTensorGather(
   }
   if (axis != 0 && axis != -1) return std::nullopt;
 
-  auto pit = producer_by_output.find(std::string(inputs[0].GetName()));
-  if (pit == producer_by_output.end()) return std::nullopt;
-  Ort::ConstNode producer = pit->second;
+  Ort::ConstNode producer = graph_index.ProducerOf(std::string(inputs[0].GetName()));
   if (producer == nullptr || producer.GetOperatorType() != "Shape") return std::nullopt;
   const std::string producer_domain = producer.GetDomain();
   if (!producer_domain.empty() && producer_domain != "ai.onnx") return std::nullopt;
@@ -1236,8 +1362,8 @@ std::optional<ConstantTensor> EvalRange(const ConstantValueMap& constants, Ort::
 }
 
 std::optional<ConstantTensor> EvalUnaryMath(const ConstantValueMap& constants,
-                                            Ort::ConstNode node,
-                                            const std::string& op_type) {
+                                            Ort::ConstNode node) {
+  const std::string op_type = node.GetOperatorType();
   const auto inputs = node.GetInputs();
   if (inputs.size() != 1 || inputs[0] == nullptr) return std::nullopt;
   const auto input = LookupConstant(constants, inputs[0]);
@@ -1378,32 +1504,6 @@ std::optional<ConstantTensor> EvalReduceMin(const ConstantValueMap& constants, O
   return MakeConstant<int64_t>(out_dims, std::move(out), data->element_type);
 }
 
-std::optional<ConstantTensor> TryFoldNode(const ConstantValueMap& constants, Ort::ConstNode node) {
-  const std::string op_type = node.GetOperatorType();
-  if (op_type == "Constant") return EvalConstant(constants, node);
-  if (op_type == "Shape") return EvalShape(constants, node);
-  if (op_type == "Cast") return EvalCast(constants, node);
-  if (op_type == "Identity") return EvalIdentity(constants, node);
-  if (op_type == "Slice") return EvalSlice(constants, node);
-  if (op_type == "Unsqueeze") return EvalUnsqueeze(constants, node);
-  if (op_type == "Squeeze") return EvalSqueeze(constants, node);
-  if (op_type == "Concat") return EvalConcat(constants, node);
-  if (op_type == "Reshape") return EvalReshape(constants, node);
-  if (op_type == "Tile") return EvalTile(constants, node);
-  if (op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div") {
-    return EvalBinary(constants, node);
-  }
-  if (op_type == "Transpose") return EvalTranspose(constants, node);
-  if (op_type == "Gather") return EvalGather(constants, node);
-  if (op_type == "ConstantOfShape") return EvalConstantOfShape(constants, node);
-  if (op_type == "Range") return EvalRange(constants, node);
-  if (op_type == "Ceil" || op_type == "Round") return EvalUnaryMath(constants, node, op_type);
-  if (op_type == "ReduceMin") return EvalReduceMin(constants, node);
-  if (op_type == "Equal") return EvalEqual(constants, node);
-  if (op_type == "Where") return EvalWhere(constants, node);
-  return std::nullopt;
-}
-
 }  // namespace
 
 bool ConstantContainsSentinel(const ConstantTensor& tensor) {
@@ -1478,30 +1578,20 @@ std::optional<std::vector<int64_t>> ResolveReshapeTarget(const std::vector<int64
 //   ONNX output group out_g = N_groups-1-j
 //   ONNX input group  in_g  = coalesced_perm[out_g]
 //   ggml_perm[j] = N_groups-1 - coalesced_perm[N_groups-1-j]
-void DetectShuffleTripleFusions(const Ort::ConstGraph& ort_graph,
+void DetectShuffleTripleFusions(const GraphIndex& gi,
                                 const ConstantValueMap& constants,
                                 FusionPlan& plan) {
-  std::unordered_map<std::string, Ort::ConstNode> producer;
-  std::unordered_map<std::string, int> consumer_count;
-  const auto nodes = ort_graph.GetNodes();
-  for (Ort::ConstNode n : nodes) {
-    for (Ort::ConstValueInfo out : n.GetOutputs()) {
-      if (out != nullptr) producer[std::string(out.GetName())] = n;
-    }
-    for (Ort::ConstValueInfo in : n.GetInputs()) {
-      if (in != nullptr) consumer_count[std::string(in.GetName())]++;
-    }
-  }
-  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
-    if (out != nullptr) consumer_count[std::string(out.GetName())]++;
-  }
-
+  // Treats graph-output use as one additional consumer, matching the original
+  // intent of rejecting fusions where the intermediate also leaves the graph.
+  auto effective_consumers = [&](const std::string& name) {
+    return gi.ConsumerCount(name) + (gi.IsGraphOutput(name) ? 1 : 0);
+  };
   std::unordered_set<std::string> claimed;
   auto claim = [&](const std::string& key) {
     return claimed.insert(key).second;
   };
 
-  for (Ort::ConstNode trans : nodes) {
+  for (Ort::ConstNode trans : gi.nodes) {
     if (trans.GetOperatorType() != "Transpose") continue;
     const auto perm_opt = ReadTransposePerm(trans);
     if (!perm_opt) continue;
@@ -1515,26 +1605,15 @@ void DetectShuffleTripleFusions(const Ort::ConstGraph& ort_graph,
     if (trans_inputs[0] == nullptr || trans_outputs[0] == nullptr) continue;
 
     const std::string r1_out = std::string(trans_inputs[0].GetName());
-    auto prod_it = producer.find(r1_out);
-    if (prod_it == producer.end()) continue;
-    Ort::ConstNode r1 = prod_it->second;
-    if (r1.GetOperatorType() != "Reshape") continue;
-    if (consumer_count[r1_out] != 1) continue;
+    Ort::ConstNode r1 = gi.ProducerOf(r1_out);
+    if (r1 == nullptr || r1.GetOperatorType() != "Reshape") continue;
+    if (effective_consumers(r1_out) != 1) continue;
 
     const std::string trans_out_name = std::string(trans_outputs[0].GetName());
-    if (consumer_count[trans_out_name] != 1) continue;
+    if (effective_consumers(trans_out_name) != 1) continue;
 
-    Ort::ConstNode r2{nullptr};
-    for (Ort::ConstNode n : nodes) {
-      for (Ort::ConstValueInfo in : n.GetInputs()) {
-        if (in != nullptr && std::string(in.GetName()) == trans_out_name) {
-          r2 = n;
-          break;
-        }
-      }
-      if (r2 != nullptr) break;
-    }
-    if (r2 == nullptr || r2.GetOperatorType() != "Reshape") continue;
+    Ort::ConstNode r2 = gi.OnlyConsumerOf(trans_out_name, "Reshape");
+    if (r2 == nullptr) continue;
 
     const auto r1_inputs = r1.GetInputs();
     const auto r2_inputs = r2.GetInputs();
@@ -1676,7 +1755,7 @@ bool IsNodeCompilable(Ort::ConstNode node, const ConstantValueMap& constants) {
   return get_node_support(node, &partial).has_value();
 }
 
-void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
+void DetectQKVSplitFusions(const GraphIndex& gi,
                            const ConstantValueMap& constants,
                            const std::unordered_set<std::string>& folded_nodes,
                            FusionPlan& plan) {
@@ -1687,32 +1766,13 @@ void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
   //     3x Gather(axis=0, scalar index in {0,1,2})
   // Every rank-5 intermediate has exactly one consumer, so the fusion is safe
   // to discard them. Emits three rank-4 ne=[head_dim, M*M, heads, B*nw].
-  std::unordered_map<std::string, Ort::ConstNode> producer;
-  std::unordered_map<std::string, int> consumer_count;
-  const auto nodes = ort_graph.GetNodes();
-  for (Ort::ConstNode n : nodes) {
-    for (Ort::ConstValueInfo out : n.GetOutputs()) {
-      if (out != nullptr) producer[std::string(out.GetName())] = n;
-    }
-    for (Ort::ConstValueInfo in : n.GetInputs()) {
-      if (in != nullptr) consumer_count[std::string(in.GetName())]++;
-    }
-  }
-  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
-    if (out != nullptr) consumer_count[std::string(out.GetName())]++;
-  }
-
-  // Topological index per node key — used to verify the fusion span has no
-  // intervening unsupported node that would force ORT to split the partition.
-  std::unordered_map<std::string, size_t> index_by_key;
-  for (size_t i = 0; i < nodes.size(); ++i) {
-    index_by_key.emplace(NodeKey(nodes[i]), i);
-  }
-
+  auto effective_consumers = [&](const std::string& name) {
+    return gi.ConsumerCount(name) + (gi.IsGraphOutput(name) ? 1 : 0);
+  };
   std::unordered_set<std::string> claimed;
   auto claim = [&](const std::string& key) { return claimed.insert(key).second; };
 
-  for (Ort::ConstNode trans : nodes) {
+  for (Ort::ConstNode trans : gi.nodes) {
     if (trans.GetOperatorType() != "Transpose") continue;
     const auto perm = ReadTransposePerm(trans);
     const std::vector<int64_t> expected_perm = {2, 0, 3, 1, 4};
@@ -1725,11 +1785,9 @@ void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
 
     // Upstream Reshape producing the rank-5 [B*nw, M*M, 3, heads, head_dim].
     const std::string r_out_name = std::string(trans_inputs[0].GetName());
-    if (consumer_count[r_out_name] != 1) continue;
-    auto r_it = producer.find(r_out_name);
-    if (r_it == producer.end()) continue;
-    Ort::ConstNode reshape = r_it->second;
-    if (reshape.GetOperatorType() != "Reshape") continue;
+    if (effective_consumers(r_out_name) != 1) continue;
+    Ort::ConstNode reshape = gi.ProducerOf(r_out_name);
+    if (reshape == nullptr || reshape.GetOperatorType() != "Reshape") continue;
 
     const auto r_inputs = reshape.GetInputs();
     const auto r_outputs = reshape.GetOutputs();
@@ -1759,21 +1817,13 @@ void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
     // Downstream: exactly three consumers of the Transpose output, each a
     // Gather(axis=0) with a scalar int64 index in {0,1,2} — one per Q/K/V.
     const std::string trans_out_name = std::string(trans_outputs[0].GetName());
-    if (consumer_count[trans_out_name] != 3) continue;
+    if (effective_consumers(trans_out_name) != 3) continue;
 
     std::array<Ort::ConstNode, 3> gathers{Ort::ConstNode{nullptr}, Ort::ConstNode{nullptr},
                                           Ort::ConstNode{nullptr}};
     bool seen[3] = {false, false, false};
     bool ok = true;
-    for (Ort::ConstNode n : nodes) {
-      bool consumes = false;
-      for (Ort::ConstValueInfo in : n.GetInputs()) {
-        if (in != nullptr && std::string(in.GetName()) == trans_out_name) {
-          consumes = true;
-          break;
-        }
-      }
-      if (!consumes) continue;
+    for (Ort::ConstNode n : gi.Consumers(trans_out_name)) {
       if (n.GetOperatorType() != "Gather") { ok = false; break; }
       const int64_t gaxis = ReadInt64Attr(n, "axis").value_or(0);
       if (gaxis != 0) { ok = false; break; }
@@ -1795,41 +1845,12 @@ void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
     const std::string g1_key = NodeKey(gathers[1]);
     const std::string g2_key = NodeKey(gathers[2]);
 
-    // Partition safety: the fusion members (R, T, G0, G1, G2) must end up in
-    // the same fused partition. ORT's grouping is topological, so the span
-    // from min to max index must contain only nodes that ggml will keep in
-    // the partition — i.e. compilable (supported), folded at compile time, or
-    // already in the fusion itself. An unsupported node (e.g. a Softmax we
-    // haven't implemented) sitting between G0 and G2 would split the
-    // partition and leave the rank-5 Transpose_2 output exposed as a cross-
-    // partition boundary, which ensure_value then rejects.
-    const std::array<std::string, 5> member_keys{r_key, t_key, g0_key, g1_key, g2_key};
-    std::unordered_set<std::string> member_set(member_keys.begin(), member_keys.end());
-    size_t lo = std::numeric_limits<size_t>::max();
-    size_t hi = 0;
-    for (const std::string& k : member_keys) {
-      const auto it = index_by_key.find(k);
-      if (it == index_by_key.end()) { lo = 1; hi = 0; break; }
-      lo = std::min(lo, it->second);
-      hi = std::max(hi, it->second);
-    }
-    if (lo > hi) continue;
-    bool span_ok = true;
-    for (size_t i = lo; i <= hi; ++i) {
-      const std::string key = NodeKey(nodes[i]);
-      if (member_set.count(key) > 0) continue;
-      if (folded_nodes.count(key) > 0) continue;
-      // Nodes claimed by an earlier fusion (anchors or consumed) stay in the
-      // partition just like compilable ones.
-      if (plan.consumed_nodes.count(key) > 0) continue;
-      if (plan.generic_shuffle_anchors.count(key) > 0) continue;
-      if (plan.qkv_split_anchors.count(key) > 0) continue;
-      if (plan.window_mask_add_anchors.count(key) > 0) continue;
-      if (IsNodeCompilable(nodes[i], constants)) continue;
-      span_ok = false;
-      break;
-    }
-    if (!span_ok) continue;
+    // Partition safety: every node between the fusion members must be a
+    // member, folded, claimed by an earlier fusion, or compilable. Otherwise
+    // an unsupported node (e.g. a Softmax we haven't implemented) would
+    // split the partition and leave the rank-5 Transpose output exposed.
+    if (!FusionSpanSafe(gi, {r_key, t_key, g0_key, g1_key, g2_key},
+                        constants, folded_nodes, plan)) continue;
 
     if (!claim(r_key) || !claim(t_key) || !claim(g0_key) || !claim(g1_key) || !claim(g2_key)) {
       continue;
@@ -1862,7 +1883,7 @@ void DetectQKVSplitFusions(const Ort::ConstGraph& ort_graph,
   }
 }
 
-void DetectWindowMaskAddFusions(const Ort::ConstGraph& ort_graph,
+void DetectWindowMaskAddFusions(const GraphIndex& gi,
                                 const ConstantValueMap& constants,
                                 const std::unordered_set<std::string>& folded_nodes,
                                 FusionPlan& plan) {
@@ -1872,30 +1893,13 @@ void DetectWindowMaskAddFusions(const Ort::ConstGraph& ort_graph,
   // input shape. Because the mask is a compile-time constant, we can drop its
   // leading size-1 ONNX axes to rank-reduce it to <=4 without moving any
   // bytes; the Add then becomes a plain rank-4 broadcast add directly on X.
-  std::unordered_map<std::string, Ort::ConstNode> producer;
-  std::unordered_map<std::string, int> consumer_count;
-  const auto nodes = ort_graph.GetNodes();
-  for (Ort::ConstNode n : nodes) {
-    for (Ort::ConstValueInfo out : n.GetOutputs()) {
-      if (out != nullptr) producer[std::string(out.GetName())] = n;
-    }
-    for (Ort::ConstValueInfo in : n.GetInputs()) {
-      if (in != nullptr) consumer_count[std::string(in.GetName())]++;
-    }
-  }
-  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
-    if (out != nullptr) consumer_count[std::string(out.GetName())]++;
-  }
-
-  std::unordered_map<std::string, size_t> index_by_key;
-  for (size_t i = 0; i < nodes.size(); ++i) {
-    index_by_key.emplace(NodeKey(nodes[i]), i);
-  }
-
+  auto effective_consumers = [&](const std::string& name) {
+    return gi.ConsumerCount(name) + (gi.IsGraphOutput(name) ? 1 : 0);
+  };
   std::unordered_set<std::string> claimed;
   auto claim = [&](const std::string& key) { return claimed.insert(key).second; };
 
-  for (Ort::ConstNode add : nodes) {
+  for (Ort::ConstNode add : gi.nodes) {
     if (add.GetOperatorType() != "Add") continue;
     const auto add_inputs = add.GetInputs();
     const auto add_outputs = add.GetOutputs();
@@ -1918,11 +1922,9 @@ void DetectWindowMaskAddFusions(const Ort::ConstGraph& ort_graph,
 
       // Leading Reshape must produce the score side.
       const std::string lead_out_name = std::string(score_vi.GetName());
-      if (consumer_count[lead_out_name] != 1) continue;
-      auto prod_it = producer.find(lead_out_name);
-      if (prod_it == producer.end()) continue;
-      Ort::ConstNode lead = prod_it->second;
-      if (lead.GetOperatorType() != "Reshape") continue;
+      if (effective_consumers(lead_out_name) != 1) continue;
+      Ort::ConstNode lead = gi.ProducerOf(lead_out_name);
+      if (lead == nullptr || lead.GetOperatorType() != "Reshape") continue;
       const auto lead_inputs = lead.GetInputs();
       if (lead_inputs.size() < 1 || lead_inputs[0] == nullptr) continue;
 
@@ -1937,15 +1939,9 @@ void DetectWindowMaskAddFusions(const Ort::ConstGraph& ort_graph,
       // Trailing Reshape must be the single consumer of the Add's output and
       // must land back at X's shape.
       const std::string add_out_name = std::string(add_outputs[0].GetName());
-      if (consumer_count[add_out_name] != 1) continue;
-      Ort::ConstNode trail{nullptr};
-      for (Ort::ConstNode n : nodes) {
-        for (Ort::ConstValueInfo in : n.GetInputs()) {
-          if (in != nullptr && std::string(in.GetName()) == add_out_name) { trail = n; break; }
-        }
-        if (trail != nullptr) break;
-      }
-      if (trail == nullptr || trail.GetOperatorType() != "Reshape") continue;
+      if (effective_consumers(add_out_name) != 1) continue;
+      Ort::ConstNode trail = gi.OnlyConsumerOf(add_out_name, "Reshape");
+      if (trail == nullptr) continue;
       const auto trail_outputs = trail.GetOutputs();
       if (trail_outputs.size() != 1 || trail_outputs[0] == nullptr) continue;
       const TensorMetadata trail_out_meta = getTensorMetadata(trail_outputs[0]);
@@ -1966,26 +1962,8 @@ void DetectWindowMaskAddFusions(const Ort::ConstGraph& ort_graph,
       const std::string lead_key = NodeKey(lead);
       const std::string anchor_key = NodeKey(add);
       const std::string trail_key = NodeKey(trail);
-      std::unordered_set<std::string> member_set{lead_key, anchor_key, trail_key};
-      size_t lo = std::numeric_limits<size_t>::max(), hi = 0;
-      bool ok_keys = true;
-      for (const std::string& k : member_set) {
-        auto it = index_by_key.find(k);
-        if (it == index_by_key.end()) { ok_keys = false; break; }
-        lo = std::min(lo, it->second);
-        hi = std::max(hi, it->second);
-      }
-      if (!ok_keys) continue;
-      bool span_ok = true;
-      for (size_t i = lo; i <= hi; ++i) {
-        const std::string key = NodeKey(nodes[i]);
-        if (member_set.count(key) > 0) continue;
-        if (folded_nodes.count(key) > 0) continue;
-        if (IsNodeCompilable(nodes[i], constants)) continue;
-        span_ok = false;
-        break;
-      }
-      if (!span_ok) continue;
+      if (!FusionSpanSafe(gi, {lead_key, anchor_key, trail_key},
+                          constants, folded_nodes, plan)) continue;
 
       if (!claim(lead_key) || !claim(anchor_key) || !claim(trail_key)) continue;
 
@@ -2033,26 +2011,10 @@ static std::optional<std::vector<int64_t>> ReadPadNodePads(
 // Conv's p0/p1 and the Pad node is eliminated. Applies only when the Pad is
 // constant-mode with value 0, pads only H/W symmetrically, and the Conv has
 // no padding of its own and has exactly one consumer of the Pad's output.
-void DetectPadConvFusions(const Ort::ConstGraph& ort_graph,
+void DetectPadConvFusions(const GraphIndex& gi,
                           const ConstantValueMap& constants,
                           FusionPlan& plan) {
-  // Build value-name → producing node map.
-  std::unordered_map<std::string, Ort::ConstNode> producer;
-  for (Ort::ConstNode n : ort_graph.GetNodes()) {
-    for (Ort::ConstValueInfo out : n.GetOutputs()) {
-      if (out != nullptr) producer.emplace(std::string(out.GetName()), n);
-    }
-  }
-
-  // Build a use-count map for all value names.
-  std::unordered_map<std::string, int> use_count;
-  for (Ort::ConstNode n : ort_graph.GetNodes()) {
-    for (Ort::ConstValueInfo inp : n.GetInputs()) {
-      if (inp != nullptr) ++use_count[std::string(inp.GetName())];
-    }
-  }
-
-  for (Ort::ConstNode conv : ort_graph.GetNodes()) {
+  for (Ort::ConstNode conv : gi.nodes) {
     const std::string op = conv.GetOperatorType();
     if (op != "Conv") continue;
     const std::string dom = conv.GetDomain();
@@ -2085,10 +2047,8 @@ void DetectPadConvFusions(const Ort::ConstGraph& ort_graph,
 
     // Find the Pad node producing the Conv's data input.
     const std::string data_input_name = conv_inputs[0].GetName();
-    auto pit = producer.find(data_input_name);
-    if (pit == producer.end()) continue;
-    Ort::ConstNode pad = pit->second;
-    if (std::string(pad.GetOperatorType()) != "Pad") continue;
+    Ort::ConstNode pad = gi.ProducerOf(data_input_name);
+    if (pad == nullptr || std::string(pad.GetOperatorType()) != "Pad") continue;
     const std::string pad_dom = pad.GetDomain();
     if (!pad_dom.empty() && pad_dom != "ai.onnx") continue;
 
@@ -2121,8 +2081,8 @@ void DetectPadConvFusions(const Ort::ConstGraph& ort_graph,
     const int h_pad = static_cast<int>((*pads)[2]);
     const int w_pad = static_cast<int>((*pads)[3]);
 
-    // The Pad output must be consumed only by this Conv (use_count == 1).
-    if (use_count[data_input_name] != 1) continue;
+    // The Pad output must be consumed only by this Conv.
+    if (gi.ConsumerCount(data_input_name) != 1) continue;
 
     // Don't absorb a Pad that another fusion already claimed.
     const std::string pad_key = NodeKey(pad);
@@ -2137,25 +2097,10 @@ void DetectPadConvFusions(const Ort::ConstGraph& ort_graph,
   }
 }
 
-void DetectConvBatchNormFusions(const Ort::ConstGraph& ort_graph,
+void DetectConvBatchNormFusions(const GraphIndex& gi,
                                 ConstantValueMap& constants,
                                 FusionPlan& plan) {
-  std::unordered_map<std::string, Ort::ConstNode> producer;
-  std::unordered_map<std::string, int> use_count;
-  std::unordered_set<std::string> graph_output_names;
-  for (Ort::ConstNode n : ort_graph.GetNodes()) {
-    for (Ort::ConstValueInfo out : n.GetOutputs()) {
-      if (out != nullptr) producer.emplace(std::string(out.GetName()), n);
-    }
-    for (Ort::ConstValueInfo inp : n.GetInputs()) {
-      if (inp != nullptr) ++use_count[std::string(inp.GetName())];
-    }
-  }
-  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
-    if (out != nullptr) graph_output_names.insert(std::string(out.GetName()));
-  }
-
-  for (Ort::ConstNode bn : ort_graph.GetNodes()) {
+  for (Ort::ConstNode bn : gi.nodes) {
     const std::string op = bn.GetOperatorType();
     if (op != "BatchNormalization") continue;
     const std::string dom = bn.GetDomain();
@@ -2169,12 +2114,10 @@ void DetectConvBatchNormFusions(const Ort::ConstGraph& ort_graph,
     }
 
     const std::string conv_out_name = bn_inputs[0].GetName();
-    if (use_count[conv_out_name] != 1) continue;
-    if (graph_output_names.count(conv_out_name) > 0) continue;
+    if (gi.ConsumerCount(conv_out_name) != 1) continue;
+    if (gi.IsGraphOutput(conv_out_name)) continue;
 
-    auto pit = producer.find(conv_out_name);
-    if (pit == producer.end()) continue;
-    Ort::ConstNode conv = pit->second;
+    Ort::ConstNode conv = gi.ProducerOf(conv_out_name);
     if (conv == nullptr || std::string(conv.GetOperatorType()) != "Conv") continue;
     const std::string conv_dom = conv.GetDomain();
     if (!conv_dom.empty() && conv_dom != "ai.onnx") continue;
@@ -2216,11 +2159,11 @@ void DetectConvBatchNormFusions(const Ort::ConstGraph& ort_graph,
         vit->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
       continue;
     }
-    if (use_count[weight_name] != 1 ||
-        use_count[scale_name] != 1 ||
-        use_count[beta_name] != 1 ||
-        use_count[mean_name] != 1 ||
-        use_count[var_name] != 1) {
+    if (gi.ConsumerCount(weight_name) != 1 ||
+        gi.ConsumerCount(scale_name) != 1 ||
+        gi.ConsumerCount(beta_name) != 1 ||
+        gi.ConsumerCount(mean_name) != 1 ||
+        gi.ConsumerCount(var_name) != 1) {
       continue;
     }
 
@@ -2240,7 +2183,7 @@ void DetectConvBatchNormFusions(const Ort::ConstGraph& ort_graph,
       auto cbit = constants.find(folded_bias_name);
       if (cbit == constants.end() ||
           cbit->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-          use_count[folded_bias_name] != 1) {
+          gi.ConsumerCount(folded_bias_name) != 1) {
         continue;
       }
       conv_bias = ReadTypedData<float>(cbit->second);
@@ -2755,6 +2698,253 @@ std::optional<std::vector<int64_t>> ResolveShapeRuleInt64Input(
   return values;
 }
 
+// ===========================================================================
+//  MetaOp registry — single source of truth for per-op folding + shape rules.
+//
+//  TryFoldNode and PropagateInferredShapes both dispatch through this table.
+//  Adding an op means adding one row to kMetaOps: the registry is iterable
+//  (GetMetaOpRegistry) and lookup is a single hash probe (FindMetaOp).
+//
+//  Entries are sparse: either function pointer may be null. A fold-only op
+//  leaves shape_fn null; a shape-only op leaves fold_fn null.
+// ===========================================================================
+
+struct ShapeRuleResult {
+  std::optional<std::vector<int64_t>> out_shape;              // single-output rules
+  std::optional<std::vector<std::vector<int64_t>>> per_output; // multi-output (Split)
+};
+
+// Per-node scratch bundle passed to every shape rule. Built once per node by
+// PropagateInferredShapes; rules read from it and never mutate.
+struct ShapeRuleCtx {
+  Ort::ConstNode node;
+  const std::vector<Ort::ConstValueInfo>& inputs;
+  const ConstantValueMap& constants;
+  // Look up the fully-static shape of input[idx]; nullopt if not resolvable.
+  std::function<std::optional<std::vector<int64_t>>(size_t)> get_in_shape;
+  // Resolve shape of a tensor by name (constant-valued shape tensors etc.).
+  std::function<std::optional<std::vector<int64_t>>(const std::string&)> lookup_shape_by_name;
+};
+
+using FoldFn = std::optional<ConstantTensor> (*)(const ConstantValueMap&, Ort::ConstNode);
+using ShapeFn = ShapeRuleResult (*)(const ShapeRuleCtx&);
+
+struct MetaOp {
+  std::string_view op_type;  // all ops currently live in domain ""
+  FoldFn fold_fn;            // nullable
+  ShapeFn shape_fn;          // nullable
+};
+
+// --- Shape rule adapters --------------------------------------------------
+// Each adapter unpacks ShapeRuleCtx into the call signature of the
+// corresponding Infer* function. Kept tiny and data-only so the registry
+// table below reads as a flat index of supported ops.
+
+ShapeRuleResult ShapeRulePad(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  if (in) r.out_shape = InferPadOutputShape(c.node, *in, c.constants);
+  return r;
+}
+ShapeRuleResult ShapeRuleReshape(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  auto target = ResolveShapeRuleInt64Input(c.constants, c.node, 1, c.lookup_shape_by_name);
+  if (in && target) r.out_shape = InferReshapeOutputShape(c.node, *in, *target);
+  return r;
+}
+ShapeRuleResult ShapeRuleTranspose(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  if (in) r.out_shape = InferTransposeOutputShape(c.node, *in);
+  return r;
+}
+ShapeRuleResult ShapeRuleUnsqueeze(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  if (in) r.out_shape = InferUnsqueezeOutputShape(c.node, *in, c.constants);
+  return r;
+}
+ShapeRuleResult ShapeRuleSqueeze(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  if (in) r.out_shape = InferSqueezeOutputShape(c.node, *in, c.constants);
+  return r;
+}
+ShapeRuleResult ShapeRuleSlice(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  if (in) r.out_shape = InferSliceOutputShape(c.node, *in, c.constants);
+  return r;
+}
+ShapeRuleResult ShapeRuleExpand(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  auto target = ResolveShapeRuleInt64Input(c.constants, c.node, 1, c.lookup_shape_by_name);
+  if (in && target) r.out_shape = InferExpandOutputShape(*in, *target);
+  return r;
+}
+ShapeRuleResult ShapeRuleTile(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  if (in) r.out_shape = InferTileOutputShape(c.node, *in, c.constants, c.node);
+  return r;
+}
+ShapeRuleResult ShapeRuleIdentityShape(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  r.out_shape = c.get_in_shape(0);
+  return r;
+}
+ShapeRuleResult ShapeRuleGather(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto data_shape = c.get_in_shape(0);
+  auto idx_shape = c.get_in_shape(1);
+  if (data_shape && idx_shape) r.out_shape = InferGatherOutputShape(c.node, *data_shape, *idx_shape);
+  return r;
+}
+ShapeRuleResult ShapeRuleConcat(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  std::vector<std::optional<std::vector<int64_t>>> shapes;
+  shapes.reserve(c.inputs.size());
+  for (size_t i = 0; i < c.inputs.size(); ++i) shapes.push_back(c.get_in_shape(i));
+  r.out_shape = InferConcatOutputShape(c.node, shapes);
+  return r;
+}
+ShapeRuleResult ShapeRuleSplit(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto in = c.get_in_shape(0);
+  if (in) r.per_output = InferSplitOutputShapes(c.node, *in, c.constants);
+  return r;
+}
+ShapeRuleResult ShapeRuleBroadcast(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  std::vector<std::optional<std::vector<int64_t>>> shapes;
+  shapes.reserve(c.inputs.size());
+  for (size_t i = 0; i < c.inputs.size(); ++i) shapes.push_back(c.get_in_shape(i));
+  r.out_shape = InferBroadcastShape(shapes);
+  return r;
+}
+ShapeRuleResult ShapeRuleRange(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  r.out_shape = InferRangeOutputShape(c.node, c.constants);
+  return r;
+}
+ShapeRuleResult ShapeRuleConstantOfShape(const ShapeRuleCtx& c) {
+  ShapeRuleResult r;
+  auto shape = ResolveShapeRuleInt64Input(c.constants, c.node, 0, c.lookup_shape_by_name);
+  if (shape) r.out_shape = InferConstantOfShapeOutputShape(*shape);
+  return r;
+}
+
+// --- The registry table ---------------------------------------------------
+// Rows are ordered by category: trivial / shape-manip / elementwise /
+// reductions-and-generators. Broadcasted elementwise ops share one shape fn
+// (ShapeRuleBroadcast) across 13 op types — spelled out explicitly instead
+// of being hidden in an if-chain cluster.
+
+const std::vector<MetaOp>& GetMetaOpRegistry() {
+  static const std::vector<MetaOp> kMetaOps = {
+      // Trivial / pass-through
+      {"Constant",        EvalConstant,        nullptr},
+      {"Shape",           EvalShape,           nullptr},
+      {"Cast",            EvalCast,            ShapeRuleIdentityShape},
+      {"Identity",        EvalIdentity,        ShapeRuleIdentityShape},
+      // Shape-manipulating folds and shape rules
+      {"Reshape",         EvalReshape,         ShapeRuleReshape},
+      {"Transpose",       EvalTranspose,       ShapeRuleTranspose},
+      {"Unsqueeze",       EvalUnsqueeze,       ShapeRuleUnsqueeze},
+      {"Squeeze",         EvalSqueeze,         ShapeRuleSqueeze},
+      {"Slice",           EvalSlice,           ShapeRuleSlice},
+      {"Expand",          nullptr,             ShapeRuleExpand},
+      {"Tile",            EvalTile,            ShapeRuleTile},
+      {"Concat",          EvalConcat,          ShapeRuleConcat},
+      {"Gather",          EvalGather,          ShapeRuleGather},
+      {"Split",           nullptr,             ShapeRuleSplit},
+      {"Pad",             nullptr,             ShapeRulePad},
+      // Elementwise — broadcast shape
+      {"Add",             EvalBinary,          ShapeRuleBroadcast},
+      {"Sub",             EvalBinary,          ShapeRuleBroadcast},
+      {"Mul",             EvalBinary,          ShapeRuleBroadcast},
+      {"Div",             EvalBinary,          ShapeRuleBroadcast},
+      {"Max",             nullptr,             ShapeRuleBroadcast},
+      {"Min",             nullptr,             ShapeRuleBroadcast},
+      {"Pow",             nullptr,             ShapeRuleBroadcast},
+      {"Equal",           EvalEqual,           ShapeRuleBroadcast},
+      {"Greater",         nullptr,             ShapeRuleBroadcast},
+      {"GreaterOrEqual",  nullptr,             ShapeRuleBroadcast},
+      {"Less",            nullptr,             ShapeRuleBroadcast},
+      {"LessOrEqual",     nullptr,             ShapeRuleBroadcast},
+      {"And",             nullptr,             ShapeRuleBroadcast},
+      {"Or",              nullptr,             ShapeRuleBroadcast},
+      {"Where",           EvalWhere,           ShapeRuleBroadcast},
+      // Unary math
+      {"Ceil",            EvalUnaryMath,       nullptr},
+      {"Round",           EvalUnaryMath,       nullptr},
+      // Reductions and generators
+      {"ReduceMin",       EvalReduceMin,       nullptr},
+      {"Range",           EvalRange,           ShapeRuleRange},
+      {"ConstantOfShape", EvalConstantOfShape, ShapeRuleConstantOfShape},
+  };
+  return kMetaOps;
+}
+
+const MetaOp* FindMetaOp(std::string_view op_type) {
+  static const std::unordered_map<std::string_view, const MetaOp*> kByName = [] {
+    std::unordered_map<std::string_view, const MetaOp*> m;
+    const auto& ops = GetMetaOpRegistry();
+    m.reserve(ops.size());
+    for (const auto& op : ops) m.emplace(op.op_type, &op);
+    return m;
+  }();
+  const auto it = kByName.find(op_type);
+  return it == kByName.end() ? nullptr : it->second;
+}
+
+// Table-driven fold dispatch. Replaces the former if-chain — a new fold op
+// only requires setting fold_fn on its registry row.
+std::optional<ConstantTensor> TryFoldNode(const ConstantValueMap& constants, Ort::ConstNode node) {
+  const auto* op = FindMetaOp(node.GetOperatorType());
+  if (!op || op->fold_fn == nullptr) return std::nullopt;
+  return op->fold_fn(constants, node);
+}
+
+// --- Fusion passes --------------------------------------------------------
+// Isolated behind a named list so they iterate like every other pass. The
+// five Detect* bodies are unchanged — the wrappers below only adapt their
+// varying signatures to the uniform (graph, analysis) shape.
+
+struct FusionPass {
+  std::string_view name;
+  void (*run)(const GraphIndex&, MetaAnalysis&);
+};
+
+void RunShuffleTripleFusions(const GraphIndex& gi, MetaAnalysis& a) {
+  DetectShuffleTripleFusions(gi, a.constants, a.fusions);
+}
+void RunWindowMaskAddFusions(const GraphIndex& gi, MetaAnalysis& a) {
+  DetectWindowMaskAddFusions(gi, a.constants, a.folded_nodes, a.fusions);
+}
+void RunQKVSplitFusions(const GraphIndex& gi, MetaAnalysis& a) {
+  DetectQKVSplitFusions(gi, a.constants, a.folded_nodes, a.fusions);
+}
+void RunPadConvFusions(const GraphIndex& gi, MetaAnalysis& a) {
+  DetectPadConvFusions(gi, a.constants, a.fusions);
+}
+void RunConvBatchNormFusions(const GraphIndex& gi, MetaAnalysis& a) {
+  DetectConvBatchNormFusions(gi, a.constants, a.fusions);
+}
+
+// Order matters: WindowMaskAdd must precede QKVSplit so the mask-apply
+// rank-5 bubble is fused out before QKVSplit's span check runs (if run
+// after, the bubble inflates the span past the match threshold).
+inline constexpr std::array<FusionPass, 5> kFusionPasses = {{
+    {"ShuffleTriple", RunShuffleTripleFusions},
+    {"WindowMaskAdd", RunWindowMaskAddFusions},
+    {"QKVSplit",      RunQKVSplitFusions},
+    {"PadConv",       RunPadConvFusions},
+    {"ConvBatchNorm", RunConvBatchNormFusions},
+}};
+
 void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& analysis) {
   const bool trace = std::getenv("GGONNX_TRACE_SHAPE_PROP") != nullptr;
   std::unordered_map<std::string, size_t> rule_fired;
@@ -2815,13 +3005,40 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
     return LookupInferredShape(name, analysis, ort_static);
   };
 
-  // Walk nodes in topological order (GetNodes() returns topo order).
+  // Record a single shape against all outputs that still need one.
+  auto record_single = [&](const std::vector<Ort::ConstValueInfo>& outputs,
+                           const std::vector<int64_t>& shape) {
+    if (!IsShapeFullyStatic(shape)) return;
+    for (Ort::ConstValueInfo output : outputs) {
+      if (output == nullptr) continue;
+      const std::string out_name = output.GetName();
+      if (ort_static.count(out_name) || analysis.inferred_shapes.count(out_name)) continue;
+      analysis.inferred_shapes[out_name] = shape;
+    }
+  };
+  auto record_per_output = [&](const std::vector<Ort::ConstValueInfo>& outputs,
+                               const std::vector<std::vector<int64_t>>& shapes) {
+    if (shapes.size() != outputs.size()) return;
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      if (outputs[i] == nullptr || !IsShapeFullyStatic(shapes[i])) continue;
+      const std::string out_name = outputs[i].GetName();
+      if (ort_static.count(out_name) || analysis.inferred_shapes.count(out_name)) continue;
+      analysis.inferred_shapes[out_name] = shapes[i];
+    }
+  };
+
+  // Walk nodes in topological order (GetNodes() returns topo order) and
+  // dispatch each through the MetaOp registry.
   for (Ort::ConstNode node : ort_graph.GetNodes()) {
     try {
       const std::string op_type = std::string(node.GetOperatorType());
+      const auto* meta_op = FindMetaOp(op_type);
+      if (meta_op == nullptr || meta_op->shape_fn == nullptr) continue;
+
       const auto inputs_rng = node.GetInputs();
       const std::vector<Ort::ConstValueInfo> inputs(inputs_rng.begin(), inputs_rng.end());
-      const auto outputs = node.GetOutputs();
+      const auto outputs_rng = node.GetOutputs();
+      const std::vector<Ort::ConstValueInfo> outputs(outputs_rng.begin(), outputs_rng.end());
       if (outputs.empty()) continue;
       bool needs_shape = false;
       for (Ort::ConstValueInfo output : outputs) {
@@ -2834,118 +3051,19 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
       }
       if (!needs_shape) continue;
 
-      std::optional<std::vector<int64_t>> out_shape;
-      std::optional<std::vector<std::vector<int64_t>>> out_shapes;
-
-      // Unary ops consuming input[0] shape.
-      auto unary = [&](auto&& fn) {
-        ++rule_attempted[op_type];
-        auto in_shape = get_in_shape(0, inputs);
-        if (!in_shape.has_value()) return;
-        out_shape = fn(*in_shape);
-        if (out_shape.has_value()) ++rule_fired[op_type];
+      ShapeRuleCtx ctx{
+          node, inputs, analysis.constants,
+          [&](size_t idx) { return get_in_shape(idx, inputs); },
+          lookup_shape_by_name,
       };
-
-      if (op_type == "Pad") {
-        unary([&](const auto& s) { return InferPadOutputShape(node, s, analysis.constants); });
-      } else if (op_type == "Reshape") {
-        ++rule_attempted[op_type];
-        auto in_shape = get_in_shape(0, inputs);
-        auto target = ResolveShapeRuleInt64Input(analysis.constants, node, 1, lookup_shape_by_name);
-        if (in_shape && target) {
-          out_shape = InferReshapeOutputShape(node, *in_shape, *target);
-          if (out_shape.has_value()) ++rule_fired[op_type];
-        }
-      } else if (op_type == "Transpose") {
-        unary([&](const auto& s) { return InferTransposeOutputShape(node, s); });
-      } else if (op_type == "Unsqueeze") {
-        unary([&](const auto& s) { return InferUnsqueezeOutputShape(node, s, analysis.constants); });
-      } else if (op_type == "Squeeze") {
-        unary([&](const auto& s) { return InferSqueezeOutputShape(node, s, analysis.constants); });
-      } else if (op_type == "Slice") {
-        unary([&](const auto& s) { return InferSliceOutputShape(node, s, analysis.constants); });
-      } else if (op_type == "Expand") {
-        ++rule_attempted[op_type];
-        auto in_shape = get_in_shape(0, inputs);
-        auto target = ResolveShapeRuleInt64Input(analysis.constants, node, 1, lookup_shape_by_name);
-        if (in_shape && target) {
-          out_shape = InferExpandOutputShape(*in_shape, *target);
-          if (out_shape.has_value()) ++rule_fired[op_type];
-        }
-      } else if (op_type == "Tile") {
-        unary([&](const auto& s) { return InferTileOutputShape(node, s, analysis.constants, node); });
-      } else if (op_type == "Cast" || op_type == "Identity") {
-        unary([&](const auto& s) -> std::optional<std::vector<int64_t>> { return s; });
-      } else if (op_type == "Gather") {
-        ++rule_attempted[op_type];
-        auto data_shape = get_in_shape(0, inputs);
-        auto idx_shape = get_in_shape(1, inputs);
-        if (data_shape && idx_shape) {
-          out_shape = InferGatherOutputShape(node, *data_shape, *idx_shape);
-          if (out_shape.has_value()) ++rule_fired[op_type];
-        }
-      } else if (op_type == "Concat") {
-        ++rule_attempted[op_type];
-        std::vector<std::optional<std::vector<int64_t>>> shapes;
-        shapes.reserve(inputs.size());
-        for (size_t i = 0; i < inputs.size(); ++i) shapes.push_back(get_in_shape(i, inputs));
-        out_shape = InferConcatOutputShape(node, shapes);
-        if (out_shape.has_value()) ++rule_fired[op_type];
-      } else if (op_type == "Split") {
-        ++rule_attempted[op_type];
-        auto in_shape = get_in_shape(0, inputs);
-        if (in_shape) {
-          out_shapes = InferSplitOutputShapes(node, *in_shape, analysis.constants);
-          if (out_shapes.has_value()) ++rule_fired[op_type];
-        }
-      } else if (op_type == "Where") {
-        ++rule_attempted[op_type];
-        std::vector<std::optional<std::vector<int64_t>>> shapes;
-        shapes.reserve(inputs.size());
-        for (size_t i = 0; i < inputs.size(); ++i) shapes.push_back(get_in_shape(i, inputs));
-        out_shape = InferBroadcastShape(shapes);
-        if (out_shape.has_value()) ++rule_fired[op_type];
-      } else if (op_type == "Add" || op_type == "Sub" || op_type == "Mul" ||
-                 op_type == "Div" || op_type == "Max" || op_type == "Min" ||
-                 op_type == "Pow" || op_type == "Equal" || op_type == "Greater" ||
-                 op_type == "GreaterOrEqual" || op_type == "Less" ||
-                 op_type == "LessOrEqual" || op_type == "And" || op_type == "Or") {
-        ++rule_attempted[op_type];
-        std::vector<std::optional<std::vector<int64_t>>> shapes;
-        shapes.reserve(inputs.size());
-        for (size_t i = 0; i < inputs.size(); ++i) shapes.push_back(get_in_shape(i, inputs));
-        out_shape = InferBroadcastShape(shapes);
-        if (out_shape.has_value()) ++rule_fired[op_type];
-      } else if (op_type == "Range") {
-        ++rule_attempted[op_type];
-        out_shape = InferRangeOutputShape(node, analysis.constants);
-        if (out_shape.has_value()) ++rule_fired[op_type];
-      } else if (op_type == "ConstantOfShape") {
-        ++rule_attempted[op_type];
-        auto shape = ResolveShapeRuleInt64Input(analysis.constants, node, 0, lookup_shape_by_name);
-        if (shape.has_value()) {
-          out_shape = InferConstantOfShapeOutputShape(*shape);
-        }
-        if (out_shape.has_value()) ++rule_fired[op_type];
-      } else {
-        continue;
-      }
-      if (out_shapes.has_value()) {
-        if (out_shapes->size() != outputs.size()) continue;
-        for (size_t i = 0; i < outputs.size(); ++i) {
-          if (outputs[i] == nullptr || !IsShapeFullyStatic((*out_shapes)[i])) continue;
-          const std::string out_name = outputs[i].GetName();
-          if (ort_static.count(out_name) || analysis.inferred_shapes.count(out_name)) continue;
-          analysis.inferred_shapes[out_name] = (*out_shapes)[i];
-        }
-        continue;
-      }
-      if (!out_shape.has_value() || !IsShapeFullyStatic(*out_shape)) continue;
-      for (Ort::ConstValueInfo output : outputs) {
-        if (output == nullptr) continue;
-        const std::string out_name = output.GetName();
-        if (ort_static.count(out_name) || analysis.inferred_shapes.count(out_name)) continue;
-        analysis.inferred_shapes[out_name] = *out_shape;
+      ++rule_attempted[op_type];
+      const ShapeRuleResult result = meta_op->shape_fn(ctx);
+      const bool fired = result.out_shape.has_value() || result.per_output.has_value();
+      if (fired) ++rule_fired[op_type];
+      if (result.per_output.has_value()) {
+        record_per_output(outputs, *result.per_output);
+      } else if (result.out_shape.has_value()) {
+        record_single(outputs, *result.out_shape);
       }
     } catch (...) {
       continue;
@@ -2990,37 +3108,7 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
   GGONNX_NOT_NULL(graph, "graph must not be null");
   const Ort::ConstGraph ort_graph{graph};
   MetaAnalysis analysis;
-  std::unordered_map<std::string, Ort::ConstNode> producer_by_output;
-  std::unordered_map<std::string, size_t> consumer_count;
-  std::unordered_map<std::string, std::vector<std::string>> consumer_ops_by_input;
-  std::unordered_set<std::string> graph_output_names;
-
-  for (Ort::ConstNode node : ort_graph.GetNodes()) {
-    for (Ort::ConstValueInfo input : node.GetInputs()) {
-      if (input != nullptr) {
-        const std::string name = input.GetName();
-        consumer_count[name]++;
-        consumer_ops_by_input[name].push_back(node.GetOperatorType());
-      }
-    }
-    for (Ort::ConstValueInfo input : node.GetImplicitInputs()) {
-      if (input != nullptr) {
-        const std::string name = input.GetName();
-        consumer_count[name]++;
-        consumer_ops_by_input[name].push_back(node.GetOperatorType());
-      }
-    }
-    for (Ort::ConstValueInfo output : node.GetOutputs()) {
-      if (output != nullptr) {
-        producer_by_output.emplace(output.GetName(), node);
-      }
-    }
-  }
-  for (Ort::ConstValueInfo output : ort_graph.GetOutputs()) {
-    if (output != nullptr) {
-      graph_output_names.insert(output.GetName());
-    }
-  }
+  const GraphIndex gi{ort_graph};
 
   for (Ort::ConstValueInfo input : ort_graph.GetInputs()) {
     if (input == nullptr || !input.IsConstantInitializer()) continue;
@@ -3061,7 +3149,7 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
       }
       const auto folded = TryFoldNode(analysis.constants, node);
       const auto shape_gather_folded =
-          folded.has_value() ? folded : EvalShapeTensorGather(analysis.constants, producer_by_output, node);
+          folded.has_value() ? folded : EvalShapeTensorGather(analysis.constants, gi, node);
       if (!shape_gather_folded.has_value()) continue;
       if (!folded.has_value() && node.GetOperatorType() == "Gather") {
         bool shape_only_consumers = true;
@@ -3070,9 +3158,7 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
           static const std::unordered_set<std::string> kShapeOnlyConsumers = {
               "Reshape", "Expand", "Unsqueeze", "Squeeze", "Concat", "Slice",
           };
-          const auto it = consumer_ops_by_input.find(std::string(output.GetName()));
-          if (it == consumer_ops_by_input.end()) continue;
-          for (const std::string& op_type : it->second) {
+          for (const std::string& op_type : gi.ConsumerOps(std::string(output.GetName()))) {
             if (kShapeOnlyConsumers.count(op_type) == 0) {
               shape_only_consumers = false;
               break;
@@ -3087,13 +3173,12 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
         const auto inputs = node.GetInputs();
         if (!inputs.empty() && inputs[0] != nullptr) {
           const std::string shape_output_name = inputs[0].GetName();
-          auto pit = producer_by_output.find(shape_output_name);
-          if (pit != producer_by_output.end() &&
-              pit->second != nullptr &&
-              pit->second.GetOperatorType() == "Shape" &&
-              consumer_count[shape_output_name] == 1 &&
-              graph_output_names.count(shape_output_name) == 0) {
-            analysis.folded_nodes.insert(NodeKey(pit->second));
+          Ort::ConstNode shape_producer = gi.ProducerOf(shape_output_name);
+          if (shape_producer != nullptr &&
+              shape_producer.GetOperatorType() == "Shape" &&
+              gi.ConsumerCount(shape_output_name) == 1 &&
+              !gi.IsGraphOutput(shape_output_name)) {
+            analysis.folded_nodes.insert(NodeKey(shape_producer));
           }
         }
       }
@@ -3107,15 +3192,7 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
   }
   PropagateInferredShapes(ort_graph, analysis);
 
-  DetectShuffleTripleFusions(ort_graph, analysis.constants, analysis.fusions);
-  // WindowMaskAdd runs before QKVSplit: the mask-apply rank-5 bubble sits
-  // between the QKV Gathers in topological order, so fusing it out first
-  // lets QKVSplit's span check clear the (now much shorter) span.
-  DetectWindowMaskAddFusions(ort_graph, analysis.constants, analysis.folded_nodes,
-                             analysis.fusions);
-  DetectQKVSplitFusions(ort_graph, analysis.constants, analysis.folded_nodes, analysis.fusions);
-  DetectPadConvFusions(ort_graph, analysis.constants, analysis.fusions);
-  DetectConvBatchNormFusions(ort_graph, analysis.constants, analysis.fusions);
+  for (const FusionPass& pass : kFusionPasses) pass.run(gi, analysis);
 
   // A folded constant containing kUnknownShapeDimSentinel is symbolic — it only
   // makes sense as input to further constant folders that understand the
@@ -3157,17 +3234,11 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
       for (Ort::ConstValueInfo output : node.GetOutputs()) {
         if (output == nullptr) continue;
         const std::string output_name = output.GetName();
-        if (graph_output_names.count(output_name) > 0) {
+        if (gi.IsGraphOutput(output_name)) {
           all_consumers_folded = false;
           break;
         }
-        for (Ort::ConstNode consumer : ort_graph.GetNodes()) {
-          if (consumer == nullptr) continue;
-          bool consumes = false;
-          for (Ort::ConstValueInfo in : consumer.GetInputs()) {
-            if (in != nullptr && in.GetName() == output_name) { consumes = true; break; }
-          }
-          if (!consumes) continue;
+        for (Ort::ConstNode consumer : gi.Consumers(output_name)) {
           if (analysis.folded_nodes.count(NodeKey(consumer)) == 0) {
             all_consumers_folded = false;
             break;
