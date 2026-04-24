@@ -2154,6 +2154,17 @@ def test_shape_derived_concat_to_constantofshape(suite_tmpdir, ep_library: Path)
     got = ggml.run(["y"], inputs)[0]
     assert got.shape == (2, 5, 3)
     np.testing.assert_array_equal(got, expected)
+    # The shape-bound Gather->Unsqueeze value depends on runtime input `x`.
+    # Concat must not run inside a GGML partition that lacks `x` as a real
+    # subgraph input, otherwise the shape-bound constant upload will fail.
+    profile = end_profiling_profile(ggml)
+    node_events = [e for e in profile if e.get("cat") == "Node"]
+    cpu_concats = [
+        e for e in node_events
+        if e.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and e.get("args", {}).get("op_name") == "Concat"
+    ]
+    assert cpu_concats, f"expected Concat to stay on CPU, got profile: {profile}"
 
 
 def test_cast_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
@@ -2428,6 +2439,51 @@ def build_shape_concat_reshape_then_expand_model(tmpdir: Path) -> Path:
     return ensure_model(tmpdir, graph)
 
 
+def build_shape_concat_reshape_transpose_split_unsqueeze_model(tmpdir: Path) -> Path:
+    # Reshape target comes from Shape+Slice+Div+Concat, which ORT often leaves
+    # symbolic. meta_eval must propagate that shape through Reshape and
+    # Transpose, then infer all Split outputs so the downstream
+    # Split->Squeeze->Unsqueeze branch stays on GGML.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 12])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 1, 1, 3])
+
+    starts0 = helper.make_tensor("starts0", TensorProto.INT64, [1], [0])
+    ends0 = helper.make_tensor("ends0", TensorProto.INT64, [1], [1])
+    starts1 = helper.make_tensor("starts1", TensorProto.INT64, [1], [1])
+    ends1 = helper.make_tensor("ends1", TensorProto.INT64, [1], [2])
+    axes0 = helper.make_tensor("axes0", TensorProto.INT64, [1], [0])
+    steps0 = helper.make_tensor("steps0", TensorProto.INT64, [1], [1])
+    one = helper.make_tensor("one", TensorProto.INT64, [1], [1])
+    four = helper.make_tensor("four", TensorProto.INT64, [1], [4])
+    split_sizes = helper.make_tensor("split_sizes", TensorProto.INT64, [4], [1, 1, 1, 1])
+    squeeze_axes = helper.make_tensor("squeeze_axes", TensorProto.INT64, [1], [0])
+    unsqueeze_axes = helper.make_tensor("unsqueeze_axes", TensorProto.INT64, [1], [1])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts0", "ends0", "axes0", "steps0"], ["dim0"], name="slice_dim0"),
+        helper.make_node("Slice", ["shape", "starts1", "ends1", "axes0", "steps0"], ["dim1"], name="slice_dim1"),
+        helper.make_node("Div", ["dim1", "four"], ["dim1_div4"], name="div_dim1"),
+        helper.make_node("Concat", ["dim0", "four", "one", "dim1_div4"], ["target_shape"], name="shape_concat", axis=0),
+        helper.make_node("Reshape", ["x", "target_shape"], ["reshaped"], name="reshape_0"),
+        helper.make_node("Transpose", ["reshaped"], ["transposed"], name="transpose_0", perm=[1, 0, 2, 3]),
+        helper.make_node("Split", ["transposed", "split_sizes"], ["s0", "s1", "s2", "s3"], name="split_0", axis=0),
+        helper.make_node("Squeeze", ["s2", "squeeze_axes"], ["sq"], name="squeeze_0"),
+        helper.make_node("Unsqueeze", ["sq", "unsqueeze_axes"], ["y"], name="unsqueeze_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "shape_concat_reshape_transpose_split_unsqueeze",
+        [x],
+        [y],
+        initializer=[
+            starts0, ends0, starts1, ends1, axes0, steps0,
+            one, four, split_sizes, squeeze_axes, unsqueeze_axes,
+        ],
+    )
+    return ensure_model(tmpdir, graph)
+
+
 def test_shape_concat_reshape_transpose_slice_runs_on_ggml(
         suite_tmpdir, ep_library: Path) -> None:
     model_path = build_shape_concat_reshape_then_slice_chain_model(suite_tmpdir)
@@ -2472,4 +2528,26 @@ def test_shape_concat_reshape_then_expand_runs_on_ggml(
         and e.get("args", {}).get("op_name") == "Expand"
     ]
     assert not cpu_expands, f"Expand fell back to CPU: {cpu_expands}"
+    assert "GGMLExecutionProvider" in providers, "no GGML partition executed"
+
+
+def test_shape_concat_reshape_transpose_split_unsqueeze_runs_on_ggml(
+        suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_shape_concat_reshape_transpose_split_unsqueeze_model(suite_tmpdir)
+    rng = np.random.default_rng(61)
+    inputs = {"x": rng.standard_normal((2, 12)).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    expected = cpu.run(["y"], inputs)[0]
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    profile = end_profiling_profile(ggml)
+    node_events = [e for e in profile if e.get("cat") == "Node"]
+    providers = {e.get("args", {}).get("provider") for e in node_events}
+    cpu_ops = [
+        e for e in node_events
+        if e.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and e.get("args", {}).get("op_name") in {"Split", "Squeeze", "Unsqueeze"}
+    ]
+    assert not cpu_ops, f"Split/Squeeze/Unsqueeze fell back to CPU: {cpu_ops}"
     assert "GGMLExecutionProvider" in providers, "no GGML partition executed"

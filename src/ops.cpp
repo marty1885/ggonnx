@@ -3042,6 +3042,7 @@ EmitResult EmitTransposeNode(ggml_context* ctx,
 SupportResult IsSupportedConcatNode(Ort::ConstNode node, const MetaAnalysis* meta) {
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   SUPPORT_CHECK(!inputs.empty() && outputs.size() == 1 && node.GetImplicitInputs().size() == 0,
                 "Concat: wrong input/output count");
   SUPPORT_CHECK(outputs[0] != nullptr, "Concat: null output");
@@ -3066,6 +3067,12 @@ SupportResult IsSupportedConcatNode(Ort::ConstNode node, const MetaAnalysis* met
                       " != output type " + std::to_string(out.element_type));
     SUPPORT_CHECK(meta.dims.size() == rank, "Concat: input rank mismatch");
     SUPPORT_CHECK(rankSupportedByGGML(meta), "Concat: input rank exceeds GGML_MAX_DIMS");
+    if (constants != nullptr) {
+      auto it = constants->find(std::string(input.GetName()));
+      if (it != constants->end() && !it->second.dim_bindings.empty()) {
+        return support_error("Concat: shape-bound constant inputs are not supported");
+      }
+    }
   }
   return support_ok();
 }
@@ -3383,12 +3390,16 @@ SupportResult IsSupportedSplitNode(Ort::ConstNode node, const MetaAnalysis* meta
   const TensorMetadata data = getTensorMetadata(inputs[0]);
   if (data.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
   if (!rankSupportedByGGML(data) || data.dims.empty()) return false;
+  const auto resolved_in = (meta != nullptr) ? ResolveShape(inputs[0], *meta) : std::nullopt;
+  if (!resolved_in.has_value()) return false;
+  if (resolved_in->size() != data.dims.size()) return false;
+  if (!rankSupportedByGGML({data.element_type, *resolved_in})) return false;
 
-  const int64_t rank = static_cast<int64_t>(data.dims.size());
+  const int64_t rank = static_cast<int64_t>(resolved_in->size());
   int64_t axis = readNodeAttribute<int64_t>(node, "axis").value_or(0);
   if (axis < 0) axis += rank;
   if (axis < 0 || axis >= rank) return false;
-  if (data.dims[axis] < 0) return false;
+  if ((*resolved_in)[static_cast<size_t>(axis)] < 0) return false;
 
   // Split sizes: prefer the `split` input (opset 13+), then the attribute
   // (opset 2/11), then equal division.
@@ -3401,8 +3412,8 @@ SupportResult IsSupportedSplitNode(Ort::ConstNode node, const MetaAnalysis* meta
     split_sizes = *attr;
   } else {
     const int64_t n = static_cast<int64_t>(outputs.size());
-    if (n <= 0 || data.dims[axis] % n != 0) return false;
-    split_sizes.assign(n, data.dims[axis] / n);
+    if (n <= 0 || (*resolved_in)[static_cast<size_t>(axis)] % n != 0) return false;
+    split_sizes.assign(n, (*resolved_in)[static_cast<size_t>(axis)] / n);
   }
   if (split_sizes.size() != outputs.size()) return false;
   int64_t total = 0;
@@ -3410,13 +3421,20 @@ SupportResult IsSupportedSplitNode(Ort::ConstNode node, const MetaAnalysis* meta
     if (s < 0) return false;
     total += s;
   }
-  if (total != data.dims[axis]) return false;
+  if (total != (*resolved_in)[static_cast<size_t>(axis)]) return false;
 
-  for (Ort::ConstValueInfo out : outputs) {
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    Ort::ConstValueInfo out = outputs[i];
     if (out == nullptr) return false;
-    const TensorMetadata meta = getTensorMetadata(out);
-    if (meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
-    if (!rankSupportedByGGML(meta)) return false;
+    const TensorMetadata out_meta = getTensorMetadata(out);
+    if (out_meta.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
+    const auto resolved_out = (meta != nullptr) ? ResolveShape(out, *meta) : std::nullopt;
+    if (!resolved_out.has_value()) return false;
+    if (resolved_out->size() != resolved_in->size()) return false;
+    if (!rankSupportedByGGML({out_meta.element_type, *resolved_out})) return false;
+    auto expected = *resolved_in;
+    expected[static_cast<size_t>(axis)] = split_sizes[i];
+    if (*resolved_out != expected) return false;
   }
   return true;
 }
@@ -3426,8 +3444,11 @@ void CompileSplitAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  const TensorMetadata data = getTensorMetadata(inputs[0]);
-  const int64_t rank = static_cast<int64_t>(data.dims.size());
+  GGONNX_ASSERT(meta != nullptr, "Split compile requires meta analysis");
+  const auto resolved_in = ResolveShape(inputs[0], *meta);
+  GGONNX_ASSERT(resolved_in.has_value(),
+                "Split compile: input shape must be resolvable (support predicate invariant)");
+  const int64_t rank = static_cast<int64_t>(resolved_in->size());
   int64_t axis = readNodeAttribute<int64_t>(node, "axis").value_or(0);
   if (axis < 0) axis += rank;
 
@@ -3441,7 +3462,7 @@ void CompileSplitAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
     attrs.lengths = *a;
   } else {
     const int64_t n = static_cast<int64_t>(outputs.size());
-    attrs.lengths.assign(n, data.dims[axis] / n);
+    attrs.lengths.assign(n, (*resolved_in)[static_cast<size_t>(axis)] / n);
   }
   compiled_node->attrs = attrs;
 }

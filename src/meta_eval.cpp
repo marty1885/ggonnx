@@ -2127,6 +2127,58 @@ std::optional<std::vector<int64_t>> InferConcatOutputShape(
   return out;
 }
 
+// Shape rule: Split. Produces one fully-static shape per output when the input
+// shape and split sizes are known.
+std::optional<std::vector<std::vector<int64_t>>> InferSplitOutputShapes(
+    Ort::ConstNode node,
+    const std::vector<int64_t>& input_shape,
+    const ConstantValueMap& constants) {
+  const auto outputs = node.GetOutputs();
+  if (outputs.empty()) return std::nullopt;
+  const int64_t rank = static_cast<int64_t>(input_shape.size());
+  if (rank == 0) return std::nullopt;
+
+  int64_t axis = ReadInt64Attr(node, "axis").value_or(0);
+  if (axis < 0) axis += rank;
+  if (axis < 0 || axis >= rank) return std::nullopt;
+  const int64_t axis_dim = input_shape[static_cast<size_t>(axis)];
+  if (axis_dim < 0) return std::nullopt;
+
+  const auto inputs = node.GetInputs();
+  std::vector<int64_t> split_sizes;
+  if (inputs.size() >= 2 && inputs[1] != nullptr) {
+    auto splits = ReadConstantInt64Input(constants, node, 1);
+    if (!splits.has_value()) return std::nullopt;
+    split_sizes = std::move(*splits);
+  } else {
+    Ort::ConstOpAttr attr{nullptr};
+    const Ort::Status status = node.GetAttributeByName("split", attr);
+    if (status.IsOK() && attr != nullptr) {
+      Ort::ThrowOnError(attr.GetValueArray(split_sizes));
+    } else {
+      const int64_t n = static_cast<int64_t>(outputs.size());
+      if (n <= 0 || axis_dim % n != 0) return std::nullopt;
+      split_sizes.assign(static_cast<size_t>(n), axis_dim / n);
+    }
+  }
+  if (split_sizes.size() != outputs.size()) return std::nullopt;
+  int64_t total = 0;
+  for (int64_t s : split_sizes) {
+    if (s < 0) return std::nullopt;
+    total += s;
+  }
+  if (total != axis_dim) return std::nullopt;
+
+  std::vector<std::vector<int64_t>> out_shapes;
+  out_shapes.reserve(outputs.size());
+  for (int64_t s : split_sizes) {
+    auto out = input_shape;
+    out[static_cast<size_t>(axis)] = s;
+    out_shapes.push_back(std::move(out));
+  }
+  return out_shapes;
+}
+
 // Shape rule: Slice (float or int tensors). Mirrors CompileSliceAttributes
 // clamping. All of starts/ends/axes/steps must be constants.
 std::optional<std::vector<int64_t>> InferSliceOutputShape(
@@ -2344,11 +2396,20 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
       const auto inputs_rng = node.GetInputs();
       const std::vector<Ort::ConstValueInfo> inputs(inputs_rng.begin(), inputs_rng.end());
       const auto outputs = node.GetOutputs();
-      if (outputs.empty() || outputs[0] == nullptr) continue;
-      const std::string out_name = outputs[0].GetName();
-      if (ort_static.count(out_name) || analysis.inferred_shapes.count(out_name)) continue;
+      if (outputs.empty()) continue;
+      bool needs_shape = false;
+      for (Ort::ConstValueInfo output : outputs) {
+        if (output == nullptr) continue;
+        const std::string out_name = output.GetName();
+        if (ort_static.count(out_name) == 0 && analysis.inferred_shapes.count(out_name) == 0) {
+          needs_shape = true;
+          break;
+        }
+      }
+      if (!needs_shape) continue;
 
       std::optional<std::vector<int64_t>> out_shape;
+      std::optional<std::vector<std::vector<int64_t>>> out_shapes;
 
       // Unary ops consuming input[0] shape.
       auto unary = [&](auto&& fn) {
@@ -2404,6 +2465,13 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
         for (size_t i = 0; i < inputs.size(); ++i) shapes.push_back(get_in_shape(i, inputs));
         out_shape = InferConcatOutputShape(node, shapes);
         if (out_shape.has_value()) ++rule_fired[op_type];
+      } else if (op_type == "Split") {
+        ++rule_attempted[op_type];
+        auto in_shape = get_in_shape(0, inputs);
+        if (in_shape) {
+          out_shapes = InferSplitOutputShapes(node, *in_shape, analysis.constants);
+          if (out_shapes.has_value()) ++rule_fired[op_type];
+        }
       } else if (op_type == "ConstantOfShape") {
         ++rule_attempted[op_type];
         auto shape = ResolveShapeRuleInt64Input(analysis.constants, node, 0, lookup_shape_by_name);
@@ -2414,8 +2482,23 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
       } else {
         continue;
       }
+      if (out_shapes.has_value()) {
+        if (out_shapes->size() != outputs.size()) continue;
+        for (size_t i = 0; i < outputs.size(); ++i) {
+          if (outputs[i] == nullptr || !IsShapeFullyStatic((*out_shapes)[i])) continue;
+          const std::string out_name = outputs[i].GetName();
+          if (ort_static.count(out_name) || analysis.inferred_shapes.count(out_name)) continue;
+          analysis.inferred_shapes[out_name] = (*out_shapes)[i];
+        }
+        continue;
+      }
       if (!out_shape.has_value() || !IsShapeFullyStatic(*out_shape)) continue;
-      analysis.inferred_shapes[out_name] = std::move(*out_shape);
+      for (Ort::ConstValueInfo output : outputs) {
+        if (output == nullptr) continue;
+        const std::string out_name = output.GetName();
+        if (ort_static.count(out_name) || analysis.inferred_shapes.count(out_name)) continue;
+        analysis.inferred_shapes[out_name] = *out_shape;
+      }
     } catch (...) {
       continue;
     }
