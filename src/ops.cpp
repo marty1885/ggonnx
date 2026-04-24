@@ -2144,29 +2144,23 @@ SupportResult IsSupportedSqueezeNode(Ort::ConstNode node, const MetaAnalysis* me
   const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if ((inputs.size() != 1 && inputs.size() != 2) || outputs.size() != 1 ||
-      node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (inputs[0] == nullptr || outputs[0] == nullptr) {
-    return false;
-  }
+  SUPPORT_CHECK((inputs.size() == 1 || inputs.size() == 2) && outputs.size() == 1 &&
+                    node.GetImplicitInputs().size() == 0,
+                "Squeeze/Unsqueeze: unexpected arity");
+  SUPPORT_CHECK(inputs[0] != nullptr && outputs[0] != nullptr,
+                "Squeeze/Unsqueeze: null input/output");
   const TensorMetadata in = getTensorMetadata(inputs[0]);
   const TensorMetadata out = getTensorMetadata(outputs[0]);
-  if (in.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      out.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
-  }
-  if (!rankSupportedByGGML(in) || !rankSupportedByGGML(out)) {
-    return false;
-  }
+  SUPPORT_CHECK(in.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    out.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "Squeeze/Unsqueeze: only float supported");
+  SUPPORT_CHECK(rankSupportedByGGML(in) && rankSupportedByGGML(out),
+                "Squeeze/Unsqueeze: rank unsupported by ggml");
   // Some ORT If-subgraph values arrive with no static rank at all. GGML can
   // still represent the runtime tensor, but Squeeze/Unsqueeze axis semantics
   // become ambiguous enough to mis-lower those nodes. Leave them on CPU rather
   // than speculating and risking a native crash or wrong shape.
-  if (in.dims.empty()) {
-    return false;
-  }
+  SUPPORT_CHECK(!in.dims.empty(), "Squeeze/Unsqueeze: input has no static rank");
   // If axes are a runtime input (not a constant) we fall back to baked output
   // dims — those must be resolvable either via ORT or our shape propagation.
   const bool has_const_axes =
@@ -2175,7 +2169,8 @@ SupportResult IsSupportedSqueezeNode(Ort::ConstNode node, const MetaAnalysis* me
       readNodeAttribute<std::vector<int64_t>>(node, "axes").has_value();
   if (!has_const_axes) {
     const auto resolved = (meta != nullptr) ? ResolveShape(outputs[0], *meta) : std::nullopt;
-    if (!resolved.has_value()) return false;
+    SUPPORT_CHECK(resolved.has_value(),
+                  "Squeeze/Unsqueeze: dynamic axes and unresolved output shape");
   }
   return true;
 }
@@ -2501,35 +2496,27 @@ SupportResult IsSupportedPadNode(Ort::ConstNode node, const MetaAnalysis* meta) 
   const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
-  if (inputs.empty() || inputs.size() > 4 || outputs.size() != 1 || node.GetImplicitInputs().size() != 0) {
-    return false;
-  }
-  if (inputs[0] == nullptr || outputs[0] == nullptr) {
-    return false;
-  }
+  SUPPORT_CHECK(!inputs.empty() && inputs.size() <= 4, "Pad: unexpected input arity");
+  SUPPORT_CHECK(outputs.size() == 1, "Pad: unexpected output arity");
+  SUPPORT_CHECK(node.GetImplicitInputs().size() == 0, "Pad: implicit inputs not supported");
+  SUPPORT_CHECK(inputs[0] != nullptr && outputs[0] != nullptr, "Pad: null input/output");
 
   const TensorMetadata x = getTensorMetadata(inputs[0]);
   const TensorMetadata y = getTensorMetadata(outputs[0]);
-  if (x.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-      y.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-    return false;
-  }
-  if (x.dims.size() != 4 || y.dims.size() != 4) {
-    return false;
-  }
-  if (!rankSupportedByGGML(x) || !rankSupportedByGGML(y)) {
-    return false;
-  }
+  SUPPORT_CHECK(x.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    y.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "Pad: only float supported");
+  SUPPORT_CHECK(!x.dims.empty() && x.dims.size() <= 4 && y.dims.size() == x.dims.size(),
+                "Pad: rank must match between input/output and be in [1,4]");
+  SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(y), "Pad: rank unsupported by ggml");
 
   const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("constant");
-  if (mode != "reflect" && mode != "constant") {
-    return false;
-  }
+  SUPPORT_CHECK(mode == "reflect" || mode == "constant",
+                std::string("Pad: mode ") + mode + " not supported");
 
   const auto pads = readPadVector(node, constants);
-  if (!pads.has_value() || pads->size() != 8) {
-    return false;
-  }
+  SUPPORT_CHECK(pads.has_value(), "Pad: pads not statically known");
+  SUPPORT_CHECK(pads->size() == x.dims.size() * 2, "Pad: pads length != 2*rank");
 
   // Per-ONNX-axis validation. Pad can be nonzero on any subset of axes; reflect
   // mode additionally requires non-negative pads strictly smaller than the src
@@ -2541,16 +2528,18 @@ SupportResult IsSupportedPadNode(Ort::ConstNode node, const MetaAnalysis* meta) 
     const int64_t end = (*pads)[a + rank];
     if (begin == 0 && end == 0) continue;
     ++active_axes;
-    if (mode == "reflect" && (begin < 0 || end < 0)) return false;
+    SUPPORT_CHECK(mode != "reflect" || (begin >= 0 && end >= 0),
+                  "Pad: reflect mode requires non-negative pads");
     if (x.dims[a] < 0) continue;  // unresolved dim: trust the export
-    if (begin + end + x.dims[a] <= 0) return false;
-    if (mode == "reflect" && (begin >= x.dims[a] || end >= x.dims[a])) return false;
+    SUPPORT_CHECK(begin + end + x.dims[a] > 0, "Pad: non-positive output dim");
+    SUPPORT_CHECK(mode != "reflect" || (begin < x.dims[a] && end < x.dims[a]),
+                  "Pad: reflect pad >= src length");
   }
   // Reflect support is 1D in ggml, so we pad one axis at a time; ≤ 2 active
   // axes keeps the emitted sequence short. Constant mode uses ggml_pad_ext in
   // one shot and already tolerates any axis set — keep the same cap for
   // simplicity.
-  if (active_axes > 2) return false;
+  SUPPORT_CHECK(active_axes <= 2, "Pad: >2 active axes");
 
   if (mode == "constant") {
     // Only zero fill is supported. Accept an absent constant input or one
@@ -2558,9 +2547,9 @@ SupportResult IsSupportedPadNode(Ort::ConstNode node, const MetaAnalysis* meta) 
     const auto node_inputs = node.GetInputs();
     if (node_inputs.size() >= 3 && node_inputs[2] != nullptr) {
       const auto v = readConstantInputArray<float>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, constants);
-      if (!v) return false;
-      if (v->size() > 1) return false;
-      if (!v->empty() && (*v)[0] != 0.0f) return false;
+      SUPPORT_CHECK(v.has_value(), "Pad: constant_value not statically known");
+      SUPPORT_CHECK(v->size() <= 1, "Pad: constant_value must be scalar");
+      SUPPORT_CHECK(v->empty() || (*v)[0] == 0.0f, "Pad: non-zero constant_value");
     }
   }
 
@@ -2571,11 +2560,11 @@ void CompilePadAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const Me
   const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto pads = readPadVector(node, constants);
-  GGONNX_ASSERT(pads.has_value() && pads->size() == 8,
-                "Pad node must provide 8-element pads");
   const auto inputs = node.GetInputs();
   const TensorMetadata x = getTensorMetadata(inputs[0]);
   const int rank = static_cast<int>(x.dims.size());
+  GGONNX_ASSERT(pads.has_value() && static_cast<int>(pads->size()) == rank * 2,
+                "Pad node must provide 2*rank pads");
   const std::string mode = readNodeAttribute<std::string>(node, "mode").value_or("constant");
 
   NodeDesc::PadAttrs attrs;
