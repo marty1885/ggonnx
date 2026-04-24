@@ -291,25 +291,13 @@ SupportResult IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_
   SUPPORT_CHECK(broadcastSupportedByGGML(rhs.dims, out.dims),
                 "right operand cannot broadcast to output shape");
 
-  // GGML's binary ops require the second operand to broadcast into the first
-  // (the first operand's shape determines the output). For commutative ops we
-  // can swap operands at emit time, but only if one operand can serve as the
-  // full output shape directly. ONNX patterns where both operands broadcast
-  // into a third shape (e.g. [1,2] + [2,1] -> [2,2]) are not representable by
-  // ggml's binary kernels.
-  const bool commutative =
-      (op_type == "Add" || op_type == "Mul" || op_type == "Max" || op_type == "Min");
-  if (commutative) {
-    const bool rhs_into_lhs = broadcastSupportedByGGML(rhs.dims, lhs.dims);
-    const bool lhs_into_rhs = broadcastSupportedByGGML(lhs.dims, rhs.dims);
-    SUPPORT_CHECK(rhs_into_lhs || lhs_into_rhs,
-                  "GGML cannot realize this ONNX broadcast because neither operand can be the output shape");
-  } else {
-    SUPPORT_CHECK(ToPaddedGGMLDims(lhs.dims) == ToPaddedGGMLDims(out.dims),
-                  "Sub/Div require lhs shape to match the output exactly");
-    SUPPORT_CHECK(broadcastSupportedByGGML(rhs.dims, lhs.dims),
-                  "Sub/Div require rhs to broadcast directly into lhs");
-  }
+  // GGML binary ops require operand_a to BE the output shape and operand_b to
+  // broadcast into it. ONNX allows both operands to broadcast into a third
+  // (output) shape. EmitElementwiseBinaryNode bridges the gap by inserting a
+  // ggml_repeat_4d on whichever side doesn't already match the output. So the
+  // sufficient condition here is just "both operands broadcast into output",
+  // which the two checks above already enforce. No further restriction is
+  // needed for either commutative or non-commutative ops.
 
   return support_ok();
 }
@@ -452,28 +440,49 @@ EmitResult EmitElementwiseBinaryNode(ggml_context* ctx,
   }
 
   const std::string_view op_type(node.op_type);
-  // GGML's elementwise binary ops require the second operand to broadcast into
-  // the first. For commutative ops we can swap when the caller passed the
-  // smaller tensor first (e.g. `bias [N] + matmul [B, S, N]`).
   const bool commutative =
       (op_type == "Add" || op_type == "Mul" || op_type == "Max" || op_type == "Min");
-  if (commutative) {
-    if (!ggml_can_repeat(rhs, lhs)) {
-      if (ggml_can_repeat(lhs, rhs)) {
-        std::swap(lhs, rhs);
-      } else {
-        throw std::runtime_error(
-            "GGML cannot realize ONNX broadcast for '" + std::string(op_type) + "': lhs " +
-            FormatDims(ToOnnxDims(lhs)) + ", rhs " + FormatDims(ToOnnxDims(rhs)) +
-            ". ONNX allows both operands to broadcast into a third shape, but ggml requires one operand to be the output shape.");
-      }
-    }
-  } else if (!ggml_can_repeat(rhs, lhs)) {
-    throw std::runtime_error(
-        "GGML cannot realize broadcast for '" + std::string(op_type) + "': rhs " +
-        FormatDims(ToOnnxDims(rhs)) + " does not broadcast into lhs " +
-        FormatDims(ToOnnxDims(lhs)));
+
+  // ONNX elementwise binary uses NumPy broadcasting: both operands broadcast
+  // into a third (output) shape. ggml's binary kernels are stricter — the
+  // first operand IS the output shape and the second only broadcasts into it.
+  // For ONNX patterns where neither side is the output (e.g. [L] * [L,1] ->
+  // [L,L] for relative-position attention bias), we materialize the missing
+  // side via ggml_repeat_4d. The support check verified both inputs broadcast
+  // into the output shape per ONNX rules, so out_ne computed here is well
+  // defined; for the common case where one side already matches we skip the
+  // repeat and emit the same code as before.
+  int64_t out_ne[GGML_MAX_DIMS];
+  for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+    out_ne[i] = std::max(lhs->ne[i], rhs->ne[i]);
   }
+  auto matches = [&](const ggml_tensor* t) {
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+      if (t->ne[i] != out_ne[i]) return false;
+    }
+    return true;
+  };
+  if (commutative && !matches(lhs) && matches(rhs)) {
+    std::swap(lhs, rhs);
+  }
+  if (!matches(lhs)) {
+    lhs = ggml_repeat_4d(ctx, lhs, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+  }
+  if (!ggml_can_repeat(rhs, lhs)) {
+    // Defensive: rhs should broadcast into the output by support-check
+    // construction, but symbolic-dim leniency in capability can let an edge
+    // case through. Materialize rhs explicitly rather than tripping the
+    // ggml_add/mul internal assert.
+    rhs = ggml_repeat_4d(ctx, rhs, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+  }
+  // ggml_is_contiguous short-circuits to true when ne[0]==1 even if nb[0] is
+  // larger than the element size (permuted view). CPU binary kernels still
+  // assert nb00 == sizeof(elem), so check nb[0] directly and materialize.
+  auto needs_cont = [](const ggml_tensor* t) {
+    return t->nb[0] != ggml_type_size(t->type);
+  };
+  if (needs_cont(lhs)) lhs = ggml_cont(ctx, lhs);
+  if (needs_cont(rhs)) rhs = ggml_cont(ctx, rhs);
   if (op_type == "Add") {
     return EmitOutputs{ggml_add(ctx, lhs, rhs)};
   } else if (op_type == "Sub") {
@@ -1702,6 +1711,10 @@ EmitResult EmitConvNode(ggml_context* ctx,
     //   X [N,C,W]      -> [N,C,1,W]
     //   W [OC,IC,K]    -> [OC,IC,1,K]
     //   Y [N,OC,OW]    -> [N,OC,1,OW] -> squeeze H
+    // ggml_reshape_* asserts contiguous; transposed/strided producers (common
+    // upstream of attention/embedding paths) need an explicit cont first.
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+    if (!ggml_is_contiguous(w)) w = ggml_cont(ctx, w);
     ggml_tensor* x_4d = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], x->ne[2]);
     ggml_tensor* w_4d = ggml_reshape_4d(ctx, w, w->ne[0], 1, w->ne[1], w->ne[2]);
     ggml_tensor* out_4d = attrs->is_depthwise
@@ -2075,9 +2088,20 @@ EmitResult EmitReshapeNode(ggml_context* ctx,
   // time disagrees with the actual runtime input shape. Throw here so the error
   // surfaces as a catchable ORT status rather than a process abort.
   if (ggml_nelements(data) != target[0] * target[1] * target[2] * target[3]) {
+    std::string dims_str;
+    for (size_t i = 0; i < attrs->onnx_dims.size(); ++i) {
+      if (i) dims_str += ",";
+      dims_str += std::to_string(attrs->onnx_dims[i]);
+    }
+    std::string in_dims;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+      if (i) in_dims += ",";
+      in_dims += std::to_string(data->ne[i]);
+    }
     throw std::runtime_error(
-        "reshape element count mismatch: input has " + std::to_string(ggml_nelements(data)) +
-        " elements but target shape has " +
+        "reshape element count mismatch at '" + node.name + "': input ne=[" +
+        in_dims + "] (" + std::to_string(ggml_nelements(data)) +
+        " elements) but target shape [" + dims_str + "] has " +
         std::to_string(target[0] * target[1] * target[2] * target[3]));
   }
   ggml_tensor* src = ggml_is_contiguous(data) ? data : ggml_cont(ctx, data);
@@ -3162,9 +3186,12 @@ SupportResult IsSupportedSliceNode(Ort::ConstNode node, const MetaAnalysis* meta
   if (data.dims.size() == 0) {
     return support_error("Slice: scalar data not supported");
   }
-  // Resolve the data tensor's concrete shape, accepting either ORT's static
-  // dims or a shape we propagated through Pad/Reshape in meta_eval. If
-  // neither is available, we can't materialize the view at compile time.
+  // Require fully-static input dims so we can prove the sliced output is
+  // non-degenerate at compile time. Runtime-0-element slices cascade into
+  // downstream ggml ops whose allocator can't size a zero tensor (tripping
+  // ggml_backend_tensor_alloc's buffer==NULL assert). If we ever gain a
+  // way to short-circuit downstream propagation for zero-sized intermediates
+  // we can revisit.
   const auto resolved = (meta != nullptr) ? ResolveShape(inputs[0], *meta) : std::nullopt;
   if (!resolved.has_value()) {
     return support_error("Slice: data has dynamic dims");
@@ -3202,7 +3229,7 @@ SupportResult IsSupportedSliceNode(Ort::ConstNode node, const MetaAnalysis* meta
       axes_resolved.resize(starts->size());
       for (size_t i = 0; i < starts->size(); ++i) axes_resolved[i] = static_cast<int64_t>(i);
     }
-    const int64_t rank = static_cast<int64_t>(resolved->size());
+    const int64_t rank = static_cast<int64_t>(data.dims.size());
     for (size_t k = 0; k < steps->size(); ++k) {
       const int64_t s = (*steps)[k];
       if (s == 0) {
@@ -3231,13 +3258,9 @@ void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
   const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
-  // Re-resolve the data shape (support predicate already validated it's known).
-  // Prefer the meta-eval inferred shape when ORT's view is dynamic.
-  const auto resolved = (meta != nullptr) ? ResolveShape(inputs[0], *meta) : std::nullopt;
-  GGONNX_ASSERT(resolved.has_value(),
-                "Slice compile: data shape must have been resolvable (support predicate invariant)");
-  const std::vector<int64_t>& data_dims = *resolved;
-  const int64_t rank = static_cast<int64_t>(data_dims.size());
+  const TensorMetadata data = getTensorMetadata(inputs[0]);
+  const int64_t rank = static_cast<int64_t>(data.dims.size());
+  GGONNX_ASSERT(rank > 0, "Slice compile: rank must be > 0 (predicate invariant)");
 
   const auto starts = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
   const auto ends = readConstantInputArray<int64_t>(node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
@@ -3264,44 +3287,17 @@ void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
   }
 
   NodeDesc::SliceAttrs attrs;
-  attrs.ggml_starts.fill(0);
-  attrs.ggml_steps.fill(1);
-  // Default: each dim passes through unsliced.
-  for (int64_t i = 0; i < rank; ++i) {
-    attrs.ggml_ne[rank - 1 - i] = data_dims[i];
-  }
-  for (int i = rank; i < GGML_MAX_DIMS; ++i) {
-    attrs.ggml_ne[i] = 1;
-  }
-
+  attrs.onnx_rank = static_cast<int>(rank);
   for (size_t k = 0; k < axes.size(); ++k) {
     int64_t onnx_axis = axes[k];
     if (onnx_axis < 0) onnx_axis += rank;
     GGONNX_ASSERT(onnx_axis >= 0 && onnx_axis < rank,
                   "Slice compile: axis out of range");
-    const int64_t dim = data_dims[onnx_axis];
-    const int64_t step = steps[k];
-    GGONNX_ASSERT(step > 0,
-                  "Slice compile: support predicate must reject non-positive step");
-
-    // ONNX clamping rules for positive step: clamp start to [0, dim],
-    // clamp end to [0, dim]. Output length = ceil((e - s) / step).
-    auto clamp = [](int64_t v, int64_t lo, int64_t hi) {
-      return v < lo ? lo : (v > hi ? hi : v);
-    };
-    int64_t s = (*starts)[k];
-    int64_t e = (*ends)[k];
-    if (s < 0) s += dim;
-    if (e < 0) e += dim;
-    s = clamp(s, 0, dim);
-    e = clamp(e, 0, dim);
-    const int64_t span = e > s ? e - s : 0;
-    const int64_t length = span > 0 ? (span + step - 1) / step : 0;
-
     const int ggml_axis = static_cast<int>(rank - 1 - onnx_axis);
-    attrs.ggml_starts[ggml_axis] = s;
-    attrs.ggml_ne[ggml_axis] = length;
-    attrs.ggml_steps[ggml_axis] = step;
+    attrs.raw_start[ggml_axis] = (*starts)[k];
+    attrs.raw_end[ggml_axis] = (*ends)[k];
+    attrs.raw_step[ggml_axis] = steps[k];
+    attrs.sliced[ggml_axis] = true;
   }
 
   compiled_node->attrs = attrs;
@@ -3315,6 +3311,12 @@ EmitResult EmitSliceNode(ggml_context* ctx,
   GGONNX_ASSERT(attrs != nullptr, "compiled Slice node missing attributes");
   ggml_tensor* data = values[node.inputs[0]];
   GGONNX_NOT_NULL(data, "compiled Slice node missing GGML data input");
+  if (std::getenv("GGONNX_TRACE_SLICE") != nullptr) {
+    fprintf(stderr, "[slice] node=%s data ne=[%lld,%lld,%lld,%lld]\n",
+            node.name.c_str(),
+            (long long)data->ne[0], (long long)data->ne[1],
+            (long long)data->ne[2], (long long)data->ne[3]);
+  }
 
   // ggml_view_*d forces nb[0]=type_size, so the source's innermost stride
   // must already be the element size; otherwise the view would silently
@@ -3324,27 +3326,59 @@ EmitResult EmitSliceNode(ggml_context* ctx,
     data = ggml_cont(ctx, data);
   }
 
-  // Per-axis stride in the view = source nb * step. step==1 axes inherit the
-  // source stride directly (rectangular view); step>1 multiplies it.
-  const size_t offset_bytes =
-      static_cast<size_t>(attrs->ggml_starts[0]) * data->nb[0] +
-      static_cast<size_t>(attrs->ggml_starts[1]) * data->nb[1] +
-      static_cast<size_t>(attrs->ggml_starts[2]) * data->nb[2] +
-      static_cast<size_t>(attrs->ggml_starts[3]) * data->nb[3];
+  // Resolve per-axis start/length/step against the runtime tensor shape.
+  // Axes that the ONNX spec didn't enumerate pass through unsliced (start=0,
+  // length=ne, step=1). For sliced axes, apply ONNX clamping rules using
+  // data->ne[axis] as the length.
+  int64_t out_ne[GGML_MAX_DIMS];
+  int64_t starts_g[GGML_MAX_DIMS];
+  int64_t steps_g[GGML_MAX_DIMS];
+  for (int g = 0; g < GGML_MAX_DIMS; ++g) {
+    if (attrs->sliced[g]) {
+      const int64_t dim = data->ne[g];
+      const int64_t step = attrs->raw_step[g];
+      GGONNX_ASSERT(step > 0,
+                    "Slice emit: support predicate must reject non-positive step");
+      int64_t s = attrs->raw_start[g];
+      int64_t e = attrs->raw_end[g];
+      if (s < 0) s += dim;
+      if (e < 0) e += dim;
+      if (s < 0) s = 0; else if (s > dim) s = dim;
+      if (e < 0) e = 0; else if (e > dim) e = dim;
+      const int64_t span = e > s ? e - s : 0;
+      const int64_t length = span > 0 ? (span + step - 1) / step : 0;
+      starts_g[g] = s;
+      out_ne[g] = length;
+      steps_g[g] = step;
+    } else {
+      starts_g[g] = 0;
+      out_ne[g] = data->ne[g];
+      steps_g[g] = 1;
+    }
+  }
 
-  GGONNX_ASSERT(attrs->ggml_steps[0] == 1,
+  GGONNX_ASSERT(steps_g[0] == 1,
                 "Slice emit: step on ggml axis 0 should have been rejected by support predicate");
 
+  const size_t offset_bytes =
+      static_cast<size_t>(starts_g[0]) * data->nb[0] +
+      static_cast<size_t>(starts_g[1]) * data->nb[1] +
+      static_cast<size_t>(starts_g[2]) * data->nb[2] +
+      static_cast<size_t>(starts_g[3]) * data->nb[3];
+
   ggml_tensor* view = ggml_view_4d(ctx, data,
-                                   attrs->ggml_ne[0], attrs->ggml_ne[1],
-                                   attrs->ggml_ne[2], attrs->ggml_ne[3],
-                                   data->nb[1] * static_cast<size_t>(attrs->ggml_steps[1]),
-                                   data->nb[2] * static_cast<size_t>(attrs->ggml_steps[2]),
-                                   data->nb[3] * static_cast<size_t>(attrs->ggml_steps[3]),
+                                   out_ne[0], out_ne[1], out_ne[2], out_ne[3],
+                                   data->nb[1] * static_cast<size_t>(steps_g[1]),
+                                   data->nb[2] * static_cast<size_t>(steps_g[2]),
+                                   data->nb[3] * static_cast<size_t>(steps_g[3]),
                                    offset_bytes);
+  // Zero-element view: skip the pack. ggml_cont on a zero-sized tensor trips
+  // gallocr's buffer==NULL assert; the view itself is trivially contiguous
+  // when there's nothing to copy.
+  const bool zero_length = out_ne[0] == 0 || out_ne[1] == 0 || out_ne[2] == 0 || out_ne[3] == 0;
+  if (zero_length) return EmitOutputs{view};
   // Materialize because downstream kernels (and the graph-output copy path)
-  // require contiguous memory. The view keeps the same dims but aliases the
-  // source buffer — ggml_cont does the actual pack.
+  // require contiguous memory.
   return EmitOutputs{ggml_cont(ctx, view)};
 }
 

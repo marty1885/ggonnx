@@ -74,6 +74,13 @@ struct GGMLEp {
   const OrtLogger* logger{};
   std::vector<std::string> selected_devices;
   std::shared_ptr<BackendSelection> selection;
+  // Computed once over the FULL graph in EpGetCapability and reused by every
+  // CompilePartition call. Re-running AnalyzeCompileTimeConstants on a single
+  // partition subgraph gives different (less complete) results because
+  // foldable ancestors may have been split into a different partition — their
+  // outputs then arrive as opaque boundary inputs and downstream folding
+  // breaks. Keeping the full-graph analysis avoids that divergence.
+  std::shared_ptr<const MetaAnalysis> capability_meta;
 };
 
 struct ValueDesc {
@@ -526,10 +533,20 @@ void MaterializeConstantData(const float* src,
   }
 }
 
-CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection& selection) {
+CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection& selection,
+                                   const MetaAnalysis* shared_meta) {
   GGONNX_NOT_NULL(graph, "graph must not be null");
   const Ort::ConstGraph ort_graph{graph};
-  MetaAnalysis meta_analysis = AnalyzeCompileTimeConstants(graph);
+  // Prefer the capability-time analysis (computed over the full graph) when
+  // available. Re-running AnalyzeCompileTimeConstants on the partition
+  // subgraph alone produces stricter (incomplete) results — any folded
+  // ancestor that landed in a different partition appears here as an opaque
+  // boundary input, breaking downstream folding (e.g. Reshape's shape input
+  // computed by a Shape→Gather chain split across partitions). Keys are
+  // value/output names which are preserved through ORT's partitioning.
+  MetaAnalysis meta_analysis = (shared_meta != nullptr)
+      ? *shared_meta
+      : AnalyzeCompileTimeConstants(graph);
   CompiledPartition partition;
 
   GGONNX_ASSERT(!selection.devices.empty(), "BackendSelection must contain at least one device");
@@ -1368,14 +1385,6 @@ void ExecutePartitionWithGGML(GGMLComputeState& state, OrtKernelContext* kernel_
     GGONNX_ASSERT(bytes == elementCount(output_dims) * ggml_element_size(output_tensor),
                   "GGML output byte size mismatch for '" + partition.values[output_id].name + "'");
     ggml_backend_tensor_get(output_tensor, output_data, 0, bytes);
-    if (output_tensor->type == GGML_TYPE_I64) {
-      const int64_t* v = reinterpret_cast<const int64_t*>(output_data);
-      const size_t n = bytes / 8;
-      fprintf(stderr, "[ggonnx-debug] live INT64 output '%s' dims=%s:",
-              partition.values[output_id].name.c_str(), FormatDims(output_dims).c_str());
-      for (size_t k = 0; k < n && k < 8; ++k) fprintf(stderr, " %lld", (long long)v[k]);
-      fprintf(stderr, "\n");
-    }
   }
 }
 
@@ -1467,13 +1476,17 @@ OrtStatus* FactoryGetSupportedDevices(OrtEpFactory* this_ptr,
   });
 }
 
-OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
+OrtStatus* EpGetCapability(OrtEp* this_ptr,
                            const OrtGraph* graph,
                            OrtEpGraphSupportInfo* graph_support_info) noexcept {
   return WrapStatus([&] {
     GGONNX_NOT_NULL(graph_support_info, "graph support info must not be null");
     const Ort::ConstGraph ort_graph{graph};
-    const MetaAnalysis meta_analysis = AnalyzeCompileTimeConstants(graph);
+    auto shared_meta = std::make_shared<MetaAnalysis>(AnalyzeCompileTimeConstants(graph));
+    if (this_ptr != nullptr) {
+      AsEp(this_ptr)->capability_meta = shared_meta;
+    }
+    const MetaAnalysis& meta_analysis = *shared_meta;
 
     // Partition by walking nodes in topological order (how ORT yields them) and
     // sealing the current fuse group whenever we hit an unsupported node. Any
@@ -1525,6 +1538,7 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
       current_group_has_runtime_node = false;
     };
 
+    const bool debug_cap = std::getenv("GGONNX_DEBUG_CAPABILITY") != nullptr;
     for (Ort::ConstNode node : ort_graph.GetNodes()) {
       const std::string key = NodeKey(node);
       const bool is_fusion_anchor =
@@ -1532,9 +1546,15 @@ OrtStatus* EpGetCapability(OrtEp* /*this_ptr*/,
           meta_analysis.fusions.qkv_split_anchors.count(key) > 0 ||
           meta_analysis.fusions.window_mask_add_anchors.count(key) > 0;
       const bool is_fusion_consumed = meta_analysis.fusions.consumed_nodes.count(key) > 0;
-      const bool supported =
-          ((isNodeSupported(node, meta_analysis).has_value()) || is_fusion_anchor) &&
-          has_visible_output(node);
+      const SupportResult sup = isNodeSupported(node, meta_analysis);
+      const bool supported = (sup.has_value() || is_fusion_anchor) && has_visible_output(node);
+      if (debug_cap && !supported && !is_fusion_consumed &&
+          meta_analysis.folded_nodes.count(key) == 0) {
+        std::fprintf(stderr, "[ggonnx-cap] reject %s (%s): %s\n",
+                     std::string(node.GetOperatorType()).c_str(),
+                     std::string(node.GetName()).c_str(),
+                     sup.has_value() ? "no visible output" : sup.error().c_str());
+      }
       if (supported || meta_analysis.folded_nodes.count(key) > 0 || is_fusion_consumed) {
         current_group.push_back(node);
         current_group_has_runtime_node = current_group_has_runtime_node || supported;
@@ -1559,9 +1579,10 @@ OrtStatus* EpCompile(OrtEp* this_ptr,
     const GGMLEp* ep = AsEp(this_ptr);
     GGONNX_NOT_NULL(ep->selection.get(), "ep selection must be populated before Compile");
     const BackendSelection& selection = *ep->selection;
+    const MetaAnalysis* shared_meta = ep->capability_meta.get();
     for (size_t i = 0; i < count; ++i) {
       GGONNX_NOT_NULL(graphs[i], "graph entry must not be null");
-      auto compute_info = BuildNodeComputeInfo(CompilePartition(graphs[i], selection));
+      auto compute_info = BuildNodeComputeInfo(CompilePartition(graphs[i], selection, shared_meta));
       node_compute_infos[i] = &compute_info.release()->iface;
     }
   });

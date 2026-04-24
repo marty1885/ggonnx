@@ -432,7 +432,11 @@ def test_cumsum_non_trailing_axis_falls_back_to_cpu(suite_tmpdir, ep_library: Pa
     assert not ggml_cumsum, f"unexpected GGMLExecutionProvider CumSum events: {ggml_cumsum}"
 
 
-def test_bidirectional_broadcast_add_falls_back_to_cpu(suite_tmpdir, ep_library: Path) -> None:
+def test_bidirectional_broadcast_add_runs_on_ggml(suite_tmpdir, ep_library: Path) -> None:
+    # ONNX NumPy broadcast where neither operand matches the output shape
+    # ([1,2] + [2,1] -> [2,2]). EmitElementwiseBinaryNode materializes the
+    # missing side via ggml_repeat_4d, so the EP claims this rather than
+    # falling back to CPU.
     model_path = build_bidirectional_broadcast_add_model(suite_tmpdir)
     ggml = ggml_session(model_path, ep_library)
     inputs = {
@@ -449,14 +453,13 @@ def test_bidirectional_broadcast_add_falls_back_to_cpu(suite_tmpdir, ep_library:
         and event.get("args", {}).get("provider") == "CPUExecutionProvider"
         and event.get("args", {}).get("op_name") == "Add"
     ]
-    ggml_add = [
+    ggml_node = [
         event for event in profile
         if event.get("cat") == "Node"
         and event.get("args", {}).get("provider") == "GGMLExecutionProvider"
-        and event.get("args", {}).get("op_name") == "Add"
     ]
-    assert cpu_add, f"expected CPUExecutionProvider to run Add, got profile: {profile}"
-    assert not ggml_add, f"unexpected GGMLExecutionProvider Add events: {ggml_add}"
+    assert not cpu_add, f"expected GGML to handle Add, but CPU ran it: {cpu_add}"
+    assert ggml_node, f"expected a GGMLExecutionProvider node, got profile: {profile}"
 
 
 def build_scalar_broadcast_binary_model(tmpdir: Path, op_type: str, x_shape) -> Path:

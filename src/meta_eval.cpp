@@ -2664,6 +2664,60 @@ std::optional<std::vector<int64_t>> InferConstantOfShapeOutputShape(
   return shape;
 }
 
+// NumPy-style broadcast over an arbitrary number of input shapes. Returns the
+// broadcast result shape, or nullopt if any input is missing or shapes are
+// incompatible.
+std::optional<std::vector<int64_t>> InferBroadcastShape(
+    const std::vector<std::optional<std::vector<int64_t>>>& shapes) {
+  if (shapes.empty()) return std::nullopt;
+  size_t out_rank = 0;
+  for (const auto& s : shapes) {
+    if (!s.has_value()) return std::nullopt;
+    out_rank = std::max(out_rank, s->size());
+  }
+  std::vector<int64_t> out(out_rank, 1);
+  for (const auto& s : shapes) {
+    const size_t pad = out_rank - s->size();
+    for (size_t i = 0; i < s->size(); ++i) {
+      const int64_t d = (*s)[i];
+      if (d < 0) return std::nullopt;
+      int64_t& o = out[pad + i];
+      if (o == 1) o = d;
+      else if (d != 1 && d != o) return std::nullopt;
+    }
+  }
+  return out;
+}
+
+// Range output shape: ceil(max(0, limit - start) / delta). Requires all three
+// scalar inputs to be known constants.
+std::optional<std::vector<int64_t>> InferRangeOutputShape(
+    Ort::ConstNode node,
+    const ConstantValueMap& constants) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 3) return std::nullopt;
+  auto read_scalar = [&](size_t i) -> std::optional<double> {
+    auto t = LookupConstant(constants, inputs[i]);
+    if (!t.has_value() || ElementCount(t->dims) != 1) return std::nullopt;
+    if (t->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+      return static_cast<double>(*reinterpret_cast<const int64_t*>(t->data.data()));
+    }
+    if (t->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+      return static_cast<double>(*reinterpret_cast<const int32_t*>(t->data.data()));
+    }
+    if (t->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      return static_cast<double>(*reinterpret_cast<const float*>(t->data.data()));
+    }
+    return std::nullopt;
+  };
+  auto start = read_scalar(0);
+  auto limit = read_scalar(1);
+  auto delta = read_scalar(2);
+  if (!start || !limit || !delta || *delta == 0.0) return std::nullopt;
+  const double n = std::max(0.0, std::ceil((*limit - *start) / *delta));
+  return std::vector<int64_t>{static_cast<int64_t>(n)};
+}
+
 std::optional<std::vector<int64_t>> ResolveShapeRuleInt64Input(
     const ConstantValueMap& constants,
     Ort::ConstNode node,
@@ -2711,24 +2765,30 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
     if (vi == nullptr) return;
     const std::string name = vi.GetName();
     if (ort_static.count(name)) return;
-    // First try the value_info's declared shape.
-    try {
-      const TensorMetadata meta = getTensorMetadata(vi);
-      if (IsShapeFullyStatic(meta.dims)) {
-        ort_static.emplace(name, meta.dims);
-        return;
-      }
-    } catch (...) {}
     // Fall back to the initializer body if this tensor has one; weight
     // tensors often carry a full shape on the value but only a partial
-    // one on the value_info.
+    // one on the value_info. Initializer shapes are authoritative — even
+    // an empty-dim initializer is a genuine rank-0 scalar.
     try {
       Ort::ConstValue value{nullptr};
       if (vi.GetInitializer(value).IsOK() && value != nullptr) {
         const TensorMetadata meta = getTensorMetadata(value);
         if (IsShapeFullyStatic(meta.dims)) {
           ort_static.emplace(name, meta.dims);
+          return;
         }
+      }
+    } catch (...) {}
+    // Value_info declared shape. Skip empty-dim declarations on non-initializer
+    // value_infos: ORT's shape-inference frequently emits `shape: []` for
+    // tensors whose true shape it failed to trace (Loop/Scan bodies, etc.),
+    // which is indistinguishable from a genuine rank-0 scalar at this API
+    // level. Trusting it lets a bogus scalar propagate into Reshape(-1) and
+    // collapse a real [L] tensor to [1].
+    try {
+      const TensorMetadata meta = getTensorMetadata(vi);
+      if (!meta.dims.empty() && IsShapeFullyStatic(meta.dims)) {
+        ort_static.emplace(name, meta.dims);
       }
     } catch (...) {}
   };
@@ -2838,6 +2898,28 @@ void PropagateInferredShapes(const Ort::ConstGraph& ort_graph, MetaAnalysis& ana
           out_shapes = InferSplitOutputShapes(node, *in_shape, analysis.constants);
           if (out_shapes.has_value()) ++rule_fired[op_type];
         }
+      } else if (op_type == "Where") {
+        ++rule_attempted[op_type];
+        std::vector<std::optional<std::vector<int64_t>>> shapes;
+        shapes.reserve(inputs.size());
+        for (size_t i = 0; i < inputs.size(); ++i) shapes.push_back(get_in_shape(i, inputs));
+        out_shape = InferBroadcastShape(shapes);
+        if (out_shape.has_value()) ++rule_fired[op_type];
+      } else if (op_type == "Add" || op_type == "Sub" || op_type == "Mul" ||
+                 op_type == "Div" || op_type == "Max" || op_type == "Min" ||
+                 op_type == "Pow" || op_type == "Equal" || op_type == "Greater" ||
+                 op_type == "GreaterOrEqual" || op_type == "Less" ||
+                 op_type == "LessOrEqual" || op_type == "And" || op_type == "Or") {
+        ++rule_attempted[op_type];
+        std::vector<std::optional<std::vector<int64_t>>> shapes;
+        shapes.reserve(inputs.size());
+        for (size_t i = 0; i < inputs.size(); ++i) shapes.push_back(get_in_shape(i, inputs));
+        out_shape = InferBroadcastShape(shapes);
+        if (out_shape.has_value()) ++rule_fired[op_type];
+      } else if (op_type == "Range") {
+        ++rule_attempted[op_type];
+        out_shape = InferRangeOutputShape(node, analysis.constants);
+        if (out_shape.has_value()) ++rule_fired[op_type];
       } else if (op_type == "ConstantOfShape") {
         ++rule_attempted[op_type];
         auto shape = ResolveShapeRuleInt64Input(analysis.constants, node, 0, lookup_shape_by_name);
@@ -2885,7 +2967,16 @@ std::optional<std::vector<int64_t>> ResolveShape(Ort::ConstValueInfo vi,
                                                  const MetaAnalysis& meta) {
   if (vi == nullptr) return std::nullopt;
   const TensorMetadata ort_meta = getTensorMetadata(vi);
-  if (IsShapeFullyStatic(ort_meta.dims)) return ort_meta.dims;
+  // Empty-dim declarations on non-initializer value_infos are ORT "I don't
+  // know" in disguise — see PropagateInferredShapes::ingest for the rationale.
+  // For initializers we trust empty dims as a genuine rank-0 scalar.
+  const bool dims_trustworthy = !ort_meta.dims.empty() || [&]() {
+    try {
+      Ort::ConstValue value{nullptr};
+      return vi.GetInitializer(value).IsOK() && value != nullptr;
+    } catch (...) { return false; }
+  }();
+  if (dims_trustworthy && IsShapeFullyStatic(ort_meta.dims)) return ort_meta.dims;
   auto cit = meta.constants.find(std::string(vi.GetName()));
   if (cit != meta.constants.end() && IsShapeFullyStatic(cit->second.dims)) {
     return cit->second.dims;
@@ -3025,5 +3116,71 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
   DetectQKVSplitFusions(ort_graph, analysis.constants, analysis.folded_nodes, analysis.fusions);
   DetectPadConvFusions(ort_graph, analysis.constants, analysis.fusions);
   DetectConvBatchNormFusions(ort_graph, analysis.constants, analysis.fusions);
+
+  // A folded constant containing kUnknownShapeDimSentinel is symbolic — it only
+  // makes sense as input to further constant folders that understand the
+  // sentinel. If we let such a node be claimed by the EP, its sentinel value
+  // would be memcpy'd straight into a downstream Reshape/Expand shape input,
+  // which sees -2147483648 and raises. Drop these from folded_nodes; the
+  // constants map keeps the symbolic value for analytic propagation.
+  for (Ort::ConstNode node : ort_graph.GetNodes()) {
+    if (node == nullptr) continue;
+    const std::string key = NodeKey(node);
+    if (analysis.folded_nodes.count(key) == 0) continue;
+    bool leaks_sentinel = false;
+    for (Ort::ConstValueInfo output : node.GetOutputs()) {
+      if (output == nullptr) continue;
+      const auto it = analysis.constants.find(output.GetName());
+      if (it == analysis.constants.end()) continue;
+      if (ConstantContainsSentinel(it->second)) {
+        leaks_sentinel = true;
+        break;
+      }
+    }
+    if (leaks_sentinel) analysis.folded_nodes.erase(key);
+  }
+
+  // A Shape node is co-folded into folded_nodes when its sole consumer is a
+  // folded Gather (see the shape-gather insertion above). If the Gather just
+  // got un-folded by the sentinel filter, the Shape is now orphaned — its
+  // output has no producer in the partition and nothing writes it. Un-fold
+  // any Shape whose consumers aren't all folded.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Ort::ConstNode node : ort_graph.GetNodes()) {
+      if (node == nullptr) continue;
+      const std::string key = NodeKey(node);
+      if (analysis.folded_nodes.count(key) == 0) continue;
+      if (analysis.constants.count(std::string(node.GetOutputs()[0].GetName())) > 0) continue;
+      bool all_consumers_folded = true;
+      for (Ort::ConstValueInfo output : node.GetOutputs()) {
+        if (output == nullptr) continue;
+        const std::string output_name = output.GetName();
+        if (graph_output_names.count(output_name) > 0) {
+          all_consumers_folded = false;
+          break;
+        }
+        for (Ort::ConstNode consumer : ort_graph.GetNodes()) {
+          if (consumer == nullptr) continue;
+          bool consumes = false;
+          for (Ort::ConstValueInfo in : consumer.GetInputs()) {
+            if (in != nullptr && in.GetName() == output_name) { consumes = true; break; }
+          }
+          if (!consumes) continue;
+          if (analysis.folded_nodes.count(NodeKey(consumer)) == 0) {
+            all_consumers_folded = false;
+            break;
+          }
+        }
+        if (!all_consumers_folded) break;
+      }
+      if (!all_consumers_folded) {
+        analysis.folded_nodes.erase(key);
+        changed = true;
+      }
+    }
+  }
+
   return analysis;
 }

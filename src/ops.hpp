@@ -230,11 +230,18 @@ struct NodeDesc {
     // for step>1 axes the view multiplies the source stride by `step`. ggml
     // forces nb[0] = type_size, so step>1 on ggml axis 0 (= last ONNX axis) is
     // rejected by the support predicate.
-    // Arrays are in padded GGML axis order: untouched dims get start=0,
-    // full ne, and step=1.
-    std::array<int64_t, GGML_MAX_DIMS> ggml_starts{0, 0, 0, 0};
-    std::array<int64_t, GGML_MAX_DIMS> ggml_ne{1, 1, 1, 1};
-    std::array<int64_t, GGML_MAX_DIMS> ggml_steps{1, 1, 1, 1};
+    //
+    // Per-ggml-axis start/end/step held as the raw constant values from the
+    // ONNX inputs (start/end may be negative, INT64_MAX/MIN for "to-end"). The
+    // input data's per-axis length (`dim`) isn't necessarily known at compile
+    // time — we resolve negative indices, clamping, and output length from
+    // data->ne[axis] at emit time. `sliced` flags which axes participate; the
+    // others pass through unchanged.
+    std::array<int64_t, GGML_MAX_DIMS> raw_start{0, 0, 0, 0};
+    std::array<int64_t, GGML_MAX_DIMS> raw_end{0, 0, 0, 0};
+    std::array<int64_t, GGML_MAX_DIMS> raw_step{1, 1, 1, 1};
+    std::array<bool, GGML_MAX_DIMS> sliced{false, false, false, false};
+    int onnx_rank = 0;
   };
   struct SplitAttrs {
     int ggml_axis{0};
