@@ -405,4 +405,14 @@ struct FusionPlan {
     std::string data_input_name;
   };
   std::unordered_map<std::string, AbsorbedPad> absorbed_pads;
+  // Keyed by Conv node key. The sole consumer BatchNormalization has been
+  // folded into the Conv's compile-time weight/bias constants. The Conv should
+  // wire its output directly to output_value_name and use the replacement
+  // weight/bias constants by name. The BN node is consumed_nodes.
+  struct FoldedBatchNorm {
+    std::string output_value_name;
+    std::string weight_input_name;
+    std::string bias_input_name;
+  };
+  std::unordered_map<std::string, FoldedBatchNorm> folded_batchnorms;
 };

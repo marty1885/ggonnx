@@ -53,6 +53,8 @@ class DebugApi:
     def __init__(self, ep_library: Path) -> None:
         self.lib = ctypes.CDLL(str(ep_library))
         self.lib.GGONNX_DebugGetGraphBuildCount.restype = ctypes.c_uint64
+        self.lib.GGONNX_DebugGetLastGraphNodeCount.restype = ctypes.c_uint64
+        self.lib.GGONNX_DebugGetLastGraphOutputCount.restype = ctypes.c_uint64
         self.lib.GGONNX_DebugResetGraphBuildCount.argtypes = []
 
     def reset(self) -> None:
@@ -60,6 +62,12 @@ class DebugApi:
 
     def graph_build_count(self) -> int:
         return int(self.lib.GGONNX_DebugGetGraphBuildCount())
+
+    def last_graph_node_count(self) -> int:
+        return int(self.lib.GGONNX_DebugGetLastGraphNodeCount())
+
+    def last_graph_output_count(self) -> int:
+        return int(self.lib.GGONNX_DebugGetLastGraphOutputCount())
 
 
 def save_model(path: Path, graph) -> None:

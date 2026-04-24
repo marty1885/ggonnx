@@ -1,6 +1,7 @@
 #include "meta_eval.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <cstring>
 #include <limits>
@@ -710,14 +711,32 @@ std::optional<std::vector<ConstantTensor>> EvalArangeLoop(const ConstantValueMap
   const auto body_inputs = body.GetInputs();
   const auto body_outputs = body.GetOutputs();
   const auto body_nodes = body.GetNodes();
-  if (body_inputs.size() != 3 || body_outputs.size() != 3 || body_nodes.size() != 3) return std::nullopt;
+  if (body_inputs.size() != 3 || body_outputs.size() != 3) return std::nullopt;
+
+  std::unordered_map<std::string, std::string> identity_input_by_output;
+  auto resolve_alias = [&identity_input_by_output](const std::string& value_name)
+      -> std::optional<std::string> {
+    std::string current = value_name;
+    std::unordered_set<std::string> seen;
+    while (true) {
+      if (!seen.insert(current).second) return std::nullopt;
+      auto it = identity_input_by_output.find(current);
+      if (it == identity_input_by_output.end()) return current;
+      current = it->second;
+    }
+  };
+  auto lookup_constant_name = [&constants](const std::string& value_name)
+      -> std::optional<ConstantTensor> {
+    auto it = constants.find(value_name);
+    if (it == constants.end()) return std::nullopt;
+    return it->second;
+  };
 
   Ort::ConstNode add_node{nullptr};
-  bool saw_prev_identity = false;
-  bool saw_cond_identity = false;
   for (Ort::ConstNode body_node : body_nodes) {
     const std::string op_type = body_node.GetOperatorType();
     if (op_type == "Add") {
+      if (add_node != nullptr) return std::nullopt;
       add_node = body_node;
     } else if (op_type == "Identity") {
       const auto node_inputs = body_node.GetInputs();
@@ -725,37 +744,36 @@ std::optional<std::vector<ConstantTensor>> EvalArangeLoop(const ConstantValueMap
       if (node_inputs.size() != 1 || node_outputs.size() != 1 || node_inputs[0] == nullptr || node_outputs[0] == nullptr) {
         return std::nullopt;
       }
-      if (std::string(node_inputs[0].GetName()) == body_inputs[1].GetName() &&
-          std::string(node_outputs[0].GetName()) == body_outputs[0].GetName()) {
-        saw_cond_identity = true;
-      } else if (std::string(node_inputs[0].GetName()) == body_inputs[2].GetName() &&
-                 std::string(node_outputs[0].GetName()) == body_outputs[2].GetName()) {
-        saw_prev_identity = true;
-      } else {
-        return std::nullopt;
-      }
+      identity_input_by_output.emplace(node_outputs[0].GetName(), node_inputs[0].GetName());
     } else {
       return std::nullopt;
     }
   }
-  if (add_node == nullptr || !saw_prev_identity || !saw_cond_identity) return std::nullopt;
+  if (add_node == nullptr) return std::nullopt;
+  const auto cond_root = resolve_alias(body_outputs[0].GetName());
+  const auto prev_root = resolve_alias(body_outputs[2].GetName());
+  if (!cond_root || !prev_root) return std::nullopt;
+  if (*cond_root != body_inputs[1].GetName() || *prev_root != body_inputs[2].GetName()) return std::nullopt;
 
   const auto add_inputs = add_node.GetInputs();
   const auto add_outputs = add_node.GetOutputs();
-  if (add_inputs.size() != 2 || add_outputs.size() != 1 || add_outputs[0] == nullptr ||
-      std::string(add_outputs[0].GetName()) != body_outputs[1].GetName()) {
+  if (add_inputs.size() != 2 || add_outputs.size() != 1 || add_outputs[0] == nullptr) {
     return std::nullopt;
   }
+  const auto current_root = resolve_alias(body_outputs[1].GetName());
+  if (!current_root || *current_root != add_outputs[0].GetName()) return std::nullopt;
 
   std::optional<ConstantTensor> delta_tensor;
   bool saw_prev = false;
   for (size_t i = 0; i < 2; ++i) {
     if (add_inputs[i] == nullptr) return std::nullopt;
-    if (std::string(add_inputs[i].GetName()) == body_inputs[2].GetName()) {
+    const auto add_input_root = resolve_alias(add_inputs[i].GetName());
+    if (!add_input_root) return std::nullopt;
+    if (*add_input_root == body_inputs[2].GetName()) {
       saw_prev = true;
       continue;
     }
-    delta_tensor = LookupConstant(constants, add_inputs[i]);
+    delta_tensor = lookup_constant_name(*add_input_root);
   }
   if (!saw_prev || !delta_tensor) return std::nullopt;
   if (delta_tensor->element_type != start_tensor->element_type ||
@@ -1164,6 +1182,202 @@ std::optional<ConstantTensor> EvalWhere(const ConstantValueMap& constants, Ort::
   return out;
 }
 
+std::optional<ConstantTensor> EvalRange(const ConstantValueMap& constants, Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 3 || inputs[0] == nullptr || inputs[1] == nullptr || inputs[2] == nullptr) {
+    return std::nullopt;
+  }
+  const auto start = LookupConstant(constants, inputs[0]);
+  const auto limit = LookupConstant(constants, inputs[1]);
+  const auto delta = LookupConstant(constants, inputs[2]);
+  if (!start || !limit || !delta) return std::nullopt;
+  if (start->element_type != limit->element_type || start->element_type != delta->element_type) {
+    return std::nullopt;
+  }
+  if (ElementCount(start->dims) != 1 || ElementCount(limit->dims) != 1 || ElementCount(delta->dims) != 1) {
+    return std::nullopt;
+  }
+
+  const auto et = start->element_type;
+  if (et == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    const float s = ReadTypedData<float>(*start)[0];
+    const float l = ReadTypedData<float>(*limit)[0];
+    const float d = ReadTypedData<float>(*delta)[0];
+    if (d == 0.0f) return std::nullopt;
+    const int64_t n = std::max<int64_t>(static_cast<int64_t>(std::ceil((l - s) / d)), 0);
+    if (n > static_cast<int64_t>(kMaxFoldedElements)) return std::nullopt;
+    std::vector<float> out(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = s + static_cast<float>(i) * d;
+    return MakeConstant<float>({n}, std::move(out), et);
+  }
+  if (et == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+    const int32_t s = ReadTypedData<int32_t>(*start)[0];
+    const int32_t l = ReadTypedData<int32_t>(*limit)[0];
+    const int32_t d = ReadTypedData<int32_t>(*delta)[0];
+    if (d == 0) return std::nullopt;
+    const int64_t n = std::max<int64_t>(static_cast<int64_t>(std::ceil(double(l - s) / double(d))), 0);
+    if (n > static_cast<int64_t>(kMaxFoldedElements)) return std::nullopt;
+    std::vector<int32_t> out(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = s + static_cast<int32_t>(i) * d;
+    return MakeConstant<int32_t>({n}, std::move(out), et);
+  }
+  if (et == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+    const int64_t s = ReadTypedData<int64_t>(*start)[0];
+    const int64_t l = ReadTypedData<int64_t>(*limit)[0];
+    const int64_t d = ReadTypedData<int64_t>(*delta)[0];
+    if (d == 0) return std::nullopt;
+    const int64_t n = std::max<int64_t>(static_cast<int64_t>(std::ceil(double(l - s) / double(d))), 0);
+    if (n > static_cast<int64_t>(kMaxFoldedElements)) return std::nullopt;
+    std::vector<int64_t> out(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = s + i * d;
+    return MakeConstant<int64_t>({n}, std::move(out), et);
+  }
+  return std::nullopt;
+}
+
+std::optional<ConstantTensor> EvalUnaryMath(const ConstantValueMap& constants,
+                                            Ort::ConstNode node,
+                                            const std::string& op_type) {
+  const auto inputs = node.GetInputs();
+  if (inputs.size() != 1 || inputs[0] == nullptr) return std::nullopt;
+  const auto input = LookupConstant(constants, inputs[0]);
+  if (!input || input->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return std::nullopt;
+  if (ContainsUnknownShapeDim(*input) || !FitsFoldLimit(input->dims)) return std::nullopt;
+  std::vector<float> out = ReadTypedData<float>(*input);
+  for (float& v : out) {
+    if (op_type == "Ceil") v = std::ceil(v);
+    else if (op_type == "Round") v = std::round(v);
+    else return std::nullopt;
+  }
+  return MakeConstant<float>(std::vector<int64_t>(input->dims), std::move(out), input->element_type);
+}
+
+std::optional<ConstantTensor> EvalReduceMin(const ConstantValueMap& constants, Ort::ConstNode node) {
+  const auto inputs = node.GetInputs();
+  if (inputs.empty() || inputs[0] == nullptr) return std::nullopt;
+  const auto data = LookupConstant(constants, inputs[0]);
+  if (!data || ContainsUnknownShapeDim(*data)) return std::nullopt;
+  if (data->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 &&
+      data->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 &&
+      data->element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return std::nullopt;
+  }
+
+  std::vector<int64_t> axes;
+  if (inputs.size() >= 2 && inputs[1] != nullptr) {
+    auto a = ReadConstantInt64Input(constants, node, 1);
+    if (!a) return std::nullopt;
+    axes = *a;
+  } else {
+    Ort::ConstOpAttr attr{nullptr};
+    if (node.GetAttributeByName("axes", attr).IsOK() && attr != nullptr) {
+      Ort::ThrowOnError(attr.GetValueArray(axes));
+    } else {
+      axes.resize(data->dims.size());
+      for (size_t i = 0; i < axes.size(); ++i) axes[i] = static_cast<int64_t>(i);
+    }
+  }
+  const bool keepdims = [&]() {
+    Ort::ConstOpAttr attr{nullptr};
+    int64_t v = 1;
+    if (node.GetAttributeByName("keepdims", attr).IsOK() && attr != nullptr) attr.GetValue(v);
+    return v != 0;
+  }();
+
+  const int64_t rank = static_cast<int64_t>(data->dims.size());
+  std::vector<int64_t> norm_axes = axes;
+  for (int64_t& a : norm_axes) {
+    if (a < 0) a += rank;
+    if (a < 0 || a >= rank) return std::nullopt;
+  }
+  std::sort(norm_axes.begin(), norm_axes.end());
+  norm_axes.erase(std::unique(norm_axes.begin(), norm_axes.end()), norm_axes.end());
+
+  // Keep this simple: fold only full reduction or 1-axis reductions for now.
+  if (!(norm_axes.size() == rank || norm_axes.size() == 1)) return std::nullopt;
+
+  auto make_out_dims = [&]() {
+    std::vector<int64_t> out_dims = data->dims;
+    if (keepdims) {
+      for (int64_t a : norm_axes) out_dims[static_cast<size_t>(a)] = 1;
+    } else {
+      for (auto it = norm_axes.rbegin(); it != norm_axes.rend(); ++it) {
+        out_dims.erase(out_dims.begin() + *it);
+      }
+      if (out_dims.empty()) out_dims = {};
+    }
+    return out_dims;
+  };
+
+  if (norm_axes.size() == rank) {
+    if (data->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      const auto vals = ReadTypedData<float>(*data);
+      const float v = *std::min_element(vals.begin(), vals.end());
+      return MakeConstant<float>(make_out_dims(), {v}, data->element_type);
+    }
+    if (data->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+      const auto vals = ReadTypedData<int32_t>(*data);
+      const int32_t v = *std::min_element(vals.begin(), vals.end());
+      return MakeConstant<int32_t>(make_out_dims(), {v}, data->element_type);
+    }
+    const auto vals = ReadTypedData<int64_t>(*data);
+    const int64_t v = *std::min_element(vals.begin(), vals.end());
+    return MakeConstant<int64_t>(make_out_dims(), {v}, data->element_type);
+  }
+
+  const int64_t axis = norm_axes[0];
+  const auto strides = MakeStrides(data->dims);
+  const int64_t axis_stride = strides[static_cast<size_t>(axis)];
+  const int64_t axis_len = data->dims[static_cast<size_t>(axis)];
+  int64_t outer = 1;
+  for (int64_t i = 0; i < axis; ++i) outer *= data->dims[static_cast<size_t>(i)];
+  int64_t inner = 1;
+  for (int64_t i = axis + 1; i < rank; ++i) inner *= data->dims[static_cast<size_t>(i)];
+  const auto out_dims = make_out_dims();
+  if (!FitsFoldLimit(out_dims.empty() ? std::vector<int64_t>{1} : out_dims)) return std::nullopt;
+
+  if (data->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    const auto vals = ReadTypedData<float>(*data);
+    std::vector<float> out(static_cast<size_t>(outer * inner));
+    for (int64_t o = 0; o < outer; ++o) {
+      for (int64_t in = 0; in < inner; ++in) {
+        float best = vals[static_cast<size_t>(o * axis_len * inner + in)];
+        for (int64_t a = 1; a < axis_len; ++a) {
+          best = std::min(best, vals[static_cast<size_t>(o * axis_len * inner + a * inner + in)]);
+        }
+        out[static_cast<size_t>(o * inner + in)] = best;
+      }
+    }
+    return MakeConstant<float>(out_dims, std::move(out), data->element_type);
+  }
+  if (data->element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+    const auto vals = ReadTypedData<int32_t>(*data);
+    std::vector<int32_t> out(static_cast<size_t>(outer * inner));
+    for (int64_t o = 0; o < outer; ++o) {
+      for (int64_t in = 0; in < inner; ++in) {
+        int32_t best = vals[static_cast<size_t>(o * axis_len * inner + in)];
+        for (int64_t a = 1; a < axis_len; ++a) {
+          best = std::min(best, vals[static_cast<size_t>(o * axis_len * inner + a * inner + in)]);
+        }
+        out[static_cast<size_t>(o * inner + in)] = best;
+      }
+    }
+    return MakeConstant<int32_t>(out_dims, std::move(out), data->element_type);
+  }
+  const auto vals = ReadTypedData<int64_t>(*data);
+  std::vector<int64_t> out(static_cast<size_t>(outer * inner));
+  for (int64_t o = 0; o < outer; ++o) {
+    for (int64_t in = 0; in < inner; ++in) {
+      int64_t best = vals[static_cast<size_t>(o * axis_len * inner + in)];
+      for (int64_t a = 1; a < axis_len; ++a) {
+        best = std::min(best, vals[static_cast<size_t>(o * axis_len * inner + a * inner + in)]);
+      }
+      out[static_cast<size_t>(o * inner + in)] = best;
+    }
+  }
+  return MakeConstant<int64_t>(out_dims, std::move(out), data->element_type);
+}
+
 std::optional<ConstantTensor> TryFoldNode(const ConstantValueMap& constants, Ort::ConstNode node) {
   const std::string op_type = node.GetOperatorType();
   if (op_type == "Constant") return EvalConstant(constants, node);
@@ -1182,6 +1396,9 @@ std::optional<ConstantTensor> TryFoldNode(const ConstantValueMap& constants, Ort
   if (op_type == "Transpose") return EvalTranspose(constants, node);
   if (op_type == "Gather") return EvalGather(constants, node);
   if (op_type == "ConstantOfShape") return EvalConstantOfShape(constants, node);
+  if (op_type == "Range") return EvalRange(constants, node);
+  if (op_type == "Ceil" || op_type == "Round") return EvalUnaryMath(constants, node, op_type);
+  if (op_type == "ReduceMin") return EvalReduceMin(constants, node);
   if (op_type == "Equal") return EvalEqual(constants, node);
   if (op_type == "Where") return EvalWhere(constants, node);
   return std::nullopt;
@@ -1917,6 +2134,155 @@ void DetectPadConvFusions(const Ort::ConstGraph& ort_graph,
     absorbed.p1 = h_pad;
     absorbed.data_input_name = std::string(pad_inputs[0].GetName());
     plan.absorbed_pads.emplace(NodeKey(conv), std::move(absorbed));
+  }
+}
+
+void DetectConvBatchNormFusions(const Ort::ConstGraph& ort_graph,
+                                ConstantValueMap& constants,
+                                FusionPlan& plan) {
+  std::unordered_map<std::string, Ort::ConstNode> producer;
+  std::unordered_map<std::string, int> use_count;
+  std::unordered_set<std::string> graph_output_names;
+  for (Ort::ConstNode n : ort_graph.GetNodes()) {
+    for (Ort::ConstValueInfo out : n.GetOutputs()) {
+      if (out != nullptr) producer.emplace(std::string(out.GetName()), n);
+    }
+    for (Ort::ConstValueInfo inp : n.GetInputs()) {
+      if (inp != nullptr) ++use_count[std::string(inp.GetName())];
+    }
+  }
+  for (Ort::ConstValueInfo out : ort_graph.GetOutputs()) {
+    if (out != nullptr) graph_output_names.insert(std::string(out.GetName()));
+  }
+
+  for (Ort::ConstNode bn : ort_graph.GetNodes()) {
+    const std::string op = bn.GetOperatorType();
+    if (op != "BatchNormalization") continue;
+    const std::string dom = bn.GetDomain();
+    if (!dom.empty() && dom != "ai.onnx") continue;
+    const auto bn_inputs = bn.GetInputs();
+    const auto bn_outputs = bn.GetOutputs();
+    if (bn_inputs.size() != 5 || bn_outputs.size() != 1 ||
+        bn_inputs[0] == nullptr || bn_inputs[1] == nullptr || bn_inputs[2] == nullptr ||
+        bn_inputs[3] == nullptr || bn_inputs[4] == nullptr || bn_outputs[0] == nullptr) {
+      continue;
+    }
+
+    const std::string conv_out_name = bn_inputs[0].GetName();
+    if (use_count[conv_out_name] != 1) continue;
+    if (graph_output_names.count(conv_out_name) > 0) continue;
+
+    auto pit = producer.find(conv_out_name);
+    if (pit == producer.end()) continue;
+    Ort::ConstNode conv = pit->second;
+    if (conv == nullptr || std::string(conv.GetOperatorType()) != "Conv") continue;
+    const std::string conv_dom = conv.GetDomain();
+    if (!conv_dom.empty() && conv_dom != "ai.onnx") continue;
+
+    const std::string conv_key = NodeKey(conv);
+    const std::string bn_key = NodeKey(bn);
+    if (plan.consumed_nodes.count(conv_key) > 0 || plan.consumed_nodes.count(bn_key) > 0) continue;
+
+    const auto conv_inputs = conv.GetInputs();
+    if ((conv_inputs.size() != 2 && conv_inputs.size() != 3) ||
+        conv_inputs[1] == nullptr) {
+      continue;
+    }
+
+    const std::string weight_name = std::string(conv_inputs[1].GetName());
+    auto wit = constants.find(weight_name);
+    if (wit == constants.end() ||
+        wit->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      continue;
+    }
+    const TensorMetadata w_meta = getTensorMetadata(conv_inputs[1]);
+    if (w_meta.dims.empty() || w_meta.dims[0] <= 0) continue;
+    const size_t out_channels = static_cast<size_t>(w_meta.dims[0]);
+
+    const std::string scale_name = std::string(bn_inputs[1].GetName());
+    const std::string beta_name = std::string(bn_inputs[2].GetName());
+    const std::string mean_name = std::string(bn_inputs[3].GetName());
+    const std::string var_name = std::string(bn_inputs[4].GetName());
+    auto sit = constants.find(scale_name);
+    auto bit = constants.find(beta_name);
+    auto mit = constants.find(mean_name);
+    auto vit = constants.find(var_name);
+    if (sit == constants.end() || bit == constants.end() || mit == constants.end() || vit == constants.end()) {
+      continue;
+    }
+    if (sit->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        bit->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        mit->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        vit->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      continue;
+    }
+    if (use_count[weight_name] != 1 ||
+        use_count[scale_name] != 1 ||
+        use_count[beta_name] != 1 ||
+        use_count[mean_name] != 1 ||
+        use_count[var_name] != 1) {
+      continue;
+    }
+
+    const std::vector<float> scale = ReadTypedData<float>(sit->second);
+    const std::vector<float> beta = ReadTypedData<float>(bit->second);
+    const std::vector<float> mean = ReadTypedData<float>(mit->second);
+    const std::vector<float> var = ReadTypedData<float>(vit->second);
+    if (scale.size() != out_channels || beta.size() != out_channels ||
+        mean.size() != out_channels || var.size() != out_channels) {
+      continue;
+    }
+
+    std::vector<float> conv_bias(out_channels, 0.0f);
+    std::string folded_bias_name = beta_name;
+    if (conv_inputs.size() == 3 && conv_inputs[2] != nullptr) {
+      folded_bias_name = std::string(conv_inputs[2].GetName());
+      auto cbit = constants.find(folded_bias_name);
+      if (cbit == constants.end() ||
+          cbit->second.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+          use_count[folded_bias_name] != 1) {
+        continue;
+      }
+      conv_bias = ReadTypedData<float>(cbit->second);
+      if (conv_bias.size() != out_channels) continue;
+    }
+
+    std::vector<float> folded_w = ReadTypedData<float>(wit->second);
+    if (folded_w.empty() || folded_w.size() % out_channels != 0) continue;
+    const size_t kernel_elems_per_oc = folded_w.size() / out_channels;
+    std::vector<float> folded_b(out_channels, 0.0f);
+
+    float epsilon = 1e-5f;
+    {
+      Ort::ConstOpAttr attr{nullptr};
+      if (bn.GetAttributeByName("epsilon", attr).IsOK() && attr != nullptr) {
+        attr.GetValue(epsilon);
+      }
+    }
+    for (size_t oc = 0; oc < out_channels; ++oc) {
+      const float inv_std = 1.0f / std::sqrt(var[oc] + epsilon);
+      const float a = scale[oc] * inv_std;
+      const size_t base = oc * kernel_elems_per_oc;
+      for (size_t i = 0; i < kernel_elems_per_oc; ++i) {
+        folded_w[base + i] *= a;
+      }
+      folded_b[oc] = beta[oc] + (conv_bias[oc] - mean[oc]) * a;
+    }
+
+    wit->second = MakeConstant(std::vector<int64_t>(wit->second.dims),
+                               std::move(folded_w),
+                               ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+    constants[folded_bias_name] =
+        MakeConstant(std::vector<int64_t>{static_cast<int64_t>(out_channels)},
+                     std::move(folded_b),
+                     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+
+    plan.consumed_nodes.insert(bn_key);
+    FusionPlan::FoldedBatchNorm folded;
+    folded.output_value_name = std::string(bn_outputs[0].GetName());
+    folded.weight_input_name = weight_name;
+    folded.bias_input_name = folded_bias_name;
+    plan.folded_batchnorms.emplace(conv_key, std::move(folded));
   }
 }
 
@@ -2658,5 +3024,6 @@ MetaAnalysis AnalyzeCompileTimeConstants(const OrtGraph* graph) {
                              analysis.fusions);
   DetectQKVSplitFusions(ort_graph, analysis.constants, analysis.folded_nodes, analysis.fusions);
   DetectPadConvFusions(ort_graph, analysis.constants, analysis.fusions);
+  DetectConvBatchNormFusions(ort_graph, analysis.constants, analysis.fusions);
   return analysis;
 }

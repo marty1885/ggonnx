@@ -33,6 +33,8 @@ constexpr const char* kVendorName = "nekko";
 constexpr const char* kVersion = "0.0.1";
 
 std::atomic<uint64_t> g_debug_graph_build_count{0};
+std::atomic<uint64_t> g_debug_last_graph_node_count{0};
+std::atomic<uint64_t> g_debug_last_graph_output_count{0};
 
 using ggonnx::ort_internal::GetOrtApi;
 using ggonnx::ort_internal::GetOrtEpApi;
@@ -756,6 +758,7 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
 
     // Fold an absorbed zero-Pad into this Conv's padding attributes.
     const FusionPlan::AbsorbedPad* absorbed_pad = nullptr;
+    const FusionPlan::FoldedBatchNorm* folded_bn = nullptr;
     if (compiled_node.op_type == "Conv") {
       auto apit = meta_analysis.fusions.absorbed_pads.find(node_key);
       if (apit != meta_analysis.fusions.absorbed_pads.end()) {
@@ -765,10 +768,27 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
           ca->p1 += absorbed_pad->p1;
         }
       }
+      auto fbit = meta_analysis.fusions.folded_batchnorms.find(node_key);
+      if (fbit != meta_analysis.fusions.folded_batchnorms.end()) {
+        folded_bn = &fbit->second;
+      }
     }
 
-    for (size_t input_idx = 0; input_idx < node_inputs.size(); ++input_idx) {
-      Ort::ConstValueInfo input = node_inputs[input_idx];
+    const size_t compiled_input_count =
+        (compiled_node.op_type == "Conv" && folded_bn != nullptr) ? 3 : node_inputs.size();
+    for (size_t input_idx = 0; input_idx < compiled_input_count; ++input_idx) {
+      Ort::ConstValueInfo input{nullptr};
+      if (compiled_node.op_type == "Conv" && folded_bn != nullptr && input_idx <= 2) {
+        if (input_idx == 0) {
+          input = node_inputs[0];
+        } else if (input_idx == 1) {
+          input = find_value_info_for(folded_bn->weight_input_name);
+        } else {
+          input = find_value_info_for(folded_bn->bias_input_name);
+        }
+      } else if (input_idx < node_inputs.size()) {
+        input = node_inputs[input_idx];
+      }
       // For an absorbed-Pad Conv, bypass the Pad output and wire the Pad's
       // upstream data input directly so no padded tensor is materialised.
       if (input_idx == 0 && absorbed_pad != nullptr) {
@@ -806,12 +826,18 @@ CompiledPartition CompilePartition(const OrtGraph* graph, const BackendSelection
         }
       }
     }
-    for (Ort::ConstValueInfo output : node_outputs) {
-      if (output == nullptr) {
-        compiled_node.outputs.push_back(kOptionalValueAbsent);
-        continue;
-      }
+    if (compiled_node.op_type == "Conv" && folded_bn != nullptr) {
+      Ort::ConstValueInfo output = find_value_info_for(folded_bn->output_value_name);
+      GGONNX_ASSERT(output != nullptr, "folded BatchNormalization output value_info not found");
       compiled_node.outputs.push_back(ensure_value(output));
+    } else {
+      for (Ort::ConstValueInfo output : node_outputs) {
+        if (output == nullptr) {
+          compiled_node.outputs.push_back(kOptionalValueAbsent);
+          continue;
+        }
+        compiled_node.outputs.push_back(ensure_value(output));
+      }
     }
 
     partition.nodes.push_back(std::move(compiled_node));
@@ -1160,6 +1186,10 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
         GGONNX_NOT_NULL(graph_state->graph, "ggml_new_graph failed");
         has_runtime_output = true;
       }
+      if (!ggml_is_contiguous(output)) {
+        output = ggml_cont(ctx, output);
+        graph_state->values[output_id] = output;
+      }
       ggml_set_output(output);
       ggml_build_forward_expand(graph_state->graph, output);
       graph_state->output_tensors[i] = output;
@@ -1222,6 +1252,18 @@ std::unique_ptr<MaterializedGraph> BuildMaterializedGraph(const CompiledPartitio
     }
 
     g_debug_graph_build_count.fetch_add(1, std::memory_order_relaxed);
+    if (graph_state->graph != nullptr) {
+      g_debug_last_graph_node_count.store(static_cast<uint64_t>(ggml_graph_n_nodes(graph_state->graph)),
+                                          std::memory_order_relaxed);
+      uint64_t output_count = 0;
+      for (ggml_tensor* t : graph_state->output_tensors) {
+        if (t != nullptr) ++output_count;
+      }
+      g_debug_last_graph_output_count.store(output_count, std::memory_order_relaxed);
+    } else {
+      g_debug_last_graph_node_count.store(0, std::memory_order_relaxed);
+      g_debug_last_graph_output_count.store(0, std::memory_order_relaxed);
+    }
     return graph_state;
   } catch (...) {
     ggml_free(ctx);
@@ -1803,6 +1845,16 @@ extern "C" uint64_t GGONNX_DebugGetGraphBuildCount() noexcept {
   return g_debug_graph_build_count.load(std::memory_order_relaxed);
 }
 
+extern "C" uint64_t GGONNX_DebugGetLastGraphNodeCount() noexcept {
+  return g_debug_last_graph_node_count.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t GGONNX_DebugGetLastGraphOutputCount() noexcept {
+  return g_debug_last_graph_output_count.load(std::memory_order_relaxed);
+}
+
 extern "C" void GGONNX_DebugResetGraphBuildCount() noexcept {
   g_debug_graph_build_count.store(0, std::memory_order_relaxed);
+  g_debug_last_graph_node_count.store(0, std::memory_order_relaxed);
+  g_debug_last_graph_output_count.store(0, std::memory_order_relaxed);
 }

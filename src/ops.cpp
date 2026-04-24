@@ -971,6 +971,11 @@ EmitResult EmitUnaryFloatNode(ggml_context* ctx,
                 "compiled unary op node has invalid arity");
   ggml_tensor* x = values[node.inputs[0]];
   GGONNX_NOT_NULL(x, "compiled unary op node missing GGML input");
+  // ggml CPU unary kernels assert nb00 == sizeof(src0_t) unconditionally. A
+  // permuted view whose ne[0]==1 slips past ggml_is_contiguous (that helper
+  // short-circuits on the blck_size match) but still trips the kernel assert,
+  // so check nb[0] directly.
+  if (x->nb[0] != ggml_type_size(x->type)) x = ggml_cont(ctx, x);
 
   const std::string_view op(node.op_type);
   if (op == "Abs")      return EmitOutputs{ggml_abs(ctx, x)};
@@ -1146,6 +1151,7 @@ EmitResult EmitPowNode(ggml_context* ctx,
                 "compiled Pow node has invalid arity");
   ggml_tensor* x = values[node.inputs[0]];
   GGONNX_NOT_NULL(x, "compiled Pow node missing GGML base input");
+  if (x->nb[0] != ggml_type_size(x->type)) x = ggml_cont(ctx, x);
   return EmitOutputs{ggml_sqr(ctx, x)};
 }
 
@@ -3031,9 +3037,10 @@ EmitResult EmitTransposeNode(ggml_context* ctx,
                                        attrs->ggml_perm[1],
                                        attrs->ggml_perm[2],
                                        attrs->ggml_perm[3]);
-  // ggml_permute returns a non-contiguous view; materialize so downstream ops
-  // that assume contiguous input (reshape, concat, mul_mat) are happy.
-  return EmitOutputs{ggml_cont(ctx, permuted)};
+  // Keep Transpose as a view. Downstream emitters that truly require
+  // contiguous storage materialize on demand; eager cont here would pay a
+  // heavy pack for chains that can consume the view directly.
+  return EmitOutputs{permuted};
 }
 
 // ONNX Concat: join N inputs along `axis`. GGML's ggml_concat takes two tensors

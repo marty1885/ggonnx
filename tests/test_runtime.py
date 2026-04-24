@@ -278,6 +278,8 @@ def test_broadcast_add_runs_on_ggml(suite_tmpdir, ep_library: Path, debug_api) -
     ggml_out = ggml.run(["z"], broadcast_inputs)[0]
     np.testing.assert_allclose(ggml_out, cpu_out, rtol=1e-6, atol=1e-6)
     assert debug_api.graph_build_count() == 1
+    assert debug_api.last_graph_node_count() > 0
+    assert debug_api.last_graph_output_count() == 1
     assert_all_nodes_run_on_ggml(ggml)
 
 
@@ -546,6 +548,148 @@ def test_single_unary_ops(suite_tmpdir, ep_library: Path, op_type: str) -> None:
     default_x = np.array([[1.0, -2.0, 0.5], [-0.25, 3.0, -1.5]], dtype=np.float32)
     inputs = {"x": _UNARY_INPUT_OVERRIDES.get(op_type, default_x)}
     assert_model_matches_cpu(model_path, ep_library, "y", inputs)
+
+
+@pytest.mark.parametrize(
+    "op_type",
+    ["Relu", "Sigmoid", "Tanh", "Neg", "Abs", "Sqrt", "Exp", "Log", "Softplus", "Elu", "Pow"],
+)
+def test_transpose_into_unary(suite_tmpdir, ep_library: Path, op_type: str) -> None:
+    # Transpose produces a non-contiguous view; the unary/sqr CPU kernels assert
+    # nb00 == sizeof(float). Regression guard for piper-style Transpose -> math
+    # chains that would otherwise abort inside ggml.
+    shape = [2, 3, 4]
+    perm = [2, 0, 1]
+    out_shape = [shape[p] for p in perm]
+    x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)
+    y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, out_shape)
+    nodes = [helper.make_node("Transpose", ["x"], ["t"], name="transpose_0", perm=perm)]
+    initializers = []
+    if op_type == "Pow":
+        import onnx
+        exp_t = onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), name="exp")
+        initializers.append(exp_t)
+        nodes.append(helper.make_node("Pow", ["t", "exp"], ["y"], name="pow_0"))
+    else:
+        nodes.append(helper.make_node(op_type, ["t"], ["y"], name=f"{op_type.lower()}_0"))
+    graph = helper.make_graph(nodes, f"transpose_{op_type.lower()}", [x_info], [y_info],
+                              initializer=initializers)
+    model_path = ensure_model(suite_tmpdir, graph)
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0.5, 2.0, shape).astype(np.float32)
+    assert_model_matches_cpu(model_path, ep_library, "y", {"x": x})
+
+
+@pytest.mark.parametrize("op_type", ["Sqrt", "Sigmoid", "Pow", "Exp", "Abs"])
+def test_transpose_ne0_one_into_unary(
+    suite_tmpdir, ep_library: Path, op_type: str
+) -> None:
+    # Piper regression: a Transpose whose post-permute ne[0]==1 slips past
+    # ggml_is_contiguous but still has nb[0] != type_size; unary CPU kernels
+    # assert nb00 == sizeof(src0_t) unconditionally. The emitter must force
+    # cont based on the stride, not the is_contiguous helper.
+    import onnx
+    shape = [1, 192, 1, 1]  # the exact ne pattern observed in piper
+    perm = [1, 0, 2, 3]     # ne[0]=1, post-permute nb[0]=192*4
+    out_shape = [shape[p] for p in perm]
+    x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)
+    y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, out_shape)
+    initializers = []
+    nodes = [helper.make_node("Transpose", ["x"], ["t"], perm=perm)]
+    if op_type == "Pow":
+        initializers.append(onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), name="exp"))
+        nodes.append(helper.make_node("Pow", ["t", "exp"], ["y"]))
+    else:
+        nodes.append(helper.make_node(op_type, ["t"], ["y"]))
+    graph = helper.make_graph(
+        nodes, f"tr_ne0_{op_type}", [x_info], [y_info], initializer=initializers
+    )
+    model_path = ensure_model(suite_tmpdir, graph)
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0.5, 2.0, shape).astype(np.float32)
+    assert_model_matches_cpu(model_path, ep_library, "y", {"x": x})
+
+
+@pytest.mark.parametrize(
+    "op_type",
+    ["Add", "Sub", "Mul", "Div"],
+)
+def test_transpose_into_binary(suite_tmpdir, ep_library: Path, op_type: str) -> None:
+    # Transpose -> binary elementwise; some ggml binary kernels also assert
+    # contiguous source.
+    import onnx
+    shape = [2, 3, 4]
+    perm = [2, 0, 1]
+    out_shape = [shape[p] for p in perm]
+    x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)
+    y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, out_shape)
+    const = onnx.numpy_helper.from_array(
+        np.ones(out_shape, dtype=np.float32), name="c"
+    )
+    nodes = [
+        helper.make_node("Transpose", ["x"], ["t"], name="transpose_0", perm=perm),
+        helper.make_node(op_type, ["t", "c"], ["y"], name=f"{op_type.lower()}_0"),
+    ]
+    graph = helper.make_graph(
+        nodes, f"transpose_{op_type.lower()}", [x_info], [y_info], initializer=[const]
+    )
+    model_path = ensure_model(suite_tmpdir, graph)
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0.5, 2.0, shape).astype(np.float32)
+    assert_model_matches_cpu(model_path, ep_library, "y", {"x": x})
+
+
+@pytest.mark.parametrize("op_type", ["Sqrt", "Sigmoid", "Pow", "Abs", "Log"])
+def test_slice_into_unary(suite_tmpdir, ep_library: Path, op_type: str) -> None:
+    # Slice produces a view; feeding it directly into a CPU unary kernel must
+    # not fail on nb00 == sizeof.
+    import onnx
+    shape = [2, 6, 4]
+    x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)
+    y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3, 4])
+    initializers = [
+        onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="starts"),
+        onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), name="ends"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="axes"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="steps"),
+    ]
+    nodes = [
+        helper.make_node("Slice", ["x", "starts", "ends", "axes", "steps"], ["s"]),
+    ]
+    if op_type == "Pow":
+        initializers.append(onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), name="exp"))
+        nodes.append(helper.make_node("Pow", ["s", "exp"], ["y"]))
+    else:
+        nodes.append(helper.make_node(op_type, ["s"], ["y"]))
+    graph = helper.make_graph(nodes, f"slice_{op_type}", [x_info], [y_info], initializer=initializers)
+    model_path = ensure_model(suite_tmpdir, graph)
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0.5, 2.0, shape).astype(np.float32)
+    assert_model_matches_cpu(model_path, ep_library, "y", {"x": x})
+
+
+@pytest.mark.parametrize("op_type", ["Sqrt", "Sigmoid", "Pow"])
+def test_transpose_reshape_into_unary(suite_tmpdir, ep_library: Path, op_type: str) -> None:
+    import onnx
+    shape = [2, 3, 4]
+    perm = [2, 0, 1]  # -> [4, 2, 3]
+    x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)
+    y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, [4, 6])
+    initializers = [onnx.numpy_helper.from_array(np.array([4, 6], dtype=np.int64), name="shape")]
+    nodes = [
+        helper.make_node("Transpose", ["x"], ["t"], perm=perm),
+        helper.make_node("Reshape", ["t", "shape"], ["r"]),
+    ]
+    if op_type == "Pow":
+        initializers.append(onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), name="exp"))
+        nodes.append(helper.make_node("Pow", ["r", "exp"], ["y"]))
+    else:
+        nodes.append(helper.make_node(op_type, ["r"], ["y"]))
+    graph = helper.make_graph(nodes, f"tr_{op_type}", [x_info], [y_info], initializer=initializers)
+    model_path = ensure_model(suite_tmpdir, graph)
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0.5, 2.0, shape).astype(np.float32)
+    assert_model_matches_cpu(model_path, ep_library, "y", {"x": x})
 
 
 def test_abs_float16(suite_tmpdir, ep_library: Path) -> None:
@@ -1700,6 +1844,173 @@ def build_loop_arange_folded_reshape_model(tmpdir: Path) -> Path:
     return ensure_model(tmpdir, graph)
 
 
+def build_loop_arange_identity_alias_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+
+    starts = helper.make_tensor("starts", TensorProto.INT64, [1], [0])
+    ends = helper.make_tensor("ends", TensorProto.INT64, [1], [1])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+    squeeze_axes = helper.make_tensor("squeeze_axes", TensorProto.INT64, [1], [0])
+    cond = helper.make_tensor("loop_cond", TensorProto.BOOL, [], [True])
+    start = helper.make_tensor("loop_start", TensorProto.INT32, [], [2])
+    delta = helper.make_tensor("loop_delta", TensorProto.INT32, [], [1])
+
+    body_in_iter = helper.make_tensor_value_info("i", TensorProto.INT64, [])
+    body_in_cond = helper.make_tensor_value_info("cond_in", TensorProto.BOOL, [])
+    body_in_prev = helper.make_tensor_value_info("prev", TensorProto.INT32, [])
+    body_out_cond = helper.make_tensor_value_info("cond_out", TensorProto.BOOL, [])
+    body_out_current = helper.make_tensor_value_info("current", TensorProto.INT32, [])
+    body_out_range = helper.make_tensor_value_info("range", TensorProto.INT32, [])
+    body_nodes = [
+        helper.make_node("Identity", ["prev"], ["prev_alias"], name="loop_prev_alias"),
+        helper.make_node("Add", ["prev_alias", "loop_delta"], ["current"], name="loop_add"),
+        helper.make_node("Identity", ["cond_in"], ["cond_out"], name="loop_cond_out"),
+        helper.make_node("Identity", ["prev_alias"], ["range"], name="loop_range"),
+    ]
+    body = helper.make_graph(
+        body_nodes,
+        "loop_body_identity_alias",
+        [body_in_iter, body_in_cond, body_in_prev],
+        [body_out_cond, body_out_current, body_out_range],
+    )
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts", "ends", "axes", "steps"], ["trip_count_vec"], name="slice_trip_count"),
+        helper.make_node("Squeeze", ["trip_count_vec", "squeeze_axes"], ["trip_count_i64"], name="squeeze_trip_count"),
+        helper.make_node(
+            "Loop",
+            ["trip_count_i64", "loop_cond", "loop_start"],
+            ["loop_final", "loop_range"],
+            name="shape_loop",
+            body=body,
+        ),
+        helper.make_node("Cast", ["loop_range"], ["reshape_shape"], name="cast_shape", to=TensorProto.INT64),
+        helper.make_node("Reshape", ["x", "reshape_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "loop_arange_identity_alias_folded_reshape",
+        [x],
+        [y],
+        initializer=[starts, ends, axes, steps, squeeze_axes, cond, start, delta],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_partial_shape_loop_arange_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+
+    starts = helper.make_tensor("starts", TensorProto.INT64, [1], [1])
+    ends = helper.make_tensor("ends", TensorProto.INT64, [1], [2])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+    squeeze_axes = helper.make_tensor("squeeze_axes", TensorProto.INT64, [1], [0])
+    cond = helper.make_tensor("loop_cond", TensorProto.BOOL, [], [True])
+    start = helper.make_tensor("loop_start", TensorProto.INT32, [], [2])
+    delta = helper.make_tensor("loop_delta", TensorProto.INT32, [], [1])
+
+    body_in_iter = helper.make_tensor_value_info("i", TensorProto.INT64, [])
+    body_in_cond = helper.make_tensor_value_info("cond_in", TensorProto.BOOL, [])
+    body_in_prev = helper.make_tensor_value_info("prev", TensorProto.INT32, [])
+    body_out_cond = helper.make_tensor_value_info("cond_out", TensorProto.BOOL, [])
+    body_out_current = helper.make_tensor_value_info("current", TensorProto.INT32, [])
+    body_out_range = helper.make_tensor_value_info("range", TensorProto.INT32, [])
+    body_nodes = [
+        helper.make_node("Add", ["prev", "loop_delta"], ["current"], name="loop_add"),
+        helper.make_node("Identity", ["prev"], ["range"], name="loop_range"),
+        helper.make_node("Identity", ["cond_in"], ["cond_out"], name="loop_cond_out"),
+    ]
+    body = helper.make_graph(
+        body_nodes,
+        "partial_shape_loop_body",
+        [body_in_iter, body_in_cond, body_in_prev],
+        [body_out_cond, body_out_current, body_out_range],
+    )
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts", "ends", "axes", "steps"], ["trip_count_vec"], name="slice_trip_count"),
+        helper.make_node("Squeeze", ["trip_count_vec", "squeeze_axes"], ["trip_count_i64"], name="squeeze_trip_count"),
+        helper.make_node(
+            "Loop",
+            ["trip_count_i64", "loop_cond", "loop_start"],
+            ["loop_final", "loop_range"],
+            name="shape_loop",
+            body=body,
+        ),
+        helper.make_node("Cast", ["loop_range"], ["reshape_shape"], name="cast_shape", to=TensorProto.INT64),
+        helper.make_node("Reshape", ["x", "reshape_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "partial_shape_loop_arange_folded_reshape",
+        [x],
+        [y],
+        initializer=[starts, ends, axes, steps, squeeze_axes, cond, start, delta],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_partial_shape_loop_arange_identity_alias_folded_reshape_model(tmpdir: Path) -> Path:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+
+    starts = helper.make_tensor("starts", TensorProto.INT64, [1], [1])
+    ends = helper.make_tensor("ends", TensorProto.INT64, [1], [2])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    steps = helper.make_tensor("steps", TensorProto.INT64, [1], [1])
+    squeeze_axes = helper.make_tensor("squeeze_axes", TensorProto.INT64, [1], [0])
+    cond = helper.make_tensor("loop_cond", TensorProto.BOOL, [], [True])
+    start = helper.make_tensor("loop_start", TensorProto.INT32, [], [2])
+    delta = helper.make_tensor("loop_delta", TensorProto.INT32, [], [1])
+
+    body_in_iter = helper.make_tensor_value_info("i", TensorProto.INT64, [])
+    body_in_cond = helper.make_tensor_value_info("cond_in", TensorProto.BOOL, [])
+    body_in_prev = helper.make_tensor_value_info("prev", TensorProto.INT32, [])
+    body_out_cond = helper.make_tensor_value_info("cond_out", TensorProto.BOOL, [])
+    body_out_current = helper.make_tensor_value_info("current", TensorProto.INT32, [])
+    body_out_range = helper.make_tensor_value_info("range", TensorProto.INT32, [])
+    body_nodes = [
+        helper.make_node("Identity", ["prev"], ["prev_alias"], name="loop_prev_alias"),
+        helper.make_node("Add", ["prev_alias", "loop_delta"], ["current"], name="loop_add"),
+        helper.make_node("Identity", ["cond_in"], ["cond_out"], name="loop_cond_out"),
+        helper.make_node("Identity", ["prev_alias"], ["range"], name="loop_range"),
+    ]
+    body = helper.make_graph(
+        body_nodes,
+        "partial_shape_loop_body_identity_alias",
+        [body_in_iter, body_in_cond, body_in_prev],
+        [body_out_cond, body_out_current, body_out_range],
+    )
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("Slice", ["shape", "starts", "ends", "axes", "steps"], ["trip_count_vec"], name="slice_trip_count"),
+        helper.make_node("Squeeze", ["trip_count_vec", "squeeze_axes"], ["trip_count_i64"], name="squeeze_trip_count"),
+        helper.make_node(
+            "Loop",
+            ["trip_count_i64", "loop_cond", "loop_start"],
+            ["loop_final", "loop_range"],
+            name="shape_loop",
+            body=body,
+        ),
+        helper.make_node("Cast", ["loop_range"], ["reshape_shape"], name="cast_shape", to=TensorProto.INT64),
+        helper.make_node("Reshape", ["x", "reshape_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "partial_shape_loop_arange_identity_alias_folded_reshape",
+        [x],
+        [y],
+        initializer=[starts, ends, axes, steps, squeeze_axes, cond, start, delta],
+    )
+    return ensure_model(tmpdir, graph)
+
+
 @pytest.mark.parametrize(
     "builder",
     [
@@ -1711,6 +2022,9 @@ def build_loop_arange_folded_reshape_model(tmpdir: Path) -> Path:
         build_partial_shape_unsqueeze_concat_folded_reshape_model,
         build_partial_shape_constant_of_shape_model,
         build_loop_arange_folded_reshape_model,
+        build_loop_arange_identity_alias_folded_reshape_model,
+        build_partial_shape_loop_arange_folded_reshape_model,
+        build_partial_shape_loop_arange_identity_alias_folded_reshape_model,
     ],
 )
 def test_compile_time_shape_subgraph_folding(suite_tmpdir, ep_library: Path, builder) -> None:
@@ -1725,6 +2039,11 @@ def test_compile_time_shape_subgraph_folding(suite_tmpdir, ep_library: Path, bui
             "x": rng.standard_normal((3, 4, 5)).astype(np.float32),
             "data": rng.standard_normal((20,)).astype(np.float32),
         }
+    elif (
+        builder is build_partial_shape_loop_arange_folded_reshape_model
+        or builder is build_partial_shape_loop_arange_identity_alias_folded_reshape_model
+    ):
+        inputs = {"x": rng.standard_normal((1, 2, 3)).astype(np.float32)}
     elif builder is build_partial_shape_constant_of_shape_model:
         inputs = {
             "x": rng.standard_normal((3, 4, 5)).astype(np.float32),
@@ -1740,6 +2059,8 @@ def test_compile_time_shape_subgraph_folding(suite_tmpdir, ep_library: Path, bui
     if (
         builder is build_partial_shape_slice_folded_reshape_model
         or builder is build_partial_shape_unsqueeze_concat_folded_reshape_model
+        or builder is build_partial_shape_loop_arange_folded_reshape_model
+        or builder is build_partial_shape_loop_arange_identity_alias_folded_reshape_model
     ):
         profile = end_profiling_profile(ggml)
         ggml_events = [
@@ -2349,6 +2670,32 @@ def test_shape_concat_reshape_then_slice_runs_on_ggml(
     assert "GGMLExecutionProvider" in providers, "no GGML partition executed"
 
 
+def test_shape_reduce_round_ceil_range_reshape_runs_on_ggml(
+        suite_tmpdir, ep_library: Path) -> None:
+    model_path = build_shape_reduce_round_ceil_range_reshape_model(suite_tmpdir)
+    rng = np.random.default_rng(41)
+    inputs = {"x": rng.standard_normal((2, 3)).astype(np.float32)}
+    cpu = cpu_session(model_path)
+    ggml = ggml_session(model_path, ep_library)
+    expected = cpu.run(["y"], inputs)[0]
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    profile = end_profiling_profile(ggml)
+    cpu_shape_math = [
+        e for e in profile
+        if e.get("cat") == "Node"
+        and e.get("args", {}).get("provider") == "CPUExecutionProvider"
+        and e.get("args", {}).get("op_name") in {"ReduceMin", "Ceil", "Round", "Range"}
+    ]
+    assert not cpu_shape_math, f"shape math fell back to CPU: {cpu_shape_math}"
+    providers = {
+        e.get("args", {}).get("provider")
+        for e in profile
+        if e.get("cat") == "Node"
+    }
+    assert "GGMLExecutionProvider" in providers, "no GGML partition executed"
+
+
 def build_shape_concat_reshape_then_slice_chain_model(tmpdir: Path) -> Path:
     # Like build_shape_concat_reshape_then_slice_model, but the Reshape output
     # is first Transposed and then Sliced — exercises the Phase-2 Transpose
@@ -2435,6 +2782,40 @@ def build_shape_concat_reshape_then_expand_model(tmpdir: Path) -> Path:
         [x],
         [y],
         initializer=[starts0, ends0, starts1_i32, ends1_i32, axes0, steps0, one, expand_shape],
+    )
+    return ensure_model(tmpdir, graph)
+
+
+def build_shape_reduce_round_ceil_range_reshape_model(tmpdir: Path) -> Path:
+    # Compile-time shape math with ops that meta_eval did not previously fold:
+    # ReduceMin, Ceil, Round, and Range. All of these are used only to build
+    # the Reshape target, so none should execute on CPU at runtime.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 2, 3])
+
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    one_f = helper.make_tensor("one_f", TensorProto.FLOAT, [], [1.0])
+    one_i64_start = helper.make_tensor("one_i64_start", TensorProto.INT64, [], [1])
+    one_i64 = helper.make_tensor("one_i64", TensorProto.INT64, [], [1])
+
+    nodes = [
+        helper.make_node("Shape", ["x"], ["shape"], name="shape_0"),
+        helper.make_node("ReduceMin", ["shape"], ["min_dim"], name="reduce_min_0", keepdims=0, axes=[0]),
+        helper.make_node("Cast", ["min_dim"], ["min_dim_f"], name="cast_to_float", to=TensorProto.FLOAT),
+        helper.make_node("Div", ["min_dim_f", "one_f"], ["half_dim"], name="div_0"),
+        helper.make_node("Ceil", ["half_dim"], ["ceil_dim"], name="ceil_0"),
+        helper.make_node("Round", ["ceil_dim"], ["round_dim"], name="round_0"),
+        helper.make_node("Cast", ["round_dim"], ["limit_i64"], name="cast_to_i64", to=TensorProto.INT64),
+        helper.make_node("Range", ["one_i64_start", "limit_i64", "one_i64"], ["range_dim"], name="range_0"),
+        helper.make_node("Concat", ["range_dim", "shape"], ["target_shape"], name="concat_0", axis=0),
+        helper.make_node("Reshape", ["x", "target_shape"], ["y"], name="reshape_0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "shape_reduce_round_ceil_range_reshape",
+        [x],
+        [y],
+        initializer=[axes, one_f, one_i64_start, one_i64],
     )
     return ensure_model(tmpdir, graph)
 
