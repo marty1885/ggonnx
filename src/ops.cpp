@@ -3116,10 +3116,15 @@ EmitResult EmitConcatNode(ggml_context* ctx,
   return EmitOutputs{acc};
 }
 
-// ONNX Slice (opset >= 10): data, starts, ends, axes?, steps?. We handle the
-// common case where starts/ends/axes/steps are constant int64 initializers and
-// all steps are 1 — that lets us lower the op to a single ggml_view_4d, which
-// is a zero-copy aliased view of the source buffer.
+// ONNX Slice (opset >= 10): data, starts, ends, axes?, steps?. We require
+// constant int64 initializers for the index inputs so the view shape can be
+// resolved at compile time. Step==1 lowers to a rectangular ggml_view_4d (a
+// zero-copy aliased view); step>1 multiplies the per-axis stride in that
+// same view. The one case we reject is step>1 on ggml axis 0 (= the last
+// ONNX axis), because ggml_view_*d forces nb[0]=type_size and there is no
+// way to express a non-unit innermost stride. Negative steps would need a
+// real reverse op (or ggml_get_rows with a constant index tensor wired into
+// the EP's constant-upload path) and aren't supported either.
 SupportResult IsSupportedSliceNode(Ort::ConstNode node, const MetaAnalysis* meta) {
   const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
@@ -3188,10 +3193,34 @@ SupportResult IsSupportedSliceNode(Ort::ConstNode node, const MetaAnalysis* meta
     if (steps->size() != starts->size()) {
       return support_error("Slice: steps length does not match starts");
     }
-    for (int64_t s : *steps) {
-      if (s != 1) {
+    // Resolve axes for the per-step axis check below.
+    std::vector<int64_t> axes_resolved;
+    if (inputs.size() >= 4 && inputs[3] != nullptr) {
+      const auto axes = readConstantInputArray<int64_t>(node, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
+      axes_resolved = *axes;
+    } else {
+      axes_resolved.resize(starts->size());
+      for (size_t i = 0; i < starts->size(); ++i) axes_resolved[i] = static_cast<int64_t>(i);
+    }
+    const int64_t rank = static_cast<int64_t>(resolved->size());
+    for (size_t k = 0; k < steps->size(); ++k) {
+      const int64_t s = (*steps)[k];
+      if (s == 0) {
+        return support_error("Slice: step=0 is illegal");
+      }
+      if (s < 0) {
+        return support_error("Slice: negative step=" + std::to_string(s) +
+                             " not supported (would require reverse / get_rows path)");
+      }
+      if (s == 1) continue;
+      int64_t onnx_axis = axes_resolved[k];
+      if (onnx_axis < 0) onnx_axis += rank;
+      // ggml axis 0 == last ONNX axis; ggml_view_*d forces nb[0]=type_size so
+      // we can't express a strided innermost axis as a view.
+      if (onnx_axis == rank - 1) {
         return support_error("Slice: step=" + std::to_string(s) +
-                             " not supported (only step==1)");
+                             " on the last ONNX axis is not view-expressible "
+                             "(ggml_view forces nb[0]=type_size)");
       }
     }
   }
@@ -3225,8 +3254,18 @@ void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
     for (size_t i = 0; i < starts->size(); ++i) axes[i] = static_cast<int64_t>(i);
   }
 
+  std::vector<int64_t> steps;
+  if (inputs.size() == 5 && inputs[4] != nullptr) {
+    const auto steps_opt = readConstantInputArray<int64_t>(node, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
+    GGONNX_ASSERT(steps_opt.has_value(), "Slice compile: steps must be a constant int64 initializer");
+    steps = *steps_opt;
+  } else {
+    steps.assign(starts->size(), 1);
+  }
+
   NodeDesc::SliceAttrs attrs;
   attrs.ggml_starts.fill(0);
+  attrs.ggml_steps.fill(1);
   // Default: each dim passes through unsliced.
   for (int64_t i = 0; i < rank; ++i) {
     attrs.ggml_ne[rank - 1 - i] = data_dims[i];
@@ -3241,8 +3280,12 @@ void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
     GGONNX_ASSERT(onnx_axis >= 0 && onnx_axis < rank,
                   "Slice compile: axis out of range");
     const int64_t dim = data_dims[onnx_axis];
+    const int64_t step = steps[k];
+    GGONNX_ASSERT(step > 0,
+                  "Slice compile: support predicate must reject non-positive step");
 
-    // ONNX clamping rules: clamp start to [0, dim], clamp end to [0, dim].
+    // ONNX clamping rules for positive step: clamp start to [0, dim],
+    // clamp end to [0, dim]. Output length = ceil((e - s) / step).
     auto clamp = [](int64_t v, int64_t lo, int64_t hi) {
       return v < lo ? lo : (v > hi ? hi : v);
     };
@@ -3252,11 +3295,13 @@ void CompileSliceAttributes(Ort::ConstNode node, NodeDesc* compiled_node, const 
     if (e < 0) e += dim;
     s = clamp(s, 0, dim);
     e = clamp(e, 0, dim);
-    const int64_t length = e > s ? e - s : 0;
+    const int64_t span = e > s ? e - s : 0;
+    const int64_t length = span > 0 ? (span + step - 1) / step : 0;
 
     const int ggml_axis = static_cast<int>(rank - 1 - onnx_axis);
     attrs.ggml_starts[ggml_axis] = s;
     attrs.ggml_ne[ggml_axis] = length;
+    attrs.ggml_steps[ggml_axis] = step;
   }
 
   compiled_node->attrs = attrs;
@@ -3271,17 +3316,31 @@ EmitResult EmitSliceNode(ggml_context* ctx,
   ggml_tensor* data = values[node.inputs[0]];
   GGONNX_NOT_NULL(data, "compiled Slice node missing GGML data input");
 
-  // Inherit source strides — a step==1 slice is a plain rectangular view.
+  // ggml_view_*d forces nb[0]=type_size, so the source's innermost stride
+  // must already be the element size; otherwise the view would silently
+  // re-interpret the buffer. This is the same loophole that bit unary ops
+  // (see memory note) — guard explicitly.
+  if (data->nb[0] != ggml_type_size(data->type)) {
+    data = ggml_cont(ctx, data);
+  }
+
+  // Per-axis stride in the view = source nb * step. step==1 axes inherit the
+  // source stride directly (rectangular view); step>1 multiplies it.
   const size_t offset_bytes =
       static_cast<size_t>(attrs->ggml_starts[0]) * data->nb[0] +
       static_cast<size_t>(attrs->ggml_starts[1]) * data->nb[1] +
       static_cast<size_t>(attrs->ggml_starts[2]) * data->nb[2] +
       static_cast<size_t>(attrs->ggml_starts[3]) * data->nb[3];
 
+  GGONNX_ASSERT(attrs->ggml_steps[0] == 1,
+                "Slice emit: step on ggml axis 0 should have been rejected by support predicate");
+
   ggml_tensor* view = ggml_view_4d(ctx, data,
                                    attrs->ggml_ne[0], attrs->ggml_ne[1],
                                    attrs->ggml_ne[2], attrs->ggml_ne[3],
-                                   data->nb[1], data->nb[2], data->nb[3],
+                                   data->nb[1] * static_cast<size_t>(attrs->ggml_steps[1]),
+                                   data->nb[2] * static_cast<size_t>(attrs->ggml_steps[2]),
+                                   data->nb[3] * static_cast<size_t>(attrs->ggml_steps[3]),
                                    offset_bytes);
   // Materialize because downstream kernels (and the graph-output copy path)
   // require contiguous memory. The view keeps the same dims but aliases the

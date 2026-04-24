@@ -1589,6 +1589,75 @@ def test_single_slice(suite_tmpdir, ep_library: Path, x_shape, y_shape, starts, 
     assert_all_nodes_run_on_ggml(ggml)
 
 
+@pytest.mark.parametrize(
+    "x_shape,starts,ends,axes,steps",
+    [
+        # step>1 on a non-last ONNX axis is view-expressible (supported on GGML).
+        # Rank 2: step on axis 0.
+        ((10, 4), [0], [10], [0], [2]),
+        ((10, 4), [1], [10], [0], [3]),
+        # Rank 3: step on axis 0 and on a middle axis.
+        ((8, 6, 4), [0], [8], [0], [2]),
+        ((8, 6, 4), [1], [6], [1], [2]),
+        # Rank 4: step on a middle (NCHW spatial-row) axis.
+        ((1, 3, 8, 8), [0], [8], [2], [2]),
+        ((2, 4, 6, 8), [1, 0], [4, 6], [1, 2], [2, 3]),
+        # End clamped beyond dim with stride.
+        ((10, 4), [0], [99], [0], [3]),
+    ],
+)
+def test_slice_step_gt_one_on_ggml(suite_tmpdir, ep_library: Path, x_shape, starts, ends, axes, steps) -> None:
+    # Compute output shape via numpy so we don't have to spell it inline.
+    rng = np.random.default_rng(33)
+    x = rng.standard_normal(x_shape).astype(np.float32)
+    sl = [slice(None)] * len(x_shape)
+    for k, a in enumerate(axes):
+        sl[a] = slice(starts[k], ends[k], steps[k])
+    expected_shape = x[tuple(sl)].shape
+    model_path = build_slice_model(
+        suite_tmpdir, x_shape, expected_shape, starts, ends, axes=axes, steps=steps
+    )
+    cpu = cpu_session(model_path)
+    inputs = {"x": x}
+    expected = cpu.run(["y"], inputs)[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], inputs)[0]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+    assert_all_nodes_run_on_ggml(ggml)
+
+
+@pytest.mark.parametrize(
+    "x_shape,starts,ends,axes,steps,reason",
+    [
+        # step>1 on the LAST ONNX axis = ggml axis 0; ggml_view forces nb[0]=type_size
+        # so we can't express it as a view — must fall back to CPU.
+        ((4, 10), [0], [10], [1], [2], "step on innermost axis"),
+        # Negative step needs reverse / get_rows; not supported.
+        ((10,), [9], [-11], [0], [-1], "negative step"),
+        # step=0 is illegal in ONNX; we reject (CPU also rejects, but ggml support
+        # predicate must not let it through).
+    ],
+)
+def test_slice_unsupported_step_falls_back_cleanly(
+    suite_tmpdir, ep_library: Path, x_shape, starts, ends, axes, steps, reason
+) -> None:
+    rng = np.random.default_rng(34)
+    x = rng.standard_normal(x_shape).astype(np.float32)
+    sl = [slice(None)] * len(x_shape)
+    for k, a in enumerate(axes):
+        sl[a] = slice(starts[k], ends[k], steps[k])
+    out_shape = x[tuple(sl)].shape
+    model_path = build_slice_model(
+        suite_tmpdir, x_shape, out_shape, starts, ends, axes=axes, steps=steps
+    )
+    cpu = cpu_session(model_path)
+    expected = cpu.run(["y"], {"x": x})[0]
+    ggml = ggml_session(model_path, ep_library)
+    got = ggml.run(["y"], {"x": x})[0]
+    # Numerically correct (CPU fallback) — we just don't assert ggml ran the node.
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+
+
 def build_shape_folded_reshape_model(tmpdir: Path) -> Path:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])

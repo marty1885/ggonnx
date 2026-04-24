@@ -226,10 +226,15 @@ struct NodeDesc {
     std::array<int, GGML_MAX_DIMS> ggml_perm{0, 1, 2, 3};
   };
   struct SliceAttrs {
-    // Slice is implemented as a ggml_view with step == 1. Both arrays are in
-    // padded GGML axis order: untouched dims get start=0 and full size.
+    // Slice lowers to ggml_view_4d. For step==1 axes the view is rectangular;
+    // for step>1 axes the view multiplies the source stride by `step`. ggml
+    // forces nb[0] = type_size, so step>1 on ggml axis 0 (= last ONNX axis) is
+    // rejected by the support predicate.
+    // Arrays are in padded GGML axis order: untouched dims get start=0,
+    // full ne, and step=1.
     std::array<int64_t, GGML_MAX_DIMS> ggml_starts{0, 0, 0, 0};
     std::array<int64_t, GGML_MAX_DIMS> ggml_ne{1, 1, 1, 1};
+    std::array<int64_t, GGML_MAX_DIMS> ggml_steps{1, 1, 1, 1};
   };
   struct SplitAttrs {
     int ggml_axis{0};
