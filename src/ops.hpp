@@ -207,6 +207,14 @@ struct NodeDesc {
   struct InstanceNormAttrs {
     float epsilon{1e-5f};
   };
+  struct NormAttrs {
+    // Resolved non-negative axis: normalize over trailing (rank - axis) ONNX
+    // dims. Scale (and bias, if present) must have shape matching X.shape[axis:].
+    int axis{0};
+    int onnx_rank{0};
+    float epsilon{1e-5f};
+    bool has_bias{false};
+  };
   struct BatchNormAttrs {
     float epsilon{1e-5f};
     // ONNX input rank (2..4 supported). The channel axis in ONNX is always 1,
@@ -320,6 +328,7 @@ struct NodeDesc {
                              Pool2DAttrs,
                              PadAttrs,
                              InstanceNormAttrs,
+                             NormAttrs,
                              BatchNormAttrs,
                              UpsampleAttrs,
                              TransposeAttrs,

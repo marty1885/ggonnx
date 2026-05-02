@@ -39,10 +39,16 @@ _KNOWN_CRASHERS: set[str] = {
     "test_affine_grid_3d_expanded",
 }
 
-# Cases where the GGML EP owns every node but produces wrong numbers.
+# Cases where the GGML EP claims nodes and then emits wrong shapes or numbers.
 # These are real correctness bugs — xfail (strict=False) keeps CI green while
 # the bug is tracked. Remove the entry once the underlying op is fixed.
-_KNOWN_NUMERIC_FAILURES: set[str] = set()
+_KNOWN_NUMERIC_FAILURES: set[str] = {
+    # Shape-tracking bug: one of our partitions emits a rank-2 tensor that
+    # feeds a CPU Transpose with perm size 3. Bug is inside a multi-partition
+    # graph with nested If branches; needs dedicated debugging.
+    "test_affine_grid_2d_expanded",
+    "test_affine_grid_2d_align_corners_expanded",
+}
 
 
 def _discover_cases() -> list[Path]:
@@ -122,23 +128,44 @@ def test_onnx_node_case(case: Path, ep_library: Path) -> None:
     try:
         session = ggml_session(model_path, ep_library)
     except Exception as e:
+        # ORT wraps EP compile failures with the partition name
+        # "GGMLExecutionProvider_<hash>_<i>". If we see that, our EP claimed
+        # some nodes and then failed to compile them — a real bug, not a
+        # coverage gap.
+        if "GGMLExecutionProvider_" in str(e):
+            pytest.fail(f"EP claimed nodes but failed to compile: {e}")
         pytest.skip(f"session create failed: {e}")
 
     # Run every dataset before inspecting the profile. ORT accumulates node
     # events across runs until end_profiling() is called, so one check covers
-    # the whole case.
+    # the whole case. Defer run exceptions until after we've read the profile
+    # so we can tell "EP never claimed these nodes" from "EP ran and exploded".
     results = []
+    run_exception: tuple[str, Exception] | None = None
     try:
         for ds_name, feeds, expected in datasets:
             try:
                 actual = session.run(None, feeds)
             except Exception as e:
-                pytest.skip(f"{ds_name}: session.run failed: {e}")
+                run_exception = (ds_name, e)
+                break
             results.append((ds_name, expected, actual))
     finally:
         profile = end_profiling_profile(session)
 
     node_events = [ev for ev in profile if ev.get("cat") == "Node"]
+    ggml_events = [
+        ev
+        for ev in node_events
+        if ev.get("args", {}).get("provider") == "GGMLExecutionProvider"
+    ]
+
+    if run_exception is not None:
+        ds_name, err = run_exception
+        if ggml_events or "GGMLExecutionProvider_" in str(err):
+            pytest.fail(f"{ds_name}: EP ran nodes then failed at runtime: {err}")
+        pytest.skip(f"{ds_name}: session.run failed: {err}")
+
     if not node_events:
         pytest.skip("no node events in profile")
 

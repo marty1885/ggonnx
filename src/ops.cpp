@@ -252,8 +252,15 @@ bool inferIntegerSpatialScale(const TensorMetadata& x,
 SupportResult IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_view op_type,
                                        const MetaAnalysis* /*meta*/) {
   SUPPORT_CHECK(op_type == "Add" || op_type == "Sub" || op_type == "Mul" || op_type == "Div" ||
-                    op_type == "Max" || op_type == "Min",
+                    op_type == "Max" || op_type == "Min" || op_type == "Mod",
                 "unexpected binary op registration");
+  // Mod has two semantics; we only handle fmod=1 (C fmod, sign-of-dividend)
+  // with float inputs. The default fmod=0 is Python-style and is typically
+  // paired with integer inputs, which we don't support here anyway.
+  if (op_type == "Mod") {
+    const int64_t fmod_attr = readNodeAttribute<int64_t>(node, "fmod").value_or(0);
+    SUPPORT_CHECK(fmod_attr == 1, "Mod: only fmod=1 (C fmod semantics) is supported");
+  }
 
   const auto inputs = node.GetInputs();
   const auto outputs = node.GetOutputs();
@@ -280,6 +287,10 @@ SupportResult IsSupportedElementwiseBinaryNode(Ort::ConstNode node, std::string_
   if ((op_type == "Max" || op_type == "Min") &&
       lhs.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
     return support_error("Max/Min are only supported for float32 tensors");
+  }
+  // Mod's fmod=1 path uses ggml_unary(TRUNC) which is float-only.
+  if (op_type == "Mod" && lhs.element_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    return support_error("Mod: only float32 supported (fmod=1 path)");
   }
   SUPPORT_CHECK(rankSupportedByGGML(lhs) && rankSupportedByGGML(rhs) && rankSupportedByGGML(out),
                 "binary op rank exceeds GGML_MAX_DIMS");
@@ -502,6 +513,13 @@ EmitResult EmitElementwiseBinaryNode(ggml_context* ctx,
     ggml_tensor* combined = (op_type == "Max") ? ggml_add(ctx, sum, abs_diff)
                                                : ggml_sub(ctx, sum, abs_diff);
     return EmitOutputs{ggml_scale(ctx, combined, 0.5f)};
+  } else if (op_type == "Mod") {
+    // Float fmod semantics: r = a - trunc(a / b) * b. We only register Mod
+    // with fmod=1; fmod=0 (Python-style, sign of divisor) and integer types
+    // are rejected by the support predicate.
+    ggml_tensor* q = ggml_div(ctx, lhs, rhs);
+    ggml_tensor* t = ggml_unary(ctx, q, GGML_UNARY_OP_TRUNC);
+    return EmitOutputs{ggml_sub(ctx, lhs, ggml_mul(ctx, t, rhs))};
   }
 
   return std::nullopt;
@@ -997,6 +1015,12 @@ EmitResult EmitUnaryFloatNode(ggml_context* ctx,
   if (op == "Log")      return EmitOutputs{ggml_log(ctx, x)};
   if (op == "Erf")      return EmitOutputs{ggml_map_custom1(ctx, ggml_cont(ctx, x), ComputeErf,
                                                             GGML_N_TASKS_MAX, nullptr)};
+  if (op == "Reciprocal") {
+    // 1/x as ggml_div(ones, x). Build ones same-shape-as-x via scale_bias(x*0 + 1)
+    // so the op stays on whatever backend owns x (Vulkan / CPU / ...).
+    ggml_tensor* ones = ggml_scale_bias(ctx, x, 0.0f, 1.0f);
+    return EmitOutputs{ggml_div(ctx, ones, x)};
+  }
   if (op == "Softplus") return EmitOutputs{ggml_softplus(ctx, x)};
   if (op == "Elu")      return EmitOutputs{ggml_elu(ctx, x)};
   return std::nullopt;
@@ -2723,6 +2747,278 @@ EmitResult EmitInstanceNormalizationNode(ggml_context* ctx,
   return EmitOutputs{ggml_add(ctx, ggml_mul(ctx, norm, scale_4d), bias_4d)};
 }
 
+// Shared support predicate for LayerNormalization (with optional bias and
+// optional Mean/InvStdDev outputs) and RMSNormalization (no bias, single
+// output). ONNX normalizes over dims [axis..rank-1]; scale (and bias if
+// present) must match that shape. We lower by flattening those trailing ONNX
+// dims into GGML axis 0 so ggml_norm / ggml_rms_norm apply.
+static SupportResult IsSupportedNormLikeNode(Ort::ConstNode node, bool allow_bias,
+                                              bool allow_extra_outputs) {
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  const size_t num_inputs = inputs.size();
+  SUPPORT_CHECK(num_inputs >= 2 && num_inputs <= (allow_bias ? 3u : 2u),
+                "Norm: unexpected input arity");
+  const size_t max_outputs = allow_extra_outputs ? 3u : 1u;
+  SUPPORT_CHECK(outputs.size() >= 1 && outputs.size() <= max_outputs,
+                "Norm: unexpected output arity");
+  SUPPORT_CHECK(node.GetImplicitInputs().size() == 0, "Norm: implicit inputs not supported");
+  SUPPORT_CHECK(inputs[0] != nullptr && inputs[1] != nullptr && outputs[0] != nullptr,
+                "Norm: null input/output metadata");
+
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata scale = getTensorMetadata(inputs[1]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  SUPPORT_CHECK(x.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    scale.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    y.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "Norm: non-float dtype");
+  SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(y) && rankSupportedByGGML(scale),
+                "Norm: rank exceeds GGML_MAX_DIMS");
+  SUPPORT_CHECK(shapeIsFullyStatic(x.dims), "Norm: input shape not fully static");
+  SUPPORT_CHECK(shapeIsFullyStatic(scale.dims), "Norm: scale shape not fully static");
+
+  const int rank = static_cast<int>(x.dims.size());
+  SUPPORT_CHECK(rank > 0, "Norm: scalar input");
+  int axis = static_cast<int>(readNodeAttribute<int64_t>(node, "axis").value_or(-1));
+  if (axis < 0) axis += rank;
+  SUPPORT_CHECK(axis >= 0 && axis < rank, "Norm: axis out of range");
+
+  // Scale shape must match x.shape[axis:].
+  const int trailing = rank - axis;
+  SUPPORT_CHECK(static_cast<int>(scale.dims.size()) == trailing,
+                "Norm: scale rank does not match trailing X dims");
+  for (int i = 0; i < trailing; ++i) {
+    SUPPORT_CHECK(scale.dims[i] == x.dims[axis + i],
+                  "Norm: scale dim mismatch with X trailing dims");
+  }
+  if (allow_bias && num_inputs == 3 && inputs[2] != nullptr) {
+    const TensorMetadata bias = getTensorMetadata(inputs[2]);
+    SUPPORT_CHECK(bias.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                  "Norm: bias dtype must match X");
+    SUPPORT_CHECK(shapeIsFullyStatic(bias.dims) && bias.dims == scale.dims,
+                  "Norm: bias shape must match scale shape");
+  }
+  return support_ok();
+}
+
+static void CompileNormLikeAttributes(Ort::ConstNode node, NodeDesc* compiled_node) {
+  GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
+  const auto inputs = node.GetInputs();
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const int rank = static_cast<int>(x.dims.size());
+  int axis = static_cast<int>(readNodeAttribute<int64_t>(node, "axis").value_or(-1));
+  if (axis < 0) axis += rank;
+  NodeDesc::NormAttrs attrs;
+  attrs.axis = axis;
+  attrs.onnx_rank = rank;
+  attrs.epsilon = readNodeAttribute<float>(node, "epsilon").value_or(1e-5f);
+  attrs.has_bias = inputs.size() == 3 && inputs[2] != nullptr;
+  compiled_node->attrs = attrs;
+}
+
+SupportResult IsSupportedLayerNormalizationNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
+  return IsSupportedNormLikeNode(node, /*allow_bias=*/true, /*allow_extra_outputs=*/true);
+}
+
+SupportResult IsSupportedRMSNormalizationNode(Ort::ConstNode node, const MetaAnalysis* /*meta*/) {
+  return IsSupportedNormLikeNode(node, /*allow_bias=*/false, /*allow_extra_outputs=*/false);
+}
+
+void CompileLayerNormalizationAttributes(Ort::ConstNode node,
+                                         NodeDesc* compiled_node,
+                                         const MetaAnalysis* /*meta*/) {
+  CompileNormLikeAttributes(node, compiled_node);
+}
+
+void CompileRMSNormalizationAttributes(Ort::ConstNode node,
+                                       NodeDesc* compiled_node,
+                                       const MetaAnalysis* /*meta*/) {
+  CompileNormLikeAttributes(node, compiled_node);
+}
+
+// Emit helper: apply `norm_fn` (ggml_norm or ggml_rms_norm) over the trailing
+// (rank - axis) ONNX dims by flattening them into GGML axis 0, then broadcast
+// the scale and (optionally) add bias.
+static EmitResult EmitNormLike(ggml_context* ctx,
+                               const NodeDesc& node,
+                               const std::vector<ggml_tensor*>& values,
+                               ggml_tensor* (*norm_fn)(ggml_context*, ggml_tensor*, float)) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::NormAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled Norm node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  ggml_tensor* scale = values[node.inputs[1]];
+  GGONNX_NOT_NULL(x, "compiled Norm node missing X input");
+  GGONNX_NOT_NULL(scale, "compiled Norm node missing scale input");
+
+  // Flatten x into 2D [trailing_prod, leading_prod] so ggml_norm's "normalize
+  // along rows" (axis 0) covers exactly X.shape[axis:]. leading_prod may be 1
+  // if axis == 0 (normalize the whole tensor).
+  int64_t trailing_prod = 1;
+  for (int i = attrs->axis; i < attrs->onnx_rank; ++i) trailing_prod *= x->ne[attrs->onnx_rank - 1 - i];
+  int64_t leading_prod = 1;
+  for (int i = 0; i < attrs->axis; ++i) leading_prod *= x->ne[attrs->onnx_rank - 1 - i];
+
+  ggml_tensor* x_cont = x;
+  if (!ggml_is_contiguous(x_cont) || x_cont->nb[0] != ggml_type_size(x_cont->type)) {
+    x_cont = ggml_cont(ctx, x_cont);
+  }
+  ggml_tensor* flat = ggml_reshape_2d(ctx, x_cont, trailing_prod, leading_prod);
+  ggml_tensor* normed = norm_fn(ctx, flat, attrs->epsilon);
+
+  // Reshape back to the original GGML shape of x (= reversed ONNX dims, padded).
+  int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  for (int i = 0; i < attrs->onnx_rank; ++i) out_ne[i] = x->ne[i];
+  ggml_tensor* restored =
+      ggml_reshape_4d(ctx, normed, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+
+  // Broadcast scale: scale's ONNX shape == x.shape[axis:], i.e. GGML axes [0..trailing-1]
+  // match; pad with 1s on the remaining leading-GGML axes.
+  const int trailing = attrs->onnx_rank - attrs->axis;
+  int64_t scale_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  for (int i = 0; i < trailing; ++i) scale_ne[i] = scale->ne[i];
+  ggml_tensor* scale_bc =
+      ggml_reshape_4d(ctx, scale, scale_ne[0], scale_ne[1], scale_ne[2], scale_ne[3]);
+  ggml_tensor* out = ggml_mul(ctx, restored, scale_bc);
+
+  if (attrs->has_bias) {
+    ggml_tensor* bias = values[node.inputs[2]];
+    GGONNX_NOT_NULL(bias, "compiled Norm node missing bias input");
+    int64_t bias_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+    for (int i = 0; i < trailing; ++i) bias_ne[i] = bias->ne[i];
+    ggml_tensor* bias_bc =
+        ggml_reshape_4d(ctx, bias, bias_ne[0], bias_ne[1], bias_ne[2], bias_ne[3]);
+    out = ggml_add(ctx, out, bias_bc);
+  }
+  return EmitOutputs{out};
+}
+
+EmitResult EmitLayerNormalizationNode(ggml_context* ctx,
+                                      const NodeDesc& node,
+                                      const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  const auto* attrs = std::get_if<NodeDesc::NormAttrs>(&node.attrs);
+  GGONNX_ASSERT(attrs != nullptr, "compiled LayerNorm node missing attributes");
+  ggml_tensor* x = values[node.inputs[0]];
+  ggml_tensor* scale = values[node.inputs[1]];
+  GGONNX_NOT_NULL(x, "compiled LayerNorm node missing X input");
+  GGONNX_NOT_NULL(scale, "compiled LayerNorm node missing scale input");
+
+  // Same flatten as EmitNormLike but we compute mean/var/inv_std manually so
+  // we can emit Mean and InvStdDev as additional outputs (ONNX LayerNorm has
+  // up to 3 outputs; ORT requires all declared ones).
+  const int rank = attrs->onnx_rank;
+  const int trailing = rank - attrs->axis;
+  int64_t trailing_prod = 1;
+  for (int i = 0; i < trailing; ++i) trailing_prod *= x->ne[i];
+  int64_t leading_prod = 1;
+  for (int i = trailing; i < rank; ++i) leading_prod *= x->ne[i];
+
+  ggml_tensor* x_cont = x;
+  if (!ggml_is_contiguous(x_cont) || x_cont->nb[0] != ggml_type_size(x_cont->type)) {
+    x_cont = ggml_cont(ctx, x_cont);
+  }
+  ggml_tensor* flat = ggml_reshape_2d(ctx, x_cont, trailing_prod, leading_prod);
+
+  // mean over ggml axis 0 (= normalized region); ggml_mean keepdims.
+  ggml_tensor* mean_flat = ggml_mean(ctx, flat);  // [1, leading_prod]
+  // centered = x - mean (broadcast on axis 0).
+  ggml_tensor* centered = ggml_sub(ctx, flat, mean_flat);
+  ggml_tensor* sq = ggml_mul(ctx, centered, centered);
+  ggml_tensor* var_flat = ggml_mean(ctx, sq);  // [1, leading_prod]
+  ggml_tensor* var_plus_eps = ggml_scale_bias(ctx, var_flat, 1.0f, attrs->epsilon);
+  ggml_tensor* sqrt_v = ggml_sqrt(ctx, var_plus_eps);
+  // inv_std = 1 / sqrt_v via ones/sqrt_v. ones built from sqrt_v via scale_bias.
+  ggml_tensor* ones = ggml_scale_bias(ctx, sqrt_v, 0.0f, 1.0f);
+  ggml_tensor* inv_std_flat = ggml_div(ctx, ones, sqrt_v);
+
+  // y_flat = centered * inv_std (broadcast).
+  ggml_tensor* y_flat = ggml_mul(ctx, centered, inv_std_flat);
+
+  // Reshape y back to original x GGML shape.
+  int64_t out_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  for (int i = 0; i < rank; ++i) out_ne[i] = x->ne[i];
+  ggml_tensor* y = ggml_reshape_4d(ctx, y_flat, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+
+  // Scale + optional bias broadcast.
+  int64_t scale_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+  for (int i = 0; i < trailing; ++i) scale_ne[i] = scale->ne[i];
+  ggml_tensor* scale_bc =
+      ggml_reshape_4d(ctx, scale, scale_ne[0], scale_ne[1], scale_ne[2], scale_ne[3]);
+  y = ggml_mul(ctx, y, scale_bc);
+  if (attrs->has_bias) {
+    ggml_tensor* bias = values[node.inputs[2]];
+    GGONNX_NOT_NULL(bias, "compiled LayerNorm node missing bias input");
+    int64_t bias_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+    for (int i = 0; i < trailing; ++i) bias_ne[i] = bias->ne[i];
+    ggml_tensor* bias_bc =
+        ggml_reshape_4d(ctx, bias, bias_ne[0], bias_ne[1], bias_ne[2], bias_ne[3]);
+    y = ggml_add(ctx, y, bias_bc);
+  }
+
+  EmitOutputs out;
+  out.push_back(y);
+  // Mean and InvStdDev: reshape flat [1, leading_prod] to full rank with
+  // trailing (normalized) ggml axes set to 1 and leading axes matching x.
+  if (node.outputs.size() > 1) {
+    int64_t m_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+    for (int i = trailing; i < rank; ++i) m_ne[i] = x->ne[i];
+    ggml_tensor* mean_out = ggml_reshape_4d(ctx, mean_flat, m_ne[0], m_ne[1], m_ne[2], m_ne[3]);
+    out.push_back(mean_out);
+    if (node.outputs.size() > 2) {
+      ggml_tensor* inv_std_out =
+          ggml_reshape_4d(ctx, inv_std_flat, m_ne[0], m_ne[1], m_ne[2], m_ne[3]);
+      out.push_back(inv_std_out);
+    }
+  }
+  return out;
+}
+
+EmitResult EmitRMSNormalizationNode(ggml_context* ctx,
+                                    const NodeDesc& node,
+                                    const std::vector<ggml_tensor*>& values) {
+  return EmitNormLike(ctx, node, values, ggml_rms_norm);
+}
+
+// ONNX Dropout: at inference (training_mode absent or compile-time-constant
+// False) the data output is just the input. Mask output (an all-true bool
+// tensor) isn't supported here — we only claim the single-output form.
+SupportResult IsSupportedDropoutNode(Ort::ConstNode node, const MetaAnalysis* meta) {
+  const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
+  const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
+  SUPPORT_CHECK(!inputs.empty() && inputs.size() <= 3 && outputs.size() == 1 &&
+                    node.GetImplicitInputs().size() == 0,
+                "Dropout: unsupported arity (only inference single-output form)");
+  SUPPORT_CHECK(inputs[0] != nullptr && outputs[0] != nullptr,
+                "Dropout: null data input/output");
+  const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
+  SUPPORT_CHECK(x.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+                    y.element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                "Dropout: non-float dtype");
+  SUPPORT_CHECK(rankSupportedByGGML(x) && rankSupportedByGGML(y),
+                "Dropout: rank exceeds GGML_MAX_DIMS");
+  // If training_mode is provided, it must be a compile-time-constant False.
+  if (inputs.size() == 3 && inputs[2] != nullptr) {
+    const auto v = readConstantInputArray<uint8_t>(
+        node, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL, constants);
+    SUPPORT_CHECK(v.has_value() && !v->empty() && (*v)[0] == 0,
+                  "Dropout: training_mode must be constant-false for inference");
+  }
+  return support_ok();
+}
+
+EmitResult EmitDropoutNode(ggml_context* ctx,
+                           const NodeDesc& node,
+                           const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  ggml_tensor* x = values[node.inputs[0]];
+  GGONNX_NOT_NULL(x, "compiled Dropout node missing input");
+  return EmitOutputs{ggml_cont(ctx, x)};
+}
+
 SupportResult IsSupportedUpsampleNode(Ort::ConstNode node, const MetaAnalysis* meta) {
   const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   const auto inputs = node.GetInputs();
@@ -3584,6 +3880,57 @@ EmitResult EmitSplitNode(ggml_context* ctx,
   return out;
 }
 
+// Derive reduction axes from a shape comparison when the axes input exists but
+// isn't a compile-time constant. Only unambiguous when `keepdims=1`: every
+// reduced axis in the output has dim 1, so the differing positions name the
+// reduced axes. Returns nullopt if the input/output shapes aren't fully
+// static or the comparison would be ambiguous (keepdims=0, or an output dim
+// doesn't collapse to 1 where it should).
+static std::optional<std::vector<int64_t>> DeriveReduceAxesFromShape(
+    const std::vector<int64_t>& in_dims,
+    const std::vector<int64_t>& out_dims,
+    bool keepdims) {
+  if (!keepdims) return std::nullopt;
+  if (in_dims.size() != out_dims.size()) return std::nullopt;
+  if (!shapeIsFullyStatic(in_dims) || !shapeIsFullyStatic(out_dims)) return std::nullopt;
+  std::vector<int64_t> axes;
+  for (size_t i = 0; i < in_dims.size(); ++i) {
+    if (in_dims[i] == out_dims[i]) continue;
+    // A reduced axis must collapse to 1 when keepdims=1.
+    if (out_dims[i] != 1) return std::nullopt;
+    axes.push_back(static_cast<int64_t>(i));
+  }
+  return axes;
+}
+
+// Resolve reduction axes from node attributes / inputs / static shapes.
+// Shared between IsSupported and Compile; returns a normalized-but-unsorted
+// list in ONNX axis coordinates (negative values not yet resolved).
+static std::optional<std::vector<int64_t>> ResolveReduceAxes(
+    Ort::ConstNode node,
+    const TensorMetadata& x,
+    const TensorMetadata& y,
+    bool keepdims,
+    const ConstantValueMap* constants) {
+  const auto inputs = node.GetInputs();
+  const int64_t rank = static_cast<int64_t>(x.dims.size());
+  if (inputs.size() == 2 && inputs[1] != nullptr) {
+    const auto v = readConstantInputArray<int64_t>(
+        node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
+    if (v.has_value()) return *v;
+    // Fall back to shape-derived axes when the axes input is dynamic but the
+    // input/output shapes are both static and keepdims=1.
+    return DeriveReduceAxesFromShape(x.dims, y.dims, keepdims);
+  }
+  if (const auto attr = readNodeAttribute<std::vector<int64_t>>(node, "axes")) {
+    return *attr;
+  }
+  // Default: reduce all axes.
+  std::vector<int64_t> all(rank);
+  for (int64_t i = 0; i < rank; ++i) all[i] = i;
+  return all;
+}
+
 // ONNX ReduceMean (opset 11/13/18). We support the common case of reducing a
 // contiguous suffix of the ONNX dims — e.g. axes=[2,3] on an [N,C,H,W] input —
 // because that's what ggml_mean (which reduces only axis 0) can express after
@@ -3607,19 +3954,12 @@ SupportResult IsSupportedReduceMeanNode(Ort::ConstNode node, const MetaAnalysis*
   const int64_t rank = static_cast<int64_t>(x.dims.size());
   SUPPORT_CHECK(rank > 0, "ReduceMean: scalar input");
 
-  // Collect axes. Prefer the `axes` input (opset 18+), then the attribute.
-  std::vector<int64_t> axes;
-  if (inputs.size() == 2 && inputs[1] != nullptr) {
-    const auto v = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-    SUPPORT_CHECK(v.has_value(), "ReduceMean: axes input is not a compile-time constant");
-    axes = *v;
-  } else if (const auto attr = readNodeAttribute<std::vector<int64_t>>(node, "axes")) {
-    axes = *attr;
-  } else {
-    // Default: reduce all axes.
-    axes.resize(rank);
-    for (int64_t i = 0; i < rank; ++i) axes[i] = i;
-  }
+  const bool keepdims = readNodeAttribute<int64_t>(node, "keepdims").value_or(1) != 0;
+  const auto resolved = ResolveReduceAxes(node, x, y, keepdims, constants);
+  SUPPORT_CHECK(resolved.has_value(),
+                "ReduceMean: axes input is not a compile-time constant and "
+                "cannot be derived from static output shape");
+  std::vector<int64_t> axes = *resolved;
   SUPPORT_CHECK(!axes.empty(), "ReduceMean: empty axes");
 
   std::vector<int64_t> normalized;
@@ -3649,24 +3989,19 @@ void CompileReduceMeanAttributes(Ort::ConstNode node, NodeDesc* compiled_node, c
   const ConstantValueMap* constants = (meta != nullptr) ? &meta->constants : nullptr;
   GGONNX_NOT_NULL(compiled_node, "compiled node output must not be null");
   const auto inputs = node.GetInputs();
+  const auto outputs = node.GetOutputs();
   const TensorMetadata x = getTensorMetadata(inputs[0]);
+  const TensorMetadata y = getTensorMetadata(outputs[0]);
   const int64_t rank = static_cast<int64_t>(x.dims.size());
 
-  std::vector<int64_t> axes;
-  if (inputs.size() == 2 && inputs[1] != nullptr) {
-    const auto v = readConstantInputArray<int64_t>(node, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, constants);
-    GGONNX_ASSERT(v.has_value(), "ReduceMean compile: axes input must be constant int64");
-    axes = *v;
-  } else if (const auto attr = readNodeAttribute<std::vector<int64_t>>(node, "axes")) {
-    axes = *attr;
-  } else {
-    axes.resize(rank);
-    for (int64_t i = 0; i < rank; ++i) axes[i] = i;
-  }
+  const bool keepdims = readNodeAttribute<int64_t>(node, "keepdims").value_or(1) != 0;
+  const auto resolved = ResolveReduceAxes(node, x, y, keepdims, constants);
+  GGONNX_ASSERT(resolved.has_value(), "ReduceMean compile: axes could not be resolved");
+  std::vector<int64_t> axes = *resolved;
 
   NodeDesc::ReduceAttrs attrs;
   attrs.trailing_count = static_cast<int>(axes.size());
-  attrs.keepdims = readNodeAttribute<int64_t>(node, "keepdims").value_or(1) != 0;
+  attrs.keepdims = keepdims;
 
   // Normalize axes and compute the GGML permutation that moves the reduction
   // GGML axes to positions [0, k-1] so the existing "leading GGML axes"
@@ -3717,9 +4052,14 @@ static EmitResult EmitReduceCore(ggml_context* ctx,
 
   // Step 1: permute so the reduction axes are at GGML positions [0, k-1].
   // Skip permute when perm is already the identity (trailing-axes case).
-  const auto& p = attrs->perm;
-  const bool is_identity_perm = (p[0] == 0 && p[1] == 1 && p[2] == 2 && p[3] == 3);
-  ggml_tensor* xp = is_identity_perm ? x : ggml_permute(ctx, x, p[0], p[1], p[2], p[3]);
+  // attrs->perm uses the "source index" convention (out[i] <- in[perm[i]]),
+  // but ggml_permute takes the "destination index" convention (in[i] -> out[axisi]).
+  // These are inverses, so pass inv_perm to the forward permute here.
+  const auto& fwd = attrs->inv_perm;
+  const bool is_identity_perm =
+      (fwd[0] == 0 && fwd[1] == 1 && fwd[2] == 2 && fwd[3] == 3);
+  ggml_tensor* xp =
+      is_identity_perm ? x : ggml_permute(ctx, x, fwd[0], fwd[1], fwd[2], fwd[3]);
 
   // Step 2: collapse the k leading GGML axes into one, then reduce.
   int64_t collapsed = 1;
@@ -3749,10 +4089,14 @@ static EmitResult EmitReduceCore(ggml_context* ctx,
 
   // Apply inverse permutation to restore the original axis ordering.
   // Skip when perm was identity (trailing-axes case, no reorder needed).
-  const auto& ip = attrs->inv_perm;
-  const bool is_identity_inv = (ip[0] == 0 && ip[1] == 1 && ip[2] == 2 && ip[3] == 3);
-  return EmitOutputs{is_identity_inv ? expanded
-                                     : ggml_permute(ctx, expanded, ip[0], ip[1], ip[2], ip[3])};
+  // Mirror of the forward step: pass attrs->perm here (the ggml "destination"
+  // form of the inverse permutation).
+  const auto& inv = attrs->perm;
+  const bool is_identity_inv =
+      (inv[0] == 0 && inv[1] == 1 && inv[2] == 2 && inv[3] == 3);
+  return EmitOutputs{is_identity_inv
+                         ? expanded
+                         : ggml_permute(ctx, expanded, inv[0], inv[1], inv[2], inv[3])};
 }
 
 EmitResult EmitReduceMeanNode(ggml_context* ctx,
@@ -3768,6 +4112,36 @@ EmitResult EmitReduceSumNode(ggml_context* ctx,
                              const std::vector<ggml_tensor*>& values) {
   GGONNX_NOT_NULL(ctx, "ggml context must not be null");
   return EmitReduceCore(ctx, node, values, ggml_sum_rows);
+}
+
+// Reduce-max along ggml axis 0: ggml has no max_rows, but max-pool 1D with
+// kernel = stride = ne[0] collapses axis 0 to a single element — exactly a
+// per-row max. Other axes pass through untouched.
+static ggml_tensor* ggonnx_max_rows(ggml_context* ctx, ggml_tensor* a) {
+  const int k = static_cast<int>(a->ne[0]);
+  GGONNX_ASSERT(k > 0, "max-rows pool requires positive axis-0 size");
+  return ggml_pool_1d(ctx, a, GGML_OP_POOL_MAX, k, k, 0);
+}
+
+// ReduceMin(x) = -ReduceMax(-x). Same pool_1d trick on the negated input.
+static ggml_tensor* ggonnx_min_rows(ggml_context* ctx, ggml_tensor* a) {
+  ggml_tensor* neg = ggml_neg(ctx, a);
+  ggml_tensor* max_neg = ggonnx_max_rows(ctx, neg);
+  return ggml_neg(ctx, max_neg);
+}
+
+EmitResult EmitReduceMaxNode(ggml_context* ctx,
+                             const NodeDesc& node,
+                             const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  return EmitReduceCore(ctx, node, values, ggonnx_max_rows);
+}
+
+EmitResult EmitReduceMinNode(ggml_context* ctx,
+                             const NodeDesc& node,
+                             const std::vector<ggml_tensor*>& values) {
+  GGONNX_NOT_NULL(ctx, "ggml context must not be null");
+  return EmitReduceCore(ctx, node, values, ggonnx_min_rows);
 }
 
 // ONNX DepthToSpace: [N, C, H, W] -> [N, C/b^2, H*b, W*b]. Two modes:
@@ -4095,6 +4469,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Div"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
       {{"", "Max"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
       {{"", "Min"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
+      {{"", "Mod"}, {IsSupportedElementwiseBinaryOpNode, nullptr, EmitElementwiseBinaryNode}},
       {{"", "GRU"}, {IsSupportedGRUNode, CompileGRUAttributes, EmitGRUNode}},
       {{"", "LSTM"}, {IsSupportedLSTMNode, CompileLSTMAttributes, EmitLSTMNode}},
       {{"", "Relu"},     {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
@@ -4106,6 +4481,7 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Exp"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Log"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Erf"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
+      {{"", "Reciprocal"}, {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Softplus"}, {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Elu"},      {IsSupportedUnaryFloatNode, nullptr, EmitUnaryFloatNode}},
       {{"", "Pow"},      {IsSupportedPowNode, nullptr, EmitPowNode}},
@@ -4131,6 +4507,11 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
       {{"", "Pad"}, {IsSupportedPadNode, CompilePadAttributes, EmitPadNode}},
       {{"", "InstanceNormalization"},
        {IsSupportedInstanceNormalizationNode, CompileInstanceNormalizationAttributes, EmitInstanceNormalizationNode}},
+      {{"", "LayerNormalization"},
+       {IsSupportedLayerNormalizationNode, CompileLayerNormalizationAttributes, EmitLayerNormalizationNode}},
+      {{"", "RMSNormalization"},
+       {IsSupportedRMSNormalizationNode, CompileRMSNormalizationAttributes, EmitRMSNormalizationNode}},
+      {{"", "Dropout"}, {IsSupportedDropoutNode, nullptr, EmitDropoutNode}},
       {{"", "Upsample"}, {IsSupportedUpsampleNode, CompileUpsampleAttributes, EmitUpsampleNode}},
       {{"", "Resize"}, {IsSupportedUpsampleNode, CompileUpsampleAttributes, EmitUpsampleNode}},
       {{"", "Identity"}, {IsSupportedIdentityNode, nullptr, EmitIdentityNode}},
@@ -4143,6 +4524,14 @@ const OpDefinition* FindOpDefinition(std::string_view domain, std::string_view o
        {IsSupportedReduceMeanNode, CompileReduceMeanAttributes, EmitReduceMeanNode}},
       {{"", "ReduceSum"},
        {IsSupportedReduceMeanNode, CompileReduceMeanAttributes, EmitReduceSumNode}},
+      {{"", "ReduceMax"},
+       {IsSupportedReduceMeanNode, CompileReduceMeanAttributes, EmitReduceMaxNode}},
+      // ReduceMin disabled: EmitReduceMinNode works in isolation (conformance +
+      // standalone tests pass) but tiny-yolov3 regresses heavily when enabled.
+      // Investigation needed — suspected interaction with Vulkan scheduler or
+      // neg/pool_1d/neg chain on a specific shape class the tests don't cover.
+      // {{"", "ReduceMin"},
+      //  {IsSupportedReduceMeanNode, CompileReduceMeanAttributes, EmitReduceMinNode}},
       {{"", "BatchNormalization"},
        {IsSupportedBatchNormNode, CompileBatchNormAttributes, EmitBatchNormNode}},
       {{"", "DepthToSpace"},
